@@ -44,11 +44,16 @@ BEGIN
 
   -- Equity (2xxx)
   IF p_entity_type = 'enskild_firma' THEN
+    -- Enskild firma equity accounts: sru_code intentionally NULL.
+    -- BAS reference maps these to INK2 SRU 7221 ("Övrigt eget kapital"),
+    -- which is the aktiebolag tax form. EF entities file NE-bilaga, not
+    -- INK2, and owner drawings/contributions on 2013/2018 must not be
+    -- reported as balance-sheet equity by SIE/INK2 consumers.
     INSERT INTO public.chart_of_accounts (user_id, company_id, account_number, account_name, account_class, account_group, account_type, normal_balance, plan_type, is_system_account, sru_code)
     VALUES
-      (v_user_id, p_company_id, '2010', 'Eget kapital', 2, '20', 'equity', 'credit', 'k1', true, '7221'),
-      (v_user_id, p_company_id, '2013', 'Övriga egna uttag', 2, '20', 'equity', 'credit', 'k1', true, '7221'),
-      (v_user_id, p_company_id, '2018', 'Övriga egna insättningar', 2, '20', 'equity', 'credit', 'k1', true, '7221');
+      (v_user_id, p_company_id, '2010', 'Eget kapital', 2, '20', 'equity', 'credit', 'k1', true, NULL),
+      (v_user_id, p_company_id, '2013', 'Övriga egna uttag', 2, '20', 'equity', 'credit', 'k1', true, NULL),
+      (v_user_id, p_company_id, '2018', 'Övriga egna insättningar', 2, '20', 'equity', 'credit', 'k1', true, NULL);
   END IF;
 
   IF p_entity_type = 'aktiebolag' THEN
@@ -128,5 +133,12 @@ BEGIN
     (v_user_id, p_company_id, '8410', 'Räntekostnader', 8, '84', 'expense', 'debit', 'k1', true, '7323');
 END;
 $$;
+
+-- Restore the EXECUTE grant. Each prior DROP/CREATE has silently dropped
+-- the grant originally established in 20240101000009; SECURITY DEFINER
+-- callers via service role still work, but RPC calls from the
+-- authenticated role have been failing with permission errors since
+-- 20260330130000. Match the original grant from migration 009.
+GRANT EXECUTE ON FUNCTION public.seed_chart_of_accounts(uuid, text) TO authenticated;
 
 NOTIFY pgrst, 'reload schema';

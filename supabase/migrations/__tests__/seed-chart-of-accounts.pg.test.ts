@@ -155,6 +155,14 @@ describe('seed_chart_of_accounts — Swedish characters', () => {
     expect(byNum.has('2081')).toBe(false)
     expect(byNum.has('2091')).toBe(false)
     expect(byNum.has('2099')).toBe(false)
+
+    // EF equity accounts must NOT carry the AB-oriented INK2 SRU code 7221.
+    // EF entities file NE-bilaga instead of INK2; emitting `#SRU 2013 7221`
+    // in a SIE export would steer downstream tax software to report owner
+    // drawings as balance-sheet equity, which is wrong for sole traders.
+    expect(byNum.get('2010')?.sru_code).toBeNull()
+    expect(byNum.get('2013')?.sru_code).toBeNull()
+    expect(byNum.get('2018')?.sru_code).toBeNull()
   })
 
   it('stores diacritics as multi-byte UTF-8, not as ASCII folds', async () => {
