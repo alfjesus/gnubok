@@ -20,10 +20,25 @@ import {
 const DEFAULT_OAUTH_BASE_URL = 'https://peroauth2.test.skatteverket.se/oauth2/v1/per'
 // `agd` is the AGI (arbetsgivardeklaration) scope. Source: SKV's service
 // description PDF, Tjänstebeskrivning Arbetsgivardeklaration inlämning v1.7,
-// section 4.1.2.2 — the 403 "Felaktigt access scope" example shows
+// section 4.1.2.2: the 403 "Felaktigt access scope" example shows
 // `"description": "The required scope agd has been requested for that access token."`
-// The other tokens match the path segments of their respective APIs.
-const DEFAULT_SCOPES = 'momsdeklaration inkforetag skahmst skattekonto agd'
+// The other tokens match the path segments of their respective APIs,
+// EXCEPT skattekonto. The scope names there, learned the hard way:
+//   - `ska`       = the interactive skattekonto REST API (saldo +
+//                   transaktioner). Requested since the extension's first
+//                   commit; removed 2026-05-10 by a "remove unused scopes"
+//                   cleanup (#431 series), which instantly broke skattekonto
+//                   sync for every token issued after that hour: the API
+//                   answers 403 "The required scopes are not authorized"
+//                   without it. Re-added 2026-07-20. Do not "clean up" again.
+//   - `skahmst`   = a DIFFERENT bulk service (Skattekonto Hämta huvudmäns
+//                   saldo och transaktioner, file via E-transport for
+//                   juridiska läsombud; see dev_docs/skatteverket/skahmst).
+//                   Not what the sync uses, but harmless to request.
+//   - `skattekonto` is NOT a real SKV scope name: SKV silently drops it
+//                   from every grant. Kept only so a future SKV rename in
+//                   our favor costs nothing.
+const DEFAULT_SCOPES = 'momsdeklaration inkforetag skahmst skattekonto ska agd'
 
 function getOAuthBaseUrl(): string {
   return process.env.SKATTEVERKET_OAUTH_BASE_URL || DEFAULT_OAUTH_BASE_URL
@@ -46,12 +61,12 @@ function getClientSecret(): string {
  *
  * SKV's per flow accepts (and on some test client configurations *requires*)
  * PKCE. Without a code_challenge SKV may issue tokens that downstream APIs
- * (notably the AGI APIGW) reject as revoked when called — even though the
+ * (notably the AGI APIGW) reject as revoked when called, even though the
  * initial token exchange succeeds. Always sending PKCE is safe regardless
  * of whether SKV strictly requires it.
  *
  * Verifier: 64 random bytes → base64url → 86 chars (within RFC 7636's
- * 43–128 range). Challenge: SHA-256 of the verifier, base64url-encoded.
+ * 43-128 range). Challenge: SHA-256 of the verifier, base64url-encoded.
  */
 export function generatePkcePair(): { verifier: string; challenge: string } {
   const verifier = crypto.randomBytes(64).toString('base64url')
@@ -85,7 +100,7 @@ export function buildAuthorizeUrl(
 
 /**
  * Exchange an authorization code for tokens.
- * Must be called immediately upon receiving the callback — code expires in 5 minutes.
+ * Must be called immediately upon receiving the callback: code expires in 5 minutes.
  */
 export async function exchangeCodeForTokens(
   code: string,
@@ -174,7 +189,7 @@ export async function refreshAccessToken(
 
   return {
     access_token: data.access_token,
-    // Each refresh returns a new refresh_token — must be stored
+    // Each refresh returns a new refresh_token: must be stored
     refresh_token: data.refresh_token ?? null,
     expires_at: Date.now() + (data.expires_in ?? 3600) * 1000,
     refresh_count: previousRefreshCount + 1,

@@ -4,20 +4,22 @@ import { useEffect, useState } from 'react'
 import { useTranslations } from 'next-intl'
 import { useCompany } from '@/contexts/CompanyContext'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import { useToast } from '@/components/ui/use-toast'
 import {
   DestructiveConfirmDialog,
   useDestructiveConfirm,
 } from '@/components/ui/destructive-confirm-dialog'
-import { Loader2, Info, Lock } from 'lucide-react'
+import { Loader2, Lock } from 'lucide-react'
 import { parseDateParts } from '@/lib/bookkeeping/validate-period-duration'
+import { validateFirstPeriod } from '@/components/bookkeeping/FiscalPeriodDateFields'
 import {
-  FiscalPeriodDateFields,
-  validateFirstPeriod,
-} from '@/components/bookkeeping/FiscalPeriodDateFields'
+  SettingsGroup,
+  SettingsInput,
+  SettingsRow,
+  SettingsRowNote,
+} from '@/components/settings/SettingsRows'
 import type { FiscalPeriod } from '@/types'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 function formatSwedishDate(dateStr: string): string {
   const months = [
@@ -84,7 +86,7 @@ export function FiscalPeriodEditor() {
         setEndDate(first.period_end)
       } catch (err) {
         if (!cancelled) {
-          setLoadError(err instanceof Error ? err.message : t('fp_load_error_unknown'))
+          setLoadError(err instanceof Error ? getUserErrorMessage(err) : t('fp_load_error_unknown'))
         }
       } finally {
         if (!cancelled) setIsLoading(false)
@@ -153,12 +155,12 @@ export function FiscalPeriodEditor() {
       setPeriod(body.data as FiscalPeriod)
       toast({
         title: t('fp_updated_title'),
-        description: `${formatSwedishDate(body.data.period_start)} – ${formatSwedishDate(body.data.period_end)}`,
+        description: `${formatSwedishDate(body.data.period_start)}: ${formatSwedishDate(body.data.period_end)}`,
       })
     } catch (err) {
       toast({
         title: t('fp_update_failed_title'),
-        description: err instanceof Error ? err.message : t('fp_try_again'),
+        description: err instanceof Error ? getUserErrorMessage(err) : t('fp_try_again'),
         variant: 'destructive',
       })
     } finally {
@@ -174,76 +176,83 @@ export function FiscalPeriodEditor() {
 
   return (
     <>
-      <section className="space-y-4 border-t border-border/8 pt-8">
-        <div className="space-y-1">
-          <h2 className="text-sm font-medium uppercase tracking-wider text-muted-foreground">
-            {t('fp_heading')}
-          </h2>
-          <p className="text-sm text-muted-foreground">
-            {t('fp_intro')}
-          </p>
-        </div>
-
+      <SettingsGroup label={t('fp_heading')} help={t('fp_intro')}>
         {isLoading ? (
-          <div className="flex items-center gap-2 text-sm text-muted-foreground">
+          <div className="flex items-center gap-2 px-1 py-3 text-sm text-muted-foreground">
             <Loader2 className="h-4 w-4 animate-spin" />
             {t('fp_loading')}
           </div>
         ) : loadError ? (
-          <p className="text-sm text-destructive">{loadError}</p>
+          <p className="px-1 py-3 text-sm text-destructive">{loadError}</p>
         ) : !period ? (
-          <p className="text-sm text-muted-foreground">{t('fp_none')}</p>
+          <p className="px-1 py-3 text-sm text-muted-foreground">{t('fp_none')}</p>
         ) : isBlocked ? (
-          <BlockedState
-            period={period}
-            postedCount={postedCount ?? 0}
-          />
+          <BlockedRow period={period} postedCount={postedCount ?? 0} />
         ) : (
-          <div className="space-y-4">
-            <div className="rounded-lg border border-warning/20 bg-warning/5 p-3 text-sm flex gap-2">
-              <Info className="h-4 w-4 text-warning flex-shrink-0 mt-0.5" />
-              <div className="space-y-1">
-                <p className="font-medium">{t('fp_warning_title')}</p>
-                <p className="text-muted-foreground">
-                  {t('fp_warning_body')}
-                  {isEF && t('fp_warning_ef_suffix')}
-                </p>
-              </div>
-            </div>
+          <>
+            {/* Consequential warning: stays visible as one quiet ochre sentence. */}
+            <p className="px-1 py-3 text-[12.5px] text-attn">
+              {t('fp_warning_title')} {t('fp_warning_body')}
+              {isEF ? t('fp_warning_ef_suffix') : null}
+            </p>
 
-            <FiscalPeriodDateFields
-              startDate={startDate}
-              onStartDateChange={setStartDate}
-              endDate={endDate}
-              entityType={company?.entity_type}
-              summaryTitle={t('fp_summary_title')}
-              endDateSlot={
-                <div className="space-y-2">
-                  <Label htmlFor="fp_end">{t('fp_end_date_label')}</Label>
-                  <Input
-                    id="fp_end"
-                    type="date"
-                    value={endDate}
-                    onChange={(e) => setEndDate(e.target.value)}
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    {t('fp_end_date_help')}
-                  </p>
-                </div>
-              }
-            />
+            <SettingsRow
+              label={t('fp_start_date_label')}
+              htmlFor="fiscal-period-start"
+              help={t('fp_start_date_help')}
+              align="baseline"
+            >
+              <SettingsInput
+                id="fiscal-period-start"
+                type="date"
+                value={startDate}
+                onChange={(e) => setStartDate(e.target.value)}
+                className="max-w-44 flex-none tabular-nums"
+              />
+            </SettingsRow>
 
-            <div className="flex justify-end gap-2">
+            <SettingsRow
+              label={t('fp_end_date_label')}
+              htmlFor="fp_end"
+              help={t('fp_end_date_help')}
+              align="baseline"
+            >
+              <SettingsInput
+                id="fp_end"
+                type="date"
+                value={endDate}
+                onChange={(e) => setEndDate(e.target.value)}
+                className="max-w-44 flex-none tabular-nums"
+              />
+            </SettingsRow>
+
+            {validation.canSummarise && (
+              <p className="px-1 pt-3 text-xs text-muted-foreground">
+                {t('fp_summary_title')}:{' '}
+                <span className="tabular-nums">
+                  {t('fp_range', { start: formatSwedishDate(startDate), end: formatSwedishDate(endDate) })}
+                </span>
+                {validation.months !== null && <> · {t('fp_months', { count: validation.months })}</>}
+              </p>
+            )}
+            {validation.error && (
+              <p className="px-1 pt-1 text-xs text-destructive">{validation.error}</p>
+            )}
+
+            <div className="flex justify-end gap-2 px-1 pt-3">
               <Button
                 type="button"
                 variant="outline"
+                size="sm"
                 onClick={handleReset}
                 disabled={!isDirty || isSaving}
+                className="text-muted-foreground hover:text-foreground"
               >
                 {t('fp_reset')}
               </Button>
               <Button
                 type="button"
+                size="sm"
                 onClick={handleSave}
                 disabled={
                   !isDirty ||
@@ -263,15 +272,15 @@ export function FiscalPeriodEditor() {
                 )}
               </Button>
             </div>
-          </div>
+          </>
         )}
-      </section>
+      </SettingsGroup>
       <DestructiveConfirmDialog {...dialogProps} />
     </>
   )
 }
 
-function BlockedState({
+function BlockedRow({
   period,
   postedCount,
 }: {
@@ -286,26 +295,27 @@ function BlockedState({
       : t('fp_blocked_reason_posted', { count: postedCount })
 
   return (
-    <div className="rounded-lg border border-border/60 bg-muted/30 p-4 space-y-3">
-      <div className="flex gap-2">
-        <Lock className="h-4 w-4 text-muted-foreground flex-shrink-0 mt-0.5" />
-        <div className="space-y-1">
-          <p className="text-sm font-medium">{t('fp_blocked_title')}</p>
-          <p className="text-sm text-muted-foreground">{reason}</p>
-        </div>
-      </div>
-      <div className="text-sm text-muted-foreground space-y-1">
-        <p>
-          {t('fp_blocked_first_year')}{' '}
-          <span className="font-medium text-foreground">
-            {formatSwedishDate(period.period_start)} &ndash; {formatSwedishDate(period.period_end)}
-          </span>
-          {isCalendarYear(period) ? t('fp_blocked_calendar_year') : t('fp_blocked_broken_year')}
-        </p>
-        <p>
-          {t('fp_blocked_explainer')}
-        </p>
-      </div>
-    </div>
+    <SettingsRow
+      // The key carries a trailing colon from its old inline usage; strip it
+      // for the micro-label position.
+      label={t('fp_blocked_first_year').replace(/:$/, '')}
+      help={
+        <>
+          <p>
+            {t('fp_blocked_title')}. {reason}
+          </p>
+          <p className="mt-2">{t('fp_blocked_explainer')}</p>
+        </>
+      }
+      borderless
+    >
+      <Lock aria-hidden="true" className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+      <span className="tabular-nums">
+        {t('fp_range', { start: formatSwedishDate(period.period_start), end: formatSwedishDate(period.period_end) })}
+      </span>
+      <SettingsRowNote>
+        {(isCalendarYear(period) ? t('fp_blocked_calendar_year') : t('fp_blocked_broken_year')).trim()}
+      </SettingsRowNote>
+    </SettingsRow>
   )
 }

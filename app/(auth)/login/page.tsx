@@ -1,6 +1,7 @@
 'use client'
 
 import { Suspense, useState, useEffect } from 'react'
+import dynamic from 'next/dynamic'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { useLocale, useTranslations } from 'next-intl'
 import Link from 'next/link'
@@ -13,18 +14,28 @@ import { Loader2, Mail, ArrowLeft, KeyRound, ExternalLink } from 'lucide-react'
 import { BrandWordmark } from '@/components/branding/BrandWordmark'
 import { getErrorMessage, type ErrorLocale } from '@/lib/errors/get-error-message'
 import { isBankIdEnabled } from '@/lib/auth/bankid'
-import { BankIdAuth } from '@/components/auth/BankIdAuth'
 import { getBranding } from '@/lib/branding/service'
 import { detectWebmailHint } from '@/lib/auth/webmail-search'
+import { safeReturnTo } from '@/lib/auth/safe-return-to'
+import {
+  consumeInviteCookie,
+  INVITE_PROBLEM_MESSAGE_KEYS,
+} from '@/lib/auth/consume-invite-cookie'
+import { AuthPageSkeleton } from '@/components/auth/AuthPageSkeleton'
 
 const branding = getBranding()
 import type { BankIdResult } from '@/components/auth/BankIdAuth'
+
+const BankIdAuth = dynamic(
+  () => import('@/components/auth/BankIdAuth').then((module) => module.BankIdAuth),
+  { ssr: false },
+)
 
 // Wrapping in Suspense is required because useSearchParams() forces
 // dynamic rendering in Next.js 16; static prerender bails out otherwise.
 export default function LoginPage() {
   return (
-    <Suspense fallback={null}>
+    <Suspense fallback={<AuthPageSkeleton />}>
       <LoginPageContent />
     </Suspense>
   )
@@ -43,11 +54,35 @@ function LoginPageContent() {
   const router = useRouter()
   const searchParams = useSearchParams()
   const callbackError = searchParams.get('error')
+  const callbackFlow = searchParams.get('flow')
+  // Post-login destination, set e.g. by the MCP OAuth authorize endpoint
+  // (/login?next=/api/mcp-oauth/authorize?...). Sanitized to a same-origin
+  // relative path; '/' means no explicit destination.
+  const nextPath = safeReturnTo(searchParams.get('next'), '/')
   const supabase = createClient()
   const bankIdEnabled = isBankIdEnabled()
   const tAuth = useTranslations('auth')
   const tCommon = useTranslations('common')
+  const tInvite = useTranslations('invite')
   const errorLocale = useLocale() as ErrorLocale
+
+  // Accept a pending invite, if any, and report a non-definitive failure.
+  // Returns true when the caller should land the user in the app directly.
+  // The invite cookie survives anything that is not a settled outcome, so
+  // /onboarding and /select-company can retry acceptance server-side.
+  const acceptPendingInvite = async (): Promise<boolean> => {
+    const invite = await consumeInviteCookie()
+    if (invite.accepted) return true
+    if (invite.problem) {
+      const keys = INVITE_PROBLEM_MESSAGE_KEYS[invite.problem]
+      toast({
+        title: tInvite(keys.title),
+        description: tInvite(keys.body),
+        variant: 'destructive',
+      })
+    }
+    return false
+  }
 
   // Reset cooldown timer
   useEffect(() => {
@@ -102,26 +137,16 @@ function LoginPageContent() {
         }
 
         // Check for pending invite token
-        const bankIdCookieMatch = document.cookie.match(/gnubok-invite-token=([^;]+)/)
-        const bankIdInviteToken = bankIdCookieMatch?.[1]
+        if (await acceptPendingInvite()) {
+          window.location.href = '/'
+          return
+        }
 
-        if (bankIdInviteToken) {
-          try {
-            const res = await fetch('/api/team/accept', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ token: bankIdInviteToken }),
-            })
-
-            if (res.ok) {
-              document.cookie = 'gnubok-invite-token=; path=/; max-age=0'
-              window.location.href = '/'
-              return
-            }
-          } catch (err) {
-            console.error('[login] invite acceptance failed:', err)
-          }
-          document.cookie = 'gnubok-invite-token=; path=/; max-age=0'
+        if (nextPath !== '/') {
+          // An explicit destination (e.g. the MCP OAuth consent page, raw
+          // HTML from a route handler) outranks the company picker.
+          window.location.assign(nextPath)
+          return
         }
 
         // Always land on the picker after BankID login so the user sees
@@ -156,7 +181,7 @@ function LoginPageContent() {
       if (error) {
         toast({
           title: tAuth('login_failed_title'),
-          description: error.message === 'Invalid login credentials'
+          description: getErrorMessage(error) === 'Invalid login credentials'
             ? tAuth('login_invalid_credentials')
             : getErrorMessage(error, { context: 'auth', locale: errorLocale }),
           variant: 'destructive',
@@ -168,32 +193,26 @@ function LoginPageContent() {
       const { data: aal } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel()
 
       if (aal?.nextLevel === 'aal2' && aal?.currentLevel === 'aal1') {
-        router.push('/mfa/verify')
+        router.push(
+          nextPath === '/'
+            ? '/mfa/verify'
+            : `/mfa/verify?returnTo=${encodeURIComponent(nextPath)}`
+        )
         return
       }
 
       // Check for pending invite token
-      const cookieMatch = document.cookie.match(/gnubok-invite-token=([^;]+)/)
-      const inviteToken = cookieMatch?.[1]
+      if (await acceptPendingInvite()) {
+        window.location.href = '/'
+        return
+      }
 
-      if (inviteToken) {
-        try {
-          const res = await fetch('/api/team/accept', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ token: inviteToken }),
-          })
-
-          if (res.ok) {
-            document.cookie = 'gnubok-invite-token=; path=/; max-age=0'
-            window.location.href = '/'
-            return
-          }
-        } catch (err) {
-          console.error('[login] invite acceptance failed:', err)
-        }
-        // Clear cookie even on failure to avoid retrying stale tokens
-        document.cookie = 'gnubok-invite-token=; path=/; max-age=0'
+      if (nextPath !== '/') {
+        // Full navigation: the destination can be a route handler that
+        // returns raw HTML (the MCP OAuth consent page), which the client
+        // router cannot render.
+        window.location.assign(nextPath)
+        return
       }
 
       router.push('/')
@@ -276,7 +295,7 @@ function LoginPageContent() {
             </p>
           </div>
 
-          <div className="rounded-xl border bg-card p-4">
+          <div className="rounded-lg border bg-card p-4">
             <p className="text-sm text-muted-foreground text-center leading-relaxed">
               {showResetPassword ? tAuth('email_sent_hint_reset') : tAuth('email_sent_hint_login')}
             </p>
@@ -327,7 +346,7 @@ function LoginPageContent() {
             </p>
           </div>
 
-          <div className="rounded-xl border bg-card p-6" style={{ boxShadow: 'var(--shadow-md)' }}>
+          <div className="rounded-lg border bg-card p-6">
             <form onSubmit={handleResetPassword} className="space-y-5">
               <div className="space-y-2">
                 <Label htmlFor="email">{tAuth('email_label')}</Label>
@@ -382,23 +401,36 @@ function LoginPageContent() {
           </p>
         </div>
 
-        <div className="rounded-xl border bg-card p-6" style={{ boxShadow: 'var(--shadow-md)' }}>
+        <div className="rounded-lg border bg-card p-6">
           {callbackError === 'auth_error' && (
             <div className="mb-5 rounded-lg border border-destructive/30 bg-destructive/5 p-4">
-              <p className="text-sm font-medium text-destructive">
-                {tAuth('callback_error_title')}
-              </p>
-              <p className="mt-1 text-sm text-destructive/90">
-                {tAuth('callback_error_body')}{' '}
-                <button
-                  type="button"
-                  onClick={() => setShowResetPassword(true)}
-                  className="font-medium underline underline-offset-2"
-                >
-                  {tAuth('request_new_reset_link')}
-                </button>
-                .
-              </p>
+              {callbackFlow === 'recovery' ? (
+                <>
+                  <p className="text-sm font-medium text-destructive">
+                    {tAuth('callback_error_title')}
+                  </p>
+                  <p className="mt-1 text-sm text-destructive/90">
+                    {tAuth('callback_error_body')}{' '}
+                    <button
+                      type="button"
+                      onClick={() => setShowResetPassword(true)}
+                      className="font-medium underline underline-offset-2"
+                    >
+                      {tAuth('request_new_reset_link')}
+                    </button>
+                    .
+                  </p>
+                </>
+              ) : (
+                <>
+                  <p className="text-sm font-medium text-destructive">
+                    {tAuth('callback_error_title_signup')}
+                  </p>
+                  <p className="mt-1 text-sm text-destructive/90">
+                    {tAuth('callback_error_body_signup')}
+                  </p>
+                </>
+              )}
             </div>
           )}
           {bankIdEnabled && (
@@ -412,13 +444,12 @@ function LoginPageContent() {
                     {tAuth('bankid_no_account_body')}
                   </p>
                   <p className="mt-2">
-                    <button
-                      type="button"
-                      onClick={() => setBankIdNoAccount(null)}
+                    <Link
+                      href="/register"
                       className="text-xs text-amber-600 underline underline-offset-2 hover:text-amber-800 dark:text-amber-400"
                     >
                       {tAuth('bankid_no_account_create')}
-                    </button>
+                    </Link>
                   </p>
                 </div>
               ) : (

@@ -1,8 +1,8 @@
-import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
-import { requireCompanyId } from '@/lib/company/context'
+import { withRouteContext } from '@/lib/api/with-route-context'
 import { resolveSekAmount } from '@/lib/bookkeeping/currency-utils'
 import type { ReportSourceLine } from '@/lib/reports/source-lines'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 /**
  * GET /api/reports/ar-ledger/customer/[customerId]/invoices
@@ -16,18 +16,9 @@ import type { ReportSourceLine } from '@/lib/reports/source-lines'
  */
 const PAGE_LIMIT = 500
 
-export async function GET(
-  request: Request,
-  { params }: { params: Promise<{ customerId: string }> }
-) {
-  const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
-
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const companyId = await requireCompanyId(supabase, user.id)
+export const GET = withRouteContext<{ params: Promise<{ customerId: string }> }>(
+  'report.ar_ledger.customer_invoices',
+  async (request, { supabase, companyId }, { params }) => {
   const { customerId } = await params
 
   // Verify customer belongs to the company.
@@ -66,7 +57,7 @@ export async function GET(
     .limit(PAGE_LIMIT)
 
   if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 })
+    return NextResponse.json({ error: getUserErrorMessage(error) }, { status: 500 })
   }
 
   // For each invoice, find the registration journal entry (source_type =
@@ -149,4 +140,4 @@ export async function GET(
       next_cursor: null,
     },
   })
-}
+})

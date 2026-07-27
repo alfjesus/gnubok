@@ -1,22 +1,18 @@
-import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
+import { withRouteContext } from '@/lib/api/with-route-context'
 import { evaluateMappingRules } from '@/lib/bookkeeping/mapping-engine'
 import { validateBody } from '@/lib/api/validate'
 import { EvaluateMappingRulesSchema } from '@/lib/api/schemas'
-import { requireCompanyId } from '@/lib/company/context'
 import type { Transaction } from '@/types'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
-export async function POST(request: Request) {
-  const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
+export const POST = withRouteContext('mapping_rules.evaluate', async (request, ctx) => {
+  const { supabase, companyId, log } = ctx
 
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const companyId = await requireCompanyId(supabase, user.id)
-
-  const validation = await validateBody(request, EvaluateMappingRulesSchema)
+  const validation = await validateBody(request, EvaluateMappingRulesSchema, {
+    log,
+    operation: 'mapping_rules.evaluate',
+  })
   if (!validation.success) return validation.response
   const body = validation.data
 
@@ -37,6 +33,8 @@ export async function POST(request: Request) {
 
     transaction = data as Transaction
   } else {
+    // Schema-validated (amount required, passthrough for optional signal
+    // fields) — the mapping engine only reads the fields it knows.
     transaction = body as unknown as Transaction
   }
 
@@ -45,8 +43,8 @@ export async function POST(request: Request) {
     return NextResponse.json({ data: result })
   } catch (err) {
     return NextResponse.json(
-      { error: err instanceof Error ? err.message : 'Evaluation failed' },
+      { error: err instanceof Error ? getUserErrorMessage(err) : 'Evaluation failed' },
       { status: 500 }
     )
   }
-}
+})

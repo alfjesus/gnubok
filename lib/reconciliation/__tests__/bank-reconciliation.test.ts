@@ -12,6 +12,7 @@ import {
   unlinkReconciliation,
   getReconciliationStatus,
   scopeTransactionsToAccount,
+  ledgerLineAmountIn,
 } from '../bank-reconciliation'
 import type { UnlinkedGLLine } from '../bank-reconciliation'
 import { makeTransaction } from '@/tests/helpers'
@@ -40,7 +41,84 @@ function makeGLLine(overrides: Partial<UnlinkedGLLine> = {}): UnlinkedGLLine {
 }
 
 // ============================================================
-// scopeTransactionsToAccount — the per-account query filter
+// ledgerLineAmountIn: the single definition of "this ledger line's amount,
+// expressed in the currency the account is being reconciled in"
+// ============================================================
+
+describe('ledgerLineAmountIn', () => {
+  it('nets debit against credit on SEK, ignoring the currency LABEL', () => {
+    // The headline trap: currency-utils stamps `currency: 'EUR'` +
+    // amount_in_currency onto a line whose debit_amount is SEK (a EUR supplier
+    // invoice paid from a SEK account). Reconciling that account in SEK must
+    // use the SEK columns and ignore the label entirely.
+    expect(ledgerLineAmountIn({ debit_amount: 1150, credit_amount: 0 }, 'SEK')).toBe(1150)
+    expect(ledgerLineAmountIn({ debit_amount: 0, credit_amount: 1150 }, 'SEK')).toBe(-1150)
+    expect(
+      ledgerLineAmountIn(
+        { debit_amount: 1150, credit_amount: 0, currency: 'EUR', amount_in_currency: 100 },
+        'SEK',
+      ),
+    ).toBe(1150)
+  })
+
+  it('never returns null on SEK: the 95% path always has an answer', () => {
+    expect(ledgerLineAmountIn({ debit_amount: null, credit_amount: null }, 'SEK')).toBe(0)
+    expect(ledgerLineAmountIn({ debit_amount: '250.50', credit_amount: '0' }, 'SEK')).toBe(250.5)
+  })
+
+  it('returns the FOREIGN amount, not the SEK figure, on a foreign account', () => {
+    // 100 EUR booked at 11.50: debit_amount is the 1150 SEK conversion.
+    // Reconciling the EUR account must yield 100, never 1150.
+    expect(
+      ledgerLineAmountIn(
+        { debit_amount: 1150, credit_amount: 0, currency: 'EUR', amount_in_currency: 100 },
+        'EUR',
+      ),
+    ).toBe(100)
+    expect(
+      ledgerLineAmountIn(
+        { debit_amount: 0, credit_amount: 1150, currency: 'EUR', amount_in_currency: 100 },
+        'EUR',
+      ),
+    ).toBe(-100)
+  })
+
+  it('takes direction from the debit/credit side, magnitude from amount_in_currency', () => {
+    // Some rows carry a negatively-signed amount_in_currency; the ledger side is
+    // authoritative for direction, so the sign must not be applied twice.
+    expect(
+      ledgerLineAmountIn(
+        { debit_amount: 0, credit_amount: 1150, currency: 'EUR', amount_in_currency: -100 },
+        'EUR',
+      ),
+    ).toBe(-100)
+  })
+
+  it('returns null (never the SEK figure) when the line carries no amount in that currency', () => {
+    // No rate on the row: a SIE-imported or pre-FX line on a EUR account. There
+    // is nothing to convert with, so the caller must report it, not guess.
+    expect(ledgerLineAmountIn({ debit_amount: 1150, credit_amount: 0 }, 'EUR')).toBeNull()
+    expect(
+      ledgerLineAmountIn({ debit_amount: 1150, credit_amount: 0, currency: 'SEK' }, 'EUR'),
+    ).toBeNull()
+    expect(
+      ledgerLineAmountIn(
+        { debit_amount: 1150, credit_amount: 0, currency: 'EUR', amount_in_currency: null },
+        'EUR',
+      ),
+    ).toBeNull()
+    // Wrong label: a USD line on a EUR account carries no EUR amount.
+    expect(
+      ledgerLineAmountIn(
+        { debit_amount: 1150, credit_amount: 0, currency: 'USD', amount_in_currency: 110 },
+        'EUR',
+      ),
+    ).toBeNull()
+  })
+})
+
+// ============================================================
+// scopeTransactionsToAccount: the per-account query filter
 // ============================================================
 
 describe('scopeTransactionsToAccount', () => {
@@ -74,7 +152,7 @@ describe('scopeTransactionsToAccount', () => {
       args: [`cash_account_id.eq.${id},cash_account_id.is.null`],
     })
     // Regression guard: the old nested `and(cash_account_id.is.null,currency.eq.X)`
-    // silently returned ZERO rows mid-backfill — it must never come back.
+    // silently returned ZERO rows mid-backfill: it must never come back.
     const orCall = calls.find((c) => c.method === 'or')
     expect(String(orCall?.args[0])).not.toContain('and(')
   })
@@ -85,7 +163,7 @@ describe('scopeTransactionsToAccount', () => {
 
     // includeUnassigned=false is the non-primary account case: a secondary
     // same-currency account (e.g. a 1931 savings account) must NOT pull in the
-    // company's unassigned NULL rows — those belong to the primary account.
+    // company's unassigned NULL rows: those belong to the primary account.
     // Double-counting them inflated the secondary account's bank total and
     // showed a large bogus difference ("1930 works, the other accounts go wonky").
     scopeTransactionsToAccount(self as never, id, 'SEK', false)
@@ -94,7 +172,7 @@ describe('scopeTransactionsToAccount', () => {
       { method: 'eq', args: ['currency', 'SEK'] },
       { method: 'eq', args: ['cash_account_id', id] },
     ])
-    // No OR — the IS NULL fallback must not appear for a non-primary account.
+    // No OR: the IS NULL fallback must not appear for a non-primary account.
     expect(calls.find((c) => c.method === 'or')).toBeUndefined()
   })
 
@@ -120,7 +198,7 @@ describe('scopeTransactionsToAccount', () => {
 })
 
 // ============================================================
-// tryReconcileTransaction — in-memory matching
+// tryReconcileTransaction: in-memory matching
 // ============================================================
 
 describe('tryReconcileTransaction', () => {
@@ -177,10 +255,10 @@ describe('tryReconcileTransaction', () => {
     expect(result!.confidence).toBe(0.90)
   })
 
-  // Regression: viktor@frnzn.com — recurring monthly bank fee from 2026 was
+  // Regression: viktor@frnzn.com: recurring monthly bank fee from 2026 was
   // wrongly reconciled to a 2024 SIE-imported voucher because description +
   // amount collided. auto_reference must require a real OCR token AND a
-  // bounded date window — description alone, no date check, is not enough.
+  // bounded date window: description alone, no date check, is not enough.
   it('does NOT match recurring charge across years on description alone', () => {
     const tx = makeTransaction({
       amount: -149,
@@ -238,7 +316,7 @@ describe('tryReconcileTransaction', () => {
 
     const result = tryReconcileTransaction(tx, [line])
 
-    // 5 days apart, no reference, different dates — no match
+    // 5 days apart, no reference, different dates: no match
     expect(result).toBeNull()
   })
 
@@ -298,6 +376,56 @@ describe('tryReconcileTransaction', () => {
     expect(result).toBeNull()
   })
 
+  // The currency check must gate BOTH sides. Gating only the transaction left a
+  // foreign bank amount being compared against a ledger figure that is always
+  // SEK, so a same-magnitude coincidence in the wrong unit scored auto_exact.
+  it('does NOT match a foreign bank row to a same-magnitude SEK ledger leg', () => {
+    const tx = makeTransaction({ amount: 100, date: '2024-06-15', currency: 'EUR' })
+    // A plain SEK booking: 100 kr on the same date. Same number, wrong unit.
+    const sekLine = makeGLLine({
+      debit_amount: 100,
+      entry_date: '2024-06-15',
+      currency: 'SEK',
+    })
+
+    const result = tryReconcileTransaction(tx, [sekLine], 'EUR')
+
+    expect(result).toBeNull()
+  })
+
+  it('matches a EUR bank row against the EUR amount recorded on the ledger line', () => {
+    const tx = makeTransaction({ amount: 100, date: '2024-06-15', currency: 'EUR' })
+    // 100 EUR at 11.50: the ledger columns hold the 1150 SEK conversion.
+    const eurLine = makeGLLine({
+      debit_amount: 1150,
+      entry_date: '2024-06-15',
+      currency: 'EUR',
+      amount_in_currency: 100,
+    })
+
+    const result = tryReconcileTransaction(tx, [eurLine], 'EUR')
+
+    expect(result).not.toBeNull()
+    expect(result!.method).toBe('auto_exact')
+  })
+
+  it('still matches a SEK payment of a EUR invoice on the SEK account (label is not the unit)', () => {
+    // Regression guard for the 95% path: currency-utils labels this line 'EUR'
+    // while debit_amount is SEK. Reconciling 1930 in SEK must be unaffected.
+    const tx = makeTransaction({ amount: 1150, date: '2024-06-15', currency: 'SEK' })
+    const line = makeGLLine({
+      debit_amount: 1150,
+      entry_date: '2024-06-15',
+      currency: 'EUR',
+      amount_in_currency: 100,
+    })
+
+    const result = tryReconcileTransaction(tx, [line])
+
+    expect(result).not.toBeNull()
+    expect(result!.method).toBe('auto_exact')
+  })
+
   // ------------------------------------------------------------------
   // Empty pool
   // ------------------------------------------------------------------
@@ -354,7 +482,7 @@ describe('tryReconcileTransaction', () => {
 })
 
 // ============================================================
-// runReconciliation — batch matching with DB calls
+// runReconciliation: batch matching with DB calls
 // ============================================================
 
 describe('runReconciliation', () => {
@@ -398,7 +526,7 @@ describe('runReconciliation', () => {
 
     // RPC: get_unlinked_1930_lines returns empty
     enqueue({ data: [] })
-    // from('transactions').select — unmatched
+    // from('transactions').select: unmatched
     enqueue({ data: [] })
 
     const result = await runReconciliation(supabase as never, 'company-1', 'user-1')
@@ -445,14 +573,215 @@ describe('runReconciliation', () => {
     enqueue({ data: [glLine] })
     // from('transactions') returns unmatched transactions
     enqueue({ data: [tx] })
-    // Update transaction with link
-    enqueue({ data: null, error: null })
+    // Update transaction with link: .select('id') returns the updated row
+    enqueue({ data: [{ id: 'tx-1' }] })
 
     const result = await runReconciliation(supabase as never, 'company-1', 'user-1', { dryRun: false })
 
     expect(result.matches).toHaveLength(1)
     expect(result.applied).toBe(1)
     expect(result.errors).toBe(0)
+  })
+
+  it('counts a conflicted apply (0 rows updated) as an error, not applied', async () => {
+    const { supabase, enqueue } = createQueueMockSupabase()
+
+    const tx = makeTransaction({ id: 'tx-1', amount: -500, date: '2024-06-15', currency: 'SEK' })
+    const glLine: UnlinkedGLLine = makeGLLine({
+      line_id: 'line-1',
+      journal_entry_id: 'je-1',
+      credit_amount: 500,
+      entry_date: '2024-06-15',
+    })
+
+    enqueue({ data: [glLine] })
+    enqueue({ data: [tx] })
+    // Optimistic-lock guard: a concurrent linker got there first: the
+    // .is('journal_entry_id', null) filter matches zero rows.
+    enqueue({ data: [] })
+
+    const result = await runReconciliation(supabase as never, 'company-1', 'user-1', { dryRun: false })
+
+    expect(result.applied).toBe(0)
+    expect(result.errors).toBe(1)
+  })
+
+  it('applies only the pairs in applyOnly, intersected with the fresh match run', async () => {
+    const { supabase, enqueue } = createQueueMockSupabase()
+
+    const tx1 = makeTransaction({ id: 'tx-1', amount: 1000, date: '2024-06-15', currency: 'SEK' })
+    const tx2 = makeTransaction({ id: 'tx-2', amount: -500, date: '2024-06-15', currency: 'SEK' })
+    const line1 = makeGLLine({
+      line_id: 'line-1',
+      journal_entry_id: 'je-1',
+      debit_amount: 1000,
+      entry_date: '2024-06-15',
+    })
+    const line2 = makeGLLine({
+      line_id: 'line-2',
+      journal_entry_id: 'je-2',
+      credit_amount: 500,
+      entry_date: '2024-06-15',
+    })
+
+    enqueue({ data: [line1, line2] })
+    enqueue({ data: [tx1, tx2] })
+    // Only ONE update should run: for the single selected pair.
+    enqueue({ data: [{ id: 'tx-2' }] })
+
+    const result = await runReconciliation(supabase as never, 'company-1', 'user-1', {
+      dryRun: false,
+      applyOnly: [
+        { transactionId: 'tx-2', journalEntryId: 'je-2' },
+        // A pair the matcher never proposed must be ignored, not applied.
+        { transactionId: 'tx-99', journalEntryId: 'je-99' },
+      ],
+    })
+
+    expect(result.matches).toHaveLength(1)
+    expect(result.matches[0].transaction.id).toBe('tx-2')
+    expect(result.applied).toBe(1)
+    expect(result.errors).toBe(0)
+  })
+
+  it('skips matches below confidenceThreshold in apply mode but still reports them', async () => {
+    const { supabase, enqueue } = createQueueMockSupabase()
+
+    // auto_exact (0.95): above the 0.9 floor, must apply.
+    const txExact = makeTransaction({ id: 'tx-exact', amount: 1000, date: '2024-06-15', currency: 'SEK' })
+    const lineExact = makeGLLine({
+      line_id: 'line-exact',
+      journal_entry_id: 'je-exact',
+      debit_amount: 1000,
+      entry_date: '2024-06-15',
+    })
+    // auto_fuzzy (0.75): below the 0.9 floor, must be skipped, not applied.
+    const txFuzzy = makeTransaction({ id: 'tx-fuzzy', amount: -999.99, date: '2024-06-15', currency: 'SEK' })
+    const lineFuzzy = makeGLLine({
+      line_id: 'line-fuzzy',
+      journal_entry_id: 'je-fuzzy',
+      credit_amount: 1000,
+      entry_date: '2024-06-15',
+    })
+
+    enqueue({ data: [lineExact, lineFuzzy] })
+    enqueue({ data: [txExact, txFuzzy] })
+    // Exactly ONE update runs: the exact match. If the fuzzy match were
+    // applied too, the queue would be short and this enqueue insufficient.
+    enqueue({ data: [{ id: 'tx-exact' }] })
+
+    const result = await runReconciliation(supabase as never, 'company-1', 'user-1', {
+      dryRun: false,
+      confidenceThreshold: 0.9,
+    })
+
+    // Both matches are REPORTED (skipped is not silently dropped) ...
+    expect(result.matches).toHaveLength(2)
+    // ... but only the high-confidence one is applied.
+    expect(result.applied).toBe(1)
+    expect(result.errors).toBe(0)
+    expect(result.skippedBelowThreshold).toBe(1)
+    const skipped = result.matches.find((m) => m.transaction.id === 'tx-fuzzy')
+    expect(skipped?.method).toBe('auto_fuzzy')
+  })
+
+  it('applies a match exactly at the threshold (floor is inclusive)', async () => {
+    const { supabase, enqueue } = createQueueMockSupabase()
+
+    // auto_date_range scores exactly 0.85: with threshold 0.85 it must apply.
+    const tx = makeTransaction({ id: 'tx-1', amount: 750, date: '2024-06-17', currency: 'SEK' })
+    const line = makeGLLine({
+      line_id: 'line-1',
+      journal_entry_id: 'je-1',
+      debit_amount: 750,
+      entry_date: '2024-06-15',
+    })
+
+    enqueue({ data: [line] })
+    enqueue({ data: [tx] })
+    enqueue({ data: [{ id: 'tx-1' }] })
+
+    const result = await runReconciliation(supabase as never, 'company-1', 'user-1', {
+      dryRun: false,
+      confidenceThreshold: 0.85,
+    })
+
+    expect(result.applied).toBe(1)
+    expect(result.skippedBelowThreshold).toBe(0)
+  })
+
+  it('dry run is unaffected by confidenceThreshold: every proposal is returned', async () => {
+    const { supabase, enqueue } = createQueueMockSupabase()
+
+    const txFuzzy = makeTransaction({ id: 'tx-fuzzy', amount: -999.99, date: '2024-06-15', currency: 'SEK' })
+    const lineFuzzy = makeGLLine({
+      line_id: 'line-fuzzy',
+      journal_entry_id: 'je-fuzzy',
+      credit_amount: 1000,
+      entry_date: '2024-06-15',
+    })
+
+    enqueue({ data: [lineFuzzy] })
+    enqueue({ data: [txFuzzy] })
+
+    const result = await runReconciliation(supabase as never, 'company-1', 'user-1', {
+      dryRun: true,
+      confidenceThreshold: 0.9,
+    })
+
+    // The preview always shows the full proposal set: filtering happens only
+    // on apply, so the user can still review + tick fuzzy matches manually.
+    expect(result.matches).toHaveLength(1)
+    expect(result.matches[0].method).toBe('auto_fuzzy')
+    expect(result.applied).toBe(0)
+    expect(result.skippedBelowThreshold).toBe(0)
+  })
+
+  it('applies every match, including fuzzy, when no threshold is given (legacy behavior)', async () => {
+    const { supabase, enqueue } = createQueueMockSupabase()
+
+    const txFuzzy = makeTransaction({ id: 'tx-fuzzy', amount: -999.99, date: '2024-06-15', currency: 'SEK' })
+    const lineFuzzy = makeGLLine({
+      line_id: 'line-fuzzy',
+      journal_entry_id: 'je-fuzzy',
+      credit_amount: 1000,
+      entry_date: '2024-06-15',
+    })
+
+    enqueue({ data: [lineFuzzy] })
+    enqueue({ data: [txFuzzy] })
+    enqueue({ data: [{ id: 'tx-fuzzy' }] })
+
+    const result = await runReconciliation(supabase as never, 'company-1', 'user-1', {
+      dryRun: false,
+    })
+
+    expect(result.applied).toBe(1)
+    expect(result.errors).toBe(0)
+    expect(result.skippedBelowThreshold).toBe(0)
+  })
+
+  it('ignores applyOnly on dry runs and returns the full match set', async () => {
+    const { supabase, enqueue } = createQueueMockSupabase()
+
+    const tx1 = makeTransaction({ id: 'tx-1', amount: 1000, date: '2024-06-15', currency: 'SEK' })
+    const line1 = makeGLLine({
+      line_id: 'line-1',
+      journal_entry_id: 'je-1',
+      debit_amount: 1000,
+      entry_date: '2024-06-15',
+    })
+
+    enqueue({ data: [line1] })
+    enqueue({ data: [tx1] })
+
+    const result = await runReconciliation(supabase as never, 'company-1', 'user-1', {
+      dryRun: true,
+      applyOnly: [],
+    })
+
+    expect(result.matches).toHaveLength(1)
+    expect(result.applied).toBe(0)
   })
 })
 
@@ -508,17 +837,36 @@ describe('manualLink', () => {
     expect(result.error).toBe('Transaktionen kunde inte hittas.')
   })
 
-  it('rejects when transaction is already linked', async () => {
+  it('rejects when transaction is already linked to a LIVE (posted) entry', async () => {
     const { supabase, enqueue } = createQueueMockSupabase()
     const tx = makeTransaction({ id: 'tx-1', journal_entry_id: 'je-existing' })
 
-    // Transaction found but already linked
+    // Transaction found, still pointing at a live posted verifikat
     enqueue({ data: tx })
+    enqueue({ data: { status: 'posted' } }) // hasLiveJournalEntryLink: prior link is live
 
     const result = await manualLink(supabase as never, 'company-1', 'tx-1', 'je-1', 'user-1')
 
     expect(result.success).toBe(false)
     expect(result.error).toBe('Transaktionen är redan kopplad till en verifikation.')
+  })
+
+  it('re-links a transaction stranded on a reversed entry (#988)', async () => {
+    const { supabase, enqueue } = createQueueMockSupabase()
+    // Still carries a pointer at a status='reversed' entry (storno/correction
+    // left it behind). The UI shows it as "utan koppling", so manualLink must
+    // treat it as free and overwrite the stale pointer.
+    const tx = makeTransaction({ id: 'tx-1', journal_entry_id: 'je-reversed' })
+
+    enqueue({ data: tx }) // tx fetch
+    enqueue({ data: { status: 'reversed' } }) // hasLiveJournalEntryLink: stale link
+    enqueue({ data: { id: 'je-1', user_id: 'company-1', status: 'posted' } }) // target JE fetch
+    enqueue({ data: [{ debit_amount: 1000, credit_amount: 0, account_number: '1930' }] }) // line on 1930
+    enqueue({ data: [{ id: 'tx-1' }] }) // UPDATE .eq(stale id) → 1 row overwritten
+
+    const result = await manualLink(supabase as never, 'company-1', 'tx-1', 'je-1', 'user-1', '1930')
+
+    expect(result.success).toBe(true)
   })
 
   it('rejects when journal entry has no line on the selected account', async () => {
@@ -569,12 +917,29 @@ describe('manualLink', () => {
     enqueue({ data: { id: 'je-1', user_id: 'company-1', status: 'posted' } })
     // Line exists on the selected account
     enqueue({ data: [{ debit_amount: 1000, credit_amount: 0, account_number: '1930' }] })
-    // Update succeeds
-    enqueue({ data: null, error: null })
+    // Update succeeds: .select('id') returns the updated row
+    enqueue({ data: [{ id: 'tx-1' }] })
 
     const result = await manualLink(supabase as never, 'company-1', 'tx-1', 'je-1', 'user-1', '1930')
 
     expect(result.success).toBe(true)
+  })
+
+  it('rejects when a concurrent linker won the race (0 rows updated)', async () => {
+    const { supabase, enqueue } = createQueueMockSupabase()
+    const tx = makeTransaction({ id: 'tx-1', journal_entry_id: null })
+
+    enqueue({ data: tx })
+    enqueue({ data: { id: 'je-1', user_id: 'company-1', status: 'posted' } })
+    enqueue({ data: [{ debit_amount: 1000, credit_amount: 0, account_number: '1930' }] })
+    // The .is('journal_entry_id', null) optimistic-lock filter matched nothing:
+    // another session linked the transaction between our read and this write.
+    enqueue({ data: [] })
+
+    const result = await manualLink(supabase as never, 'company-1', 'tx-1', 'je-1', 'user-1', '1930')
+
+    expect(result.success).toBe(false)
+    expect(result.error).toBe('Transaktionen är redan kopplad till en verifikation.')
   })
 
   it('succeeds for a bound transaction when the account matches', async () => {
@@ -591,19 +956,19 @@ describe('manualLink', () => {
     enqueue({ data: { ledger_account: '1930' } })
     // Line exists on 1930
     enqueue({ data: [{ debit_amount: 1000, credit_amount: 0, account_number: '1930' }] })
-    // Update succeeds
-    enqueue({ data: null, error: null })
+    // Update succeeds: .select('id') returns the updated row
+    enqueue({ data: [{ id: 'tx-1' }] })
 
     const result = await manualLink(supabase as never, 'company-1', 'tx-1', 'je-1', 'user-1', '1930')
 
     expect(result.success).toBe(true)
   })
 
-  it('allows N:1 — does not reject when the verifikat already has a linked transaction', async () => {
+  it('allows N:1, does not reject when the verifikat already has a linked transaction', async () => {
     const { supabase, enqueue } = createQueueMockSupabase()
     // This transaction is itself unlinked; the TARGET entry already has another
     // transaction pointing at it. manualLink no longer queries for / rejects
-    // that — several bank transactions may settle one verifikat (a salary run
+    // that: several bank transactions may settle one verifikat (a salary run
     // paid in multiple transfers). The only per-transaction guard is that THIS
     // transaction isn't already linked (tx.journal_entry_id), still enforced.
     const tx = makeTransaction({ id: 'tx-2', journal_entry_id: null })
@@ -611,8 +976,8 @@ describe('manualLink', () => {
     enqueue({ data: tx })
     enqueue({ data: { id: 'je-1', user_id: 'company-1', status: 'posted' } })
     enqueue({ data: [{ debit_amount: 1000, credit_amount: 0, account_number: '1930' }] })
-    // Update succeeds — note there is NO existing-link lookup in the sequence.
-    enqueue({ data: null, error: null })
+    // Update succeeds: note there is NO existing-link lookup in the sequence.
+    enqueue({ data: [{ id: 'tx-2' }] })
 
     const result = await manualLink(supabase as never, 'company-1', 'tx-2', 'je-1', 'user-1', '1930')
 
@@ -672,7 +1037,7 @@ describe('unlinkReconciliation', () => {
       },
     })
 
-    const result = await unlinkReconciliation(supabase as never, 'company-1', 'tx-1')
+    const result = await unlinkReconciliation(supabase as never, 'company-1', 'tx-1', 'user-1')
 
     expect(result.success).toBe(false)
     expect(result.error).toContain('Cannot unlink')
@@ -692,14 +1057,56 @@ describe('unlinkReconciliation', () => {
     // Update succeeds
     enqueue({ data: null, error: null })
 
-    const result = await unlinkReconciliation(supabase as never, 'company-1', 'tx-1')
+    const result = await unlinkReconciliation(supabase as never, 'company-1', 'tx-1', 'user-1')
 
     expect(result.success).toBe(true)
+  })
+
+  it('attributes the audit log row to the acting user, not the company', async () => {
+    // Regression: unlinkReconciliation used to pass companyId where
+    // logMatchEvent expects userId, so payment_match_log.user_id recorded the
+    // company UUID (or the insert failed its FK silently).
+    const inserts: Record<string, unknown>[] = []
+    const resultQueue: { data: unknown; error: unknown }[] = [
+      {
+        data: { id: 'tx-1', journal_entry_id: 'je-1', reconciliation_method: 'manual' },
+        error: null,
+      },
+      { data: null, error: null }, // update
+    ]
+    const buildChain = (table?: string): unknown => {
+      const handler: ProxyHandler<object> = {
+        get(_target, prop) {
+          if (prop === 'then') {
+            const next = resultQueue.shift() ?? { data: null, error: null }
+            return (resolve: (v: unknown) => void) => resolve(next)
+          }
+          if (prop === 'insert') {
+            return (row: Record<string, unknown>) => {
+              if (table === 'payment_match_log') inserts.push(row)
+              return buildChain(table)
+            }
+          }
+          return (..._args: unknown[]) => buildChain(table)
+        },
+      }
+      return new Proxy({}, handler)
+    }
+    const supabase = {
+      from: vi.fn().mockImplementation((table: string) => buildChain(table)),
+      rpc: vi.fn().mockImplementation(() => buildChain()),
+    }
+
+    const result = await unlinkReconciliation(supabase as never, 'company-1', 'tx-1', 'user-1')
+
+    expect(result.success).toBe(true)
+    expect(inserts).toHaveLength(1)
+    expect(inserts[0].user_id).toBe('user-1')
   })
 })
 
 // ============================================================
-// getReconciliationStatus — IB exclusion (PR 3 of #443)
+// getReconciliationStatus: IB exclusion (PR 3 of #443)
 // ============================================================
 
 describe('getReconciliationStatus', () => {
@@ -740,10 +1147,18 @@ describe('getReconciliationStatus', () => {
       data: [{ amount: 1000, journal_entry_id: 'je-tx', reconciliation_method: 'auto_exact' }],
     })
     // 2) journal_entry_lines: 50,000 IB debit + 1000 matched debit on 1930
+    // Two-step entry-lines fetch: entries page first, then lines by entry id
+    // (parents reattached under journal_entries by the helper).
     enqueue({
       data: [
-        { debit_amount: 50000, credit_amount: 0, journal_entries: { status: 'posted', source_type: 'opening_balance' } },
-        { debit_amount: 1000, credit_amount: 0, journal_entries: { status: 'posted', source_type: 'bank_import' } },
+        { id: 'je-gen1', status: 'posted', source_type: 'opening_balance' },
+        { id: 'je-gen2', status: 'posted', source_type: 'bank_import' },
+      ],
+    })
+    enqueue({
+      data: [
+        { debit_amount: 50000, credit_amount: 0, journal_entry_id: 'je-gen1' },
+        { debit_amount: 1000, credit_amount: 0, journal_entry_id: 'je-gen2' },
       ],
     })
     // 3) RPC get_unlinked_1930_lines: returns empty (RPC excludes IB after migration)
@@ -771,10 +1186,18 @@ describe('getReconciliationStatus', () => {
       ],
     })
     // 2) GL lines: 50,000 IB + 1000 booked
+    // Two-step entry-lines fetch: entries page first, then lines by entry id
+    // (parents reattached under journal_entries by the helper).
     enqueue({
       data: [
-        { debit_amount: 50000, credit_amount: 0, journal_entries: { status: 'posted', source_type: 'opening_balance' } },
-        { debit_amount: 1000, credit_amount: 0, journal_entries: { status: 'posted', source_type: 'bank_import' } },
+        { id: 'je-gen3', status: 'posted', source_type: 'opening_balance' },
+        { id: 'je-gen4', status: 'posted', source_type: 'bank_import' },
+      ],
+    })
+    enqueue({
+      data: [
+        { debit_amount: 50000, credit_amount: 0, journal_entry_id: 'je-gen3' },
+        { debit_amount: 1000, credit_amount: 0, journal_entry_id: 'je-gen4' },
       ],
     })
     // 3) RPC: empty
@@ -794,8 +1217,10 @@ describe('getReconciliationStatus', () => {
     const { supabase, enqueue } = createQueueMockSupabase()
 
     enqueue({ data: [{ amount: 100, journal_entry_id: 'je-1', reconciliation_method: 'auto_exact' }] })
+    // Two-step entry-lines fetch: entries page first, then lines by entry id.
+    enqueue({ data: [{ id: 'je-1', status: 'posted', source_type: 'bank_import' }] })
     enqueue({
-      data: [{ debit_amount: 100, credit_amount: 0, journal_entries: { status: 'posted', source_type: 'bank_import' } }],
+      data: [{ debit_amount: 100, credit_amount: 0, journal_entry_id: 'je-1' }],
     })
     enqueue({ data: [] })
 
@@ -808,16 +1233,24 @@ describe('getReconciliationStatus', () => {
     expect(status.is_reconciled).toBe(true)
   })
 
-  it('handles array-shaped journal_entries embed (Supabase wide typing)', async () => {
-    // Supabase typings sometimes widen embedded relations to arrays. The
-    // implementation handles both shapes — verify here.
+  it('splits IB from period movement via the reattached parent entry', async () => {
+    // The two-step entry-lines fetch reattaches the parent entry object on
+    // each line under `journal_entries`; entryOf() reads source_type from it
+    // to split the IB summary out of the period movement.
     const { supabase, enqueue } = createQueueMockSupabase()
 
     enqueue({ data: [] })
+    // Two-step entry-lines fetch: entries page first, then lines by entry id.
     enqueue({
       data: [
-        { debit_amount: 1000, credit_amount: 0, journal_entries: [{ status: 'posted', source_type: 'opening_balance' }] },
-        { debit_amount: 200, credit_amount: 0, journal_entries: [{ status: 'posted', source_type: 'bank_import' }] },
+        { id: 'je-ib', status: 'posted', source_type: 'opening_balance' },
+        { id: 'je-mv', status: 'posted', source_type: 'bank_import' },
+      ],
+    })
+    enqueue({
+      data: [
+        { debit_amount: 1000, credit_amount: 0, journal_entry_id: 'je-ib' },
+        { debit_amount: 200, credit_amount: 0, journal_entry_id: 'je-mv' },
       ],
     })
     enqueue({ data: [] })
@@ -828,76 +1261,450 @@ describe('getReconciliationStatus', () => {
     expect(status.gl_1930_period_movement).toBe(200)
   })
 
-  it('nets a book-only correction (storno + rättelse) to a reconciled period', async () => {
-    // The reported bug: a correction made via the storno flow puts a posted
-    // storno AND a posted correction on 1930, while the original flips to
-    // 'reversed'. Both posted vouchers have no bank-feed counterpart. Before the
-    // fix they inflated the period movement and showed as omatchade
-    // verifikationer, manufacturing a phantom diff. They must be excluded from
-    // the movement so a fully-matched period reconciles.
+  it('reconciles a corrected bank receipt and keeps gl_1930_balance equal to the balance sheet', async () => {
+    // A +25000 deposit was booked to the wrong counter-account, then corrected
+    // via the storno flow: the original flips to 'reversed', a storno (credit
+    // 25000) and a correction (debit 25000) are posted, and correctEntry
+    // re-points the bank transaction to the live correction (je-corr).
+    //
+    // Reconciliation now sums posted+reversed on 1930, exactly as the trial
+    // balance / balance sheet do, so the cluster nets to the true +25000 and
+    // the period reconciles. gl_1930_balance must equal what the balansräkning
+    // shows for 1930 (the bug this widget used to have was the two disagreeing).
     const { supabase, enqueue } = createQueueMockSupabase()
 
-    // 1) transactions: one real matched outflow of -9908.75
+    // 1) transactions: the +25000 deposit, re-pointed to the correction
     enqueue({
-      data: [{ amount: -9908.75, journal_entry_id: 'je-others', reconciliation_method: 'auto_exact' }],
+      data: [{ amount: 25000, journal_entry_id: 'je-corr', reconciliation_method: 'manual' }],
     })
-    // 2) GL lines on 1930: the matched outflow, plus the correction cluster.
-    //    Original (credit 25000) is status='reversed'; storno (debit 25000) and
-    //    correction (debit 25000) are posted. None of the cluster is linked.
-    enqueue({
-      data: [
-        { debit_amount: 0, credit_amount: 9908.75, journal_entries: { id: 'je-others', status: 'posted', source_type: 'bank_import' } },
-        { debit_amount: 0, credit_amount: 25000, journal_entries: { id: 'je-orig', status: 'reversed', source_type: 'manual' } },
-        { debit_amount: 25000, credit_amount: 0, journal_entries: { id: 'je-storno', status: 'posted', source_type: 'storno' } },
-        { debit_amount: 25000, credit_amount: 0, journal_entries: { id: 'je-corr', status: 'posted', source_type: 'correction' } },
-      ],
-    })
-    // 3) RPC: empty (migration excludes storno/correction; reversed isn't posted)
-    enqueue({ data: [] })
-
-    const status = await getReconciliationStatus(supabase as never, 'company-1')
-
-    // Posted balance still includes the storno/correction (+50000) and the
-    // matched outflow (-9908.75); the reversed original is not posted.
-    expect(status.gl_1930_balance).toBe(40091.25)
-    // …but those +50000 are book-only and excluded from the period movement.
-    expect(status.gl_1930_correction_adjustment).toBe(50000)
-    expect(status.gl_1930_period_movement).toBe(-9908.75)
-    expect(status.bank_transaction_total).toBe(-9908.75)
-    expect(status.difference).toBe(0)
-    expect(status.is_reconciled).toBe(true)
-  })
-
-  it('does not create a new phantom when a matched deposit is later corrected', async () => {
-    // Case 2: a +25000 deposit was matched to an entry, then that entry was
-    // corrected. The deposit's link stays on the now-'reversed' original. The
-    // movement excludes the storno/correction, so to stay symmetric the deposit
-    // (linked to a reversed entry) must drop off the bank side too — otherwise
-    // we'd swap the old -50000 phantom for a +25000 one.
-    const { supabase, enqueue } = createQueueMockSupabase()
-
-    // 1) transactions: the +25000 deposit, still linked to the reversed original
-    enqueue({
-      data: [{ amount: 25000, journal_entry_id: 'je-orig', reconciliation_method: 'manual' }],
-    })
-    // 2) GL lines: reversed original (debit 25000), storno (credit 25000),
-    //    correction (debit 25000)
+    // 2) GL lines on 1930: reversed original (debit 25000), storno (credit
+    //    25000), correction (debit 25000). All three are summed. Served via
+    //    the two-step entry-lines fetch: entries page, then lines by entry id.
     enqueue({
       data: [
-        { debit_amount: 25000, credit_amount: 0, journal_entries: { id: 'je-orig', status: 'reversed', source_type: 'bank_transaction' } },
-        { debit_amount: 0, credit_amount: 25000, journal_entries: { id: 'je-storno', status: 'posted', source_type: 'storno' } },
-        { debit_amount: 25000, credit_amount: 0, journal_entries: { id: 'je-corr', status: 'posted', source_type: 'correction' } },
+        { id: 'je-orig', status: 'reversed', source_type: 'bank_transaction' },
+        { id: 'je-storno', status: 'posted', source_type: 'storno' },
+        { id: 'je-corr', status: 'posted', source_type: 'correction' },
       ],
     })
+    const lines = [
+      { debit_amount: 25000, credit_amount: 0, journal_entry_id: 'je-orig' },
+      { debit_amount: 0, credit_amount: 25000, journal_entry_id: 'je-storno' },
+      { debit_amount: 25000, credit_amount: 0, journal_entry_id: 'je-corr' },
+    ]
+    enqueue({ data: lines })
     // 3) RPC: empty
     enqueue({ data: [] })
 
     const status = await getReconciliationStatus(supabase as never, 'company-1')
 
-    // Deposit excluded (linked to a reversed entry); cluster excluded from movement.
-    expect(status.bank_transaction_total).toBe(0)
-    expect(status.gl_1930_period_movement).toBe(0)
+    // Balance-sheet-equivalent: posted+reversed summed = 25000 - 25000 + 25000.
+    const balanceSheet1930 = lines.reduce(
+      (s, l) => s + l.debit_amount - l.credit_amount,
+      0,
+    )
+    expect(status.gl_1930_balance).toBe(balanceSheet1930) // 25000: matches BS
+    expect(status.gl_1930_correction_adjustment).toBe(0)  // storno + correction net
+    expect(status.gl_1930_period_movement).toBe(25000)
+    expect(status.bank_transaction_total).toBe(25000)
     expect(status.difference).toBe(0)
     expect(status.is_reconciled).toBe(true)
+  })
+
+  it('reconciles an amount correction even though the correction adjustment is non-zero', async () => {
+    // Regression for the de-reconcile bug: a 25000 receipt was booked as 24000,
+    // then corrected to 25000. The storno (credit 24000) and correction (debit
+    // 25000) net to +1000 on 1930, and correctEntry re-points the real 25000
+    // feed transaction to the correction. The OLD code subtracted that +1000
+    // correction bucket from the movement while still counting the re-pointed
+    // 25000 transaction → a phantom 1000 diff. The unified inclusion rule nets
+    // it correctly: gl_balance = 25000 = the feed, difference = 0.
+    const { supabase, enqueue } = createQueueMockSupabase()
+
+    enqueue({
+      data: [{ amount: 25000, journal_entry_id: 'je-corr', reconciliation_method: 'manual' }],
+    })
+    // Two-step entry-lines fetch: entries page first, then lines by entry id
+    // (parents reattached under journal_entries by the helper).
+    enqueue({
+      data: [
+        { id: 'je-orig', status: 'reversed', source_type: 'bank_transaction' },
+        { id: 'je-storno', status: 'posted', source_type: 'storno' },
+        { id: 'je-corr', status: 'posted', source_type: 'correction' },
+      ],
+    })
+    enqueue({
+      data: [
+        { debit_amount: 24000, credit_amount: 0, journal_entry_id: 'je-orig' },
+        { debit_amount: 0, credit_amount: 24000, journal_entry_id: 'je-storno' },
+        { debit_amount: 25000, credit_amount: 0, journal_entry_id: 'je-corr' },
+      ],
+    })
+    enqueue({ data: [] })
+
+    const status = await getReconciliationStatus(supabase as never, 'company-1')
+
+    expect(status.gl_1930_balance).toBe(25000)
+    expect(status.gl_1930_correction_adjustment).toBe(1000) // -24000 + 25000
+    expect(status.gl_1930_period_movement).toBe(25000)
+    expect(status.bank_transaction_total).toBe(25000)
+    expect(status.difference).toBe(0)
+    expect(status.is_reconciled).toBe(true)
+  })
+
+  it('reconciles a legacy deposit still linked to the reversed original (no special-case drop)', async () => {
+    // Pre-relink data: the +25000 deposit was matched, the entry corrected, but
+    // the transaction was never re-pointed and still references the reversed
+    // original. With posted+reversed summed on the GL side and NO reversed-link
+    // dropping on the bank side, this still nets to zero: symmetric without any
+    // special case.
+    const { supabase, enqueue } = createQueueMockSupabase()
+
+    enqueue({
+      data: [{ amount: 25000, journal_entry_id: 'je-orig', reconciliation_method: 'manual' }],
+    })
+    // Two-step entry-lines fetch: entries page first, then lines by entry id
+    // (parents reattached under journal_entries by the helper).
+    enqueue({
+      data: [
+        { id: 'je-orig', status: 'reversed', source_type: 'bank_transaction' },
+        { id: 'je-storno', status: 'posted', source_type: 'storno' },
+        { id: 'je-corr', status: 'posted', source_type: 'correction' },
+      ],
+    })
+    enqueue({
+      data: [
+        { debit_amount: 25000, credit_amount: 0, journal_entry_id: 'je-orig' },
+        { debit_amount: 0, credit_amount: 25000, journal_entry_id: 'je-storno' },
+        { debit_amount: 25000, credit_amount: 0, journal_entry_id: 'je-corr' },
+      ],
+    })
+    enqueue({ data: [] })
+
+    const status = await getReconciliationStatus(supabase as never, 'company-1')
+
+    expect(status.bank_transaction_total).toBe(25000) // counted, not dropped
+    expect(status.gl_1930_period_movement).toBe(25000)
+    expect(status.difference).toBe(0)
+    expect(status.is_reconciled).toBe(true)
+  })
+
+  it('flags a book-only entry that moves the bank balance with no feed counterpart', async () => {
+    // Intentional behaviour: a manual posting that moves 1930 without a matching
+    // bank-feed transaction (e.g. interest the feed import missed, booked debit
+    // 1930 / credit 8310) is a genuine reconciliation break: the GL balance no
+    // longer matches the statement. It must surface as a difference, not be
+    // silently swept under a "correction" exclusion.
+    const { supabase, enqueue } = createQueueMockSupabase()
+
+    enqueue({ data: [] }) // no bank-feed transactions
+    // Two-step entry-lines fetch: entries page first, then lines by entry id
+    // (parents reattached under journal_entries by the helper).
+    enqueue({
+      data: [
+        { id: 'je-manual', status: 'posted', source_type: 'manual' },
+      ],
+    })
+    enqueue({
+      data: [
+        { debit_amount: 500, credit_amount: 0, journal_entry_id: 'je-manual' },
+      ],
+    })
+    enqueue({ data: [] })
+
+    const status = await getReconciliationStatus(supabase as never, 'company-1')
+
+    expect(status.gl_1930_period_movement).toBe(500)
+    expect(status.bank_transaction_total).toBe(0)
+    expect(status.difference).toBe(-500)
+    expect(status.is_reconciled).toBe(false)
+  })
+
+  it('floors a full-history window at the IB date so a prior period cannot count the IB (issue #751)', async () => {
+    // Real-world repro: the widget's date filter defaults to "full history"
+    // (no dateFrom). A company with two fiscal periods has prior-period (2025)
+    // movements on the account that net to EXACTLY the opening balance, plus the
+    // new period's IB entry dated on period start. Summing the whole history and
+    // only subtracting the IB *summary* leaves the prior-period *detail* in the
+    // movement while the bank feed only covers the current period: a phantom
+    // difference equal to the IB. The server now floors the window at the most
+    // recent IB date on the account, clamping BOTH sides to the current period.
+    const { supabase, enqueue } = createQueueMockSupabase()
+
+    // 1) transactions: a prior-period feed line (6000, 2025) + the current
+    //    period's feed (5000, 2026). The floor must drop the 2025 one.
+    enqueue({
+      data: [
+        { date: '2025-03-31', amount: 6000, journal_entry_id: 'je-p', reconciliation_method: 'manual' },
+        { date: '2026-02-15', amount: 5000, journal_entry_id: 'je-c', reconciliation_method: 'manual' },
+      ],
+    })
+    // 2) GL lines on the account: prior-period movements (6000 + 4000 = 10000,
+    //    dated 2025) that net to the IB, the IB itself (10000, dated 2026-01-01),
+    //    and the current period's movement (5000, dated 2026).
+    // Two-step entry-lines fetch: entries page first, then lines by entry id
+    // (parents reattached under journal_entries by the helper).
+    enqueue({
+      data: [
+        { id: 'je-p1', status: 'posted', source_type: 'import', entry_date: '2025-03-31' },
+        { id: 'je-p2', status: 'posted', source_type: 'import', entry_date: '2025-09-30' },
+        { id: 'je-ib', status: 'posted', source_type: 'opening_balance', entry_date: '2026-01-01' },
+        { id: 'je-c1', status: 'posted', source_type: 'bank_transaction', entry_date: '2026-02-15' },
+      ],
+    })
+    enqueue({
+      data: [
+        { debit_amount: 6000, credit_amount: 0, journal_entry_id: 'je-p1' },
+        { debit_amount: 4000, credit_amount: 0, journal_entry_id: 'je-p2' },
+        { debit_amount: 10000, credit_amount: 0, journal_entry_id: 'je-ib' },
+        { debit_amount: 5000, credit_amount: 0, journal_entry_id: 'je-c1' },
+      ],
+    })
+    // 3) RPC: empty
+    enqueue({ data: [] })
+
+    // No dateFrom: the "full history" default that triggers the bug.
+    const status = await getReconciliationStatus(supabase as never, 'company-1')
+
+    // Both sides clamped to >= 2026-01-01 (the IB date): only the IB + the
+    // current-period movement remain on the GL side; only the 2026 feed remains
+    // on the bank side. The prior period (which equalled the IB) is excluded.
+    expect(status.gl_1930_balance).toBe(15000)          // IB 10000 + 5000 (NOT 25000)
+    expect(status.gl_1930_period_movement).toBe(5000)   // IB excluded
+    expect(status.gl_1930_opening_balance).toBe(10000)  // UI "räknas inte" note stays truthful
+    expect(status.bank_transaction_total).toBe(5000)    // 2025 feed floored out
+    expect(status.difference).toBe(0)
+    expect(status.is_reconciled).toBe(true)
+  })
+
+  it('floors at the IB date even when the caller passes a dateFrom earlier than the IB', async () => {
+    // Safety net for a manual date override / direct API call: clearing the date
+    // filter (or setting it before the IB) must not resurrect the phantom diff.
+    // effectiveFrom = max(dateFrom, ibDate), so an earlier dateFrom is raised.
+    const { supabase, enqueue } = createQueueMockSupabase()
+
+    enqueue({
+      data: [
+        { date: '2025-05-01', amount: 8000, journal_entry_id: 'je-p', reconciliation_method: 'manual' },
+        { date: '2026-04-10', amount: 3000, journal_entry_id: 'je-c', reconciliation_method: 'manual' },
+      ],
+    })
+    // Two-step entry-lines fetch: entries page first, then lines by entry id
+    // (parents reattached under journal_entries by the helper).
+    enqueue({
+      data: [
+        { id: 'je-p1', status: 'posted', source_type: 'import', entry_date: '2025-05-01' },
+        { id: 'je-ib', status: 'posted', source_type: 'opening_balance', entry_date: '2026-01-01' },
+        { id: 'je-c1', status: 'posted', source_type: 'bank_transaction', entry_date: '2026-04-10' },
+      ],
+    })
+    enqueue({
+      data: [
+        { debit_amount: 8000, credit_amount: 0, journal_entry_id: 'je-p1' },
+        { debit_amount: 8000, credit_amount: 0, journal_entry_id: 'je-ib' },
+        { debit_amount: 3000, credit_amount: 0, journal_entry_id: 'je-c1' },
+      ],
+    })
+    enqueue({ data: [] })
+
+    // dateFrom deliberately before the IB date.
+    const status = await getReconciliationStatus(supabase as never, 'company-1', '2025-01-01')
+
+    expect(status.gl_1930_period_movement).toBe(3000)   // IB + prior detail both excluded
+    expect(status.gl_1930_opening_balance).toBe(8000)
+    expect(status.bank_transaction_total).toBe(3000)    // 2025 feed floored out
+    expect(status.difference).toBe(0)
+    expect(status.is_reconciled).toBe(true)
+  })
+
+  it('reconciles a mid-period window (dateFrom after the IB date) on movements alone', async () => {
+    // Per-month reconciliation: the user scopes to March, after the fiscal-year
+    // IB (2026-01-01). effectiveFrom = max(dateFrom, ibDate) = the March dateFrom,
+    // so the IB and Jan/Feb movements are correctly excluded: they belong to the
+    // opening position of a March window, not its movements. gl_1930_opening_balance
+    // is 0 here BY DESIGN: a mid-period window contains no fiscal-year IB, so the
+    // "räknas inte" note is simply absent (not misleadingly zero). The window
+    // reconciles on March's movements vs March's feed.
+    const { supabase, enqueue } = createQueueMockSupabase()
+
+    enqueue({
+      data: [
+        { date: '2026-02-10', amount: 2000, journal_entry_id: 'je-feb', reconciliation_method: 'manual' },
+        { date: '2026-03-15', amount: 3000, journal_entry_id: 'je-mar', reconciliation_method: 'manual' },
+      ],
+    })
+    // Two-step entry-lines fetch: entries page first, then lines by entry id
+    // (parents reattached under journal_entries by the helper).
+    enqueue({
+      data: [
+        { id: 'je-ib', status: 'posted', source_type: 'opening_balance', entry_date: '2026-01-01' },
+        { id: 'je-feb1', status: 'posted', source_type: 'import', entry_date: '2026-02-10' },
+        { id: 'je-mar1', status: 'posted', source_type: 'import', entry_date: '2026-03-15' },
+      ],
+    })
+    enqueue({
+      data: [
+        { debit_amount: 9000, credit_amount: 0, journal_entry_id: 'je-ib' },
+        { debit_amount: 2000, credit_amount: 0, journal_entry_id: 'je-feb1' },
+        { debit_amount: 3000, credit_amount: 0, journal_entry_id: 'je-mar1' },
+      ],
+    })
+    enqueue({ data: [] })
+
+    // dateFrom in March: after the 2026-01-01 IB.
+    const status = await getReconciliationStatus(supabase as never, 'company-1', '2026-03-01')
+
+    expect(status.gl_1930_opening_balance).toBe(0)      // IB not part of a March window
+    expect(status.gl_1930_period_movement).toBe(3000)   // only March movements
+    expect(status.bank_transaction_total).toBe(3000)    // only March feed
+    expect(status.difference).toBe(0)
+    expect(status.is_reconciled).toBe(true)
+  })
+
+  // ----------------------------------------------------------------
+  // Avstämt requires BOTH a zero net difference AND nothing unidentified
+  // ----------------------------------------------------------------
+
+  it('is NOT reconciled when two unmatched transactions offset each other', async () => {
+    // +500 and -500 net to zero against a zero period movement, so the old
+    // net-difference test called this avstämt while BOTH rows were still
+    // unbooked affärshändelser, each owing its own verifikation identifying
+    // belopp and motpart (BFL 5 kap 1-2 §, 6-7 §). Offsetting two unknowns is
+    // not knowing either one (ÅRL 2 kap: individuell värdering,
+    // bruttoredovisning): the account is not avstämt until both are booked.
+    const { supabase, enqueue } = createQueueMockSupabase()
+
+    enqueue({
+      data: [
+        { date: '2026-03-05', amount: 500, journal_entry_id: null, reconciliation_method: null },
+        { date: '2026-03-06', amount: -500, journal_entry_id: null, reconciliation_method: null },
+      ],
+    })
+    // Only the IB on the ledger: period movement is 0, matching the bank net.
+    enqueue({
+      data: [{ id: 'je-ib', status: 'posted', source_type: 'opening_balance', entry_date: '2026-01-01' }],
+    })
+    enqueue({ data: [{ debit_amount: 50000, credit_amount: 0, journal_entry_id: 'je-ib' }] })
+    enqueue({ data: [] })
+
+    const status = await getReconciliationStatus(supabase as never, 'company-1')
+
+    expect(status.difference).toBe(0)
+    expect(status.unmatched_transaction_count).toBe(2)
+    expect(status.is_reconciled).toBe(false)
+  })
+
+  // ----------------------------------------------------------------
+  // Foreign-currency accounts are reconciled in their OWN currency
+  // ----------------------------------------------------------------
+
+  it('reconciles a EUR cash account in EUR, not against its SEK ledger figures', async () => {
+    // 100 EUR booked at 11.50: debit_amount holds the 1150 SEK conversion while
+    // the EUR amount sits in amount_in_currency. Summing the SEK column against
+    // a EUR bank feed produced a difference roughly the size of the exchange
+    // rate, so a foreign cash account could never show is_reconciled.
+    const { supabase, enqueue } = createQueueMockSupabase()
+
+    enqueue({
+      data: [{ date: '2026-03-05', amount: 100, journal_entry_id: 'je-eur', reconciliation_method: 'manual' }],
+    })
+    enqueue({
+      data: [{ id: 'je-eur', status: 'posted', source_type: 'import', entry_date: '2026-03-05' }],
+    })
+    enqueue({
+      data: [
+        {
+          debit_amount: 1150,
+          credit_amount: 0,
+          currency: 'EUR',
+          amount_in_currency: 100,
+          journal_entry_id: 'je-eur',
+        },
+      ],
+    })
+    enqueue({ data: [] })
+
+    const status = await getReconciliationStatus(
+      supabase as never,
+      'company-1',
+      undefined,
+      undefined,
+      '1932',
+      'EUR',
+    )
+
+    expect(status.currency).toBe('EUR')
+    expect(status.gl_1930_period_movement).toBe(100)   // EUR, not 1150 SEK
+    expect(status.bank_transaction_total).toBe(100)
+    expect(status.difference).toBe(0)
+    expect(status.is_reconciled).toBe(true)
+    expect(status.not_reconcilable_reason).toBeNull()
+    expect(status.unconvertible_gl_line_count).toBe(0)
+  })
+
+  it('reports not-reconcilable-yet when a foreign account has lines with no amount in that currency', async () => {
+    // A SIE-imported / pre-FX line on the EUR account: only a SEK figure, no
+    // per-row rate. There is nothing honest to convert with, so the window must
+    // say so instead of quietly treating 1150 SEK as 1150 EUR.
+    const { supabase, enqueue } = createQueueMockSupabase()
+
+    enqueue({
+      data: [{ date: '2026-03-05', amount: 100, journal_entry_id: 'je-eur', reconciliation_method: 'manual' }],
+    })
+    enqueue({
+      data: [{ id: 'je-eur', status: 'posted', source_type: 'import', entry_date: '2026-03-05' }],
+    })
+    enqueue({
+      data: [{ debit_amount: 1150, credit_amount: 0, currency: 'SEK', journal_entry_id: 'je-eur' }],
+    })
+    enqueue({ data: [] })
+
+    const status = await getReconciliationStatus(
+      supabase as never,
+      'company-1',
+      undefined,
+      undefined,
+      '1932',
+      'EUR',
+    )
+
+    expect(status.unconvertible_gl_line_count).toBe(1)
+    expect(status.not_reconcilable_reason).toBe('gl_lines_missing_currency_amount')
+    expect(status.is_reconciled).toBe(false)
+  })
+
+  it('leaves a SEK account untouched when its lines carry a foreign LABEL', async () => {
+    // 95%-path regression guard: a SEK payment of a EUR supplier invoice is
+    // labelled 'EUR' on the line while debit/credit are SEK. Reconciling 1930
+    // in SEK must use the SEK columns and never flag it as unconvertible.
+    const { supabase, enqueue } = createQueueMockSupabase()
+
+    enqueue({
+      data: [{ date: '2026-03-05', amount: -1150, journal_entry_id: 'je-1', reconciliation_method: 'manual' }],
+    })
+    enqueue({
+      data: [{ id: 'je-1', status: 'posted', source_type: 'import', entry_date: '2026-03-05' }],
+    })
+    enqueue({
+      data: [
+        {
+          debit_amount: 0,
+          credit_amount: 1150,
+          currency: 'EUR',
+          amount_in_currency: 100,
+          journal_entry_id: 'je-1',
+        },
+      ],
+    })
+    enqueue({ data: [] })
+
+    const status = await getReconciliationStatus(supabase as never, 'company-1')
+
+    expect(status.currency).toBe('SEK')
+    expect(status.gl_1930_period_movement).toBe(-1150)
+    expect(status.difference).toBe(0)
+    expect(status.is_reconciled).toBe(true)
+    expect(status.unconvertible_gl_line_count).toBe(0)
+    expect(status.not_reconcilable_reason).toBeNull()
   })
 })

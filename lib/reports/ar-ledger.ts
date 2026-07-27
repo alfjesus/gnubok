@@ -1,6 +1,8 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { fetchAllRows } from '@/lib/supabase/fetch-all'
 import { resolveSekAmount } from '@/lib/bookkeeping/currency-utils'
+import { roundOre } from '@/lib/money'
+import { fetchPaymentsAsOf, outstandingAsOf, todayIsoDate, type PaymentsAsOf } from './reskontra-payments'
 
 export interface ARInvoiceDetail {
   invoice_id: string
@@ -50,7 +52,12 @@ export interface ARLedgerReport {
 
 /**
  * Generate AR ledger (kundreskontra) with aging analysis.
- * BFL 5 kap. 4 § — sidoordnad bokföring: outstanding customer invoices with aging.
+ * BFL 5 kap. 4 §: sidoordnad bokföring: outstanding customer invoices with aging.
+ *
+ * With a backdated `asOfDate` the ledger is reconstructed as it stood on that
+ * date: invoices dated on or before it (including ones fully paid since) with
+ * outstanding amounts recomputed from the payment history (#1020). Without an
+ * `asOfDate`, or with today/future, the live open-invoice state is used as-is.
  */
 export async function generateARLedger(
   supabase: SupabaseClient,
@@ -58,19 +65,36 @@ export async function generateARLedger(
   asOfDate?: string
 ): Promise<ARLedgerReport> {
   const refDate = asOfDate ? new Date(asOfDate) : new Date()
+  // Backdated reconstruction only kicks in for genuinely historical dates:
+  // for today/future the stored open-invoice state IS the as-of state, and
+  // the live view must stay byte-identical to what it always showed.
+  const isHistorical = !!asOfDate && asOfDate < todayIsoDate()
 
-  // Fetch all unpaid/sent/overdue invoices with customer info
+  // Fetch the ledger population. Live view: open invoices only. Historical
+  // view: also invoices paid since the as-of date, restricted to invoice
+  // dates on or before it. Invoices cancelled since are treated as never
+  // having existed (their cancellation is not reliably dated).
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let invoices: any[]
+  let payments: PaymentsAsOf | null = null
   try {
-    invoices = await fetchAllRows(({ from, to }) =>
-      supabase
+    invoices = await fetchAllRows(({ from, to }) => {
+      let query = supabase
         .from('invoices')
         .select('*, customer:customers(id, name)')
         .eq('company_id', companyId)
-        .in('status', ['sent', 'overdue', 'credited'])
+      query = isHistorical
+        ? query.in('status', ['sent', 'overdue', 'credited', 'paid']).lte('invoice_date', asOfDate!)
+        : query.in('status', ['sent', 'overdue', 'credited'])
+      return query
+        // Stable total order for correct paging (see fetch-all.ts).
+        .order('id', { ascending: true })
         .range(from, to)
-    )
+    })
+
+    if (isHistorical) {
+      payments = await fetchPaymentsAsOf(supabase, 'invoice_payments', 'invoice_id', companyId, asOfDate!)
+    }
   } catch {
     return {
       entries: [],
@@ -107,12 +131,20 @@ export async function generateARLedger(
     const entry = byCustomer.get(customerId)!
     const dueDate = new Date(inv.due_date)
     const daysOverdue = Math.floor((refDate.getTime() - dueDate.getTime()) / (1000 * 60 * 60 * 24))
-    const paidAmount = Number(inv.paid_amount) || 0
     const total = Number(inv.total) || 0
-    const outstanding = Math.round((total - paidAmount) * 100) / 100
+    const liveOutstanding = roundOre(total - (Number(inv.paid_amount) || 0))
+    const outstanding = payments
+      ? outstandingAsOf(inv, total, liveOutstanding, payments, asOfDate!)
+      : liveOutstanding
+    const paidAmount = roundOre(total - outstanding)
+
+    // Historical view: 'paid' invoices are only fetched to catch ones still
+    // open at the as-of date. One already settled by then adds nothing to the
+    // reskontra, so skip its zero row instead of listing it.
+    if (isHistorical && inv.status === 'paid' && outstanding === 0) continue
 
     // Aging buckets and totals must be in SEK so they reconcile with account 1510.
-    // Foreign-currency invoices without an exchange_rate cannot be converted —
+    // Foreign-currency invoices without an exchange_rate cannot be converted:
     // adding the raw foreign amount to a SEK total is unsound, so the row is
     // counted but excluded from the buckets. The detail row is still pushed so
     // the user can see the invoice in the expandable list, with outstanding_sek
@@ -126,10 +158,10 @@ export async function generateARLedger(
 
     if (outstandingSek === null) unconvertedFxCount += 1
 
-    // Add invoice detail (always — even if unconvertible, so it's visible)
+    // Add invoice detail (always: even if unconvertible, so it's visible)
     entry.invoices.push({
       invoice_id: inv.id,
-      // Self-billing invoices we received have no own number — show the
+      // Self-billing invoices we received have no own number: show the
       // counterparty's external number instead.
       invoice_number: inv.invoice_number || inv.external_invoice_number || '',
       invoice_date: inv.invoice_date || '',
@@ -161,7 +193,6 @@ export async function generateARLedger(
   }
 
   // Round all amounts and sort invoices within each customer.
-  // Drop customers whose credit notes fully offset their open invoices (net 0).
   const entries = Array.from(byCustomer.values())
     .map((entry) => ({
       ...entry,
@@ -173,7 +204,19 @@ export async function generateARLedger(
       days_90_plus: Math.round(entry.days_90_plus * 100) / 100,
       total_outstanding: Math.round(entry.total_outstanding * 100) / 100,
     }))
-    .filter((entry) => entry.total_outstanding !== 0)
+    // Drop customers whose credit notes fully offset their open invoices
+    // (net 0): a settled customer is noise in the reskontra. A total of 0
+    // means two different things, though, and only one of them is "settled":
+    // a customer whose open invoices were all unconvertible never accumulated
+    // into the buckets at all, so its 0 is "unknown", not "nothing". Those
+    // rows are the ones `unconverted_fx_count` promises the user can find, so
+    // they must stay listed (with outstanding_sek = null) even though they
+    // add nothing to the SEK totals.
+    .filter(
+      (entry) =>
+        entry.total_outstanding !== 0 ||
+        entry.invoices.some((inv) => inv.outstanding_sek === null)
+    )
 
   // Sort by total outstanding descending
   entries.sort((a, b) => b.total_outstanding - a.total_outstanding)

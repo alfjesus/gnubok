@@ -7,7 +7,7 @@
  */
 import { z } from 'zod'
 import { ok } from '@/lib/api/v1/response'
-import { registerEndpoint } from '@/lib/api/v1/registry'
+import { registerEndpoint, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
 import { v1ErrorResponse, v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
 import { MatchSupplierInvoiceSchema } from '@/lib/api/schemas'
@@ -16,8 +16,10 @@ import {
   createSupplierInvoicePaymentEntry,
   createSupplierInvoiceCashEntry,
 } from '@/lib/bookkeeping/supplier-invoice-entries'
+import { resolveSettlementAccount } from '@/lib/bookkeeping/settlement-account'
 import { reverseEntry, createJournalEntry, findFiscalPeriod } from '@/lib/bookkeeping/engine'
-import { isBookkeepingError } from '@/lib/bookkeeping/errors'
+import { AccountsNotInChartError } from '@/lib/bookkeeping/errors'
+import { findUnresolvableAccounts } from '@/lib/bookkeeping/account-validation'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
 import { logMatchEvent } from '@/lib/invoices/match-log'
 import { eventBus } from '@/lib/events/bus'
@@ -37,13 +39,13 @@ registerEndpoint({
   path: '/api/v1/companies/:companyId/transactions/:id/match-supplier-invoice',
   summary: 'Match a negative bank transaction to a supplier invoice.',
   description:
-    'Confirms a supplier invoice payment match. Creates the payment journal entry (accrual: 2440 debit / 1930 credit; cash-method: collapsed registration+payment), updates supplier_invoices, inserts a supplier_invoice_payments row, and links the transaction. Handles FX differences for cross-currency payments (7960 gain / 3960 loss).',
+    'Confirms a supplier invoice payment match. Creates the payment journal entry (accrual: 2440 debit, credit on the transaction\'s own settlement account, 1930 when unlinked; cash-method: collapsed registration+payment), updates supplier_invoices, inserts a supplier_invoice_payments row, and links the transaction. Handles FX differences for cross-currency payments (7960 gain / 3960 loss).',
   useWhen:
     'You have a bank payment and a known open supplier invoice. The transaction must be negative (expense) and unlinked.',
   doNotUseFor:
-    'Categorizing a direct supplier expense without an invoice — use `:categorize`. Matching to a customer invoice — use `:match-invoice`. Bulk auto-match — `POST /reconciliation/bank/run`.',
+    'Categorizing a direct supplier expense without an invoice: use `:categorize`. Matching to a customer invoice: use `:match-invoice`. Bulk auto-match: `POST /reconciliation/bank/run`.',
   pitfalls: [
-    'Cash-method companies can settle a foreign invoice in full (booked at the payment-date rate); only a PARTIAL cash-method payment across currencies is rejected (MATCH_SI_CASH_FX_UNSUPPORTED) — pay in full, switch to accrual, or book manually.',
+    'Cash-method companies can settle a foreign invoice in full (booked at the payment-date rate); only a PARTIAL cash-method payment across currencies is rejected (MATCH_SI_CASH_FX_UNSUPPORTED): pay in full, switch to accrual, or book manually.',
     'Transaction must be negative (amount < 0). Positive returns MATCH_SI_NOT_EXPENSE.',
     'Supplier invoice must NOT be paid/credited already. paid/credited returns MATCH_SI_ALREADY_PAID; registered/approved/partially_paid/overdue are matchable.',
     'Idempotency-Key is mandatory.',
@@ -67,7 +69,7 @@ registerEndpoint({
   reversible: false,
   dryRunSupported: false,
   request: { body: MatchSupplierInvoiceSchema },
-  response: { success: MatchSIResponse },
+  response: { success: dataEnvelope(MatchSIResponse) },
 })
 
 export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string }> }>(
@@ -149,11 +151,93 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       })
     }
 
+    // Credit the cash account THIS transaction actually belongs to, never a
+    // hardcoded 1930: cash_account_id -> cash_accounts.ledger_account is the
+    // only source of truth for which bank account a matched transaction
+    // settled from (mirrors the dashboard route's #985 fix). Threaded through
+    // every booking branch below (pure-SEK accrual, FX, and cash-method);
+    // customLines specify their own accounts directly (#1000).
+    const paymentAccount = await resolveSettlementAccount(
+      ctx.supabase,
+      ctx.companyId!,
+      transaction.cash_account_id,
+      txLog,
+    )
+
+    // Guard the resolved account against the chart (mirrors the categorize
+    // routes): an inactive cash_accounts.ledger_account would otherwise reach
+    // the engine as a generic MATCH_SI_RECORD_PAYMENT_FAILED instead of
+    // ACCOUNTS_NOT_IN_CHART. Gated on !customLines: custom lines specify their
+    // own accounts directly; every other branch consumes paymentAccount.
+    // This MUST run before the conflicting-JE storno below: a request rejected
+    // here must leave no trace, and reversing the existing categorization JE
+    // is an irreversible side effect (posted vouchers are immutable).
+    if (!customLines) {
+      const missingAccounts = await findUnresolvableAccounts(
+        ctx.supabase,
+        ctx.companyId!,
+        [paymentAccount],
+      )
+      if (missingAccounts.length > 0) {
+        txLog.warn('resolved settlement account is inactive/unknown', { missingAccounts })
+        return v1ErrorResponse(new AccountsNotInChartError(missingAccounts), txLog, {
+          requestId: ctx.requestId,
+        })
+      }
+    }
+
+    // Amount resolution runs BEFORE the storno below for the same reason the
+    // chart guard does: it is pure arithmetic that can reject the request, and
+    // a rejected request must leave no trace (reversing the transaction's
+    // existing categorization verifikat is irreversible).
+    const txAmountAbs = Math.abs(transaction.amount)
+    const paymentAmountInvoiceCurrency =
+      transaction.currency === invoice.currency ? txAmountAbs : invoice.remaining_amount
+    // SEK that actually left the bank, when known. A foreign transaction with
+    // no stored amount_sek is `null` here: the raw foreign amount must never
+    // stand in (treating 19 USD as 19 SEK books "19 kr" on a ~175 kr payment).
+    const bankSekStored =
+      transaction.currency === 'SEK'
+        ? txAmountAbs
+        : transaction.amount_sek != null
+          ? Math.abs(transaction.amount_sek)
+          : null
+    const invoiceFxRate = invoice.exchange_rate ?? null
+    // SEK the invoice was booked at for this payment portion (null if the
+    // invoice is foreign and carries no exchange_rate).
+    const bookedSek =
+      invoice.currency === 'SEK'
+        ? paymentAmountInvoiceCurrency
+        : invoiceFxRate && invoiceFxRate > 0
+          ? Math.round(paymentAmountInvoiceCurrency * invoiceFxRate * 100) / 100
+          : null
+    // Prefer the stored bank SEK; fall back to the invoice's booked SEK (right
+    // magnitude, FX diff 0). With NEITHER on file the SEK value is unknown and
+    // the old last resort (the raw foreign amount) violated the rule stated
+    // above, so refuse: same policy as the match_batch_allocate RPC
+    // (BATCH_FX_RATE_MISSING) and toSekOrThrow() in the entry generators.
+    // Byte-identical to the dashboard route so both surfaces agree.
+    const actualBankSek = bankSekStored ?? bookedSek
+    if (actualBankSek == null) {
+      return v1ErrorResponseFromCode('SI_FX_RATE_MISSING', txLog, {
+        requestId: ctx.requestId,
+        details: {
+          transaction_currency: transaction.currency,
+          invoice_currency: invoice.currency,
+        },
+      })
+    }
+    const originalBookedSek = bookedSek ?? actualBankSek
+    const exchangeRateDifference =
+      Math.round((originalBookedSek - actualBankSek) * 100) / 100
+    const paymentAmountSek =
+      exchangeRateDifference !== 0 ? originalBookedSek : actualBankSek
+
     // Storno any conflicting auto-categorization JE before booking the
     // payment. Mirrors the match-invoice path. Without this, an earlier
     // :categorize of the same transaction (e.g. as expense_office with a
     // 5460/1930 entry) would leave its JE posted alongside the new
-    // 2440/1930 supplier-invoice payment entry — two verifikationer for
+    // 2440/1930 supplier-invoice payment entry: two verifikationer for
     // one affärshändelse violates BFL 5 kap 6 §. If storno fails, abort
     // before any further state change.
     if (transaction.journal_entry_id) {
@@ -180,36 +264,6 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       }
     }
 
-    const txAmountAbs = Math.abs(transaction.amount)
-    const paymentAmountInvoiceCurrency =
-      transaction.currency === invoice.currency ? txAmountAbs : invoice.remaining_amount
-    // SEK that actually left the bank, when known. A foreign transaction with
-    // no stored amount_sek is `null` here — the raw foreign amount must never
-    // stand in (treating 19 USD as 19 SEK books "19 kr" on a ~175 kr payment).
-    const bankSekStored =
-      transaction.currency === 'SEK'
-        ? txAmountAbs
-        : transaction.amount_sek != null
-          ? Math.abs(transaction.amount_sek)
-          : null
-    const invoiceFxRate = invoice.exchange_rate ?? null
-    // SEK the invoice was booked at for this payment portion (null if the
-    // invoice is foreign and carries no exchange_rate).
-    const bookedSek =
-      invoice.currency === 'SEK'
-        ? paymentAmountInvoiceCurrency
-        : invoiceFxRate && invoiceFxRate > 0
-          ? Math.round(paymentAmountInvoiceCurrency * invoiceFxRate * 100) / 100
-          : null
-    // Prefer the stored bank SEK; fall back to the invoice's booked SEK (right
-    // magnitude, FX diff 0); last resort the raw amount.
-    const actualBankSek = bankSekStored ?? bookedSek ?? txAmountAbs
-    const originalBookedSek = bookedSek ?? actualBankSek
-    const exchangeRateDifference =
-      Math.round((originalBookedSek - actualBankSek) * 100) / 100
-    const paymentAmountSek =
-      exchangeRateDifference !== 0 ? originalBookedSek : actualBankSek
-
     const now = new Date().toISOString()
 
     const { data: settings } = await ctx.supabase
@@ -233,7 +287,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       txAmountAbs >= invoice.remaining_amount - 0.005
 
     // Under kontantmetoden the expense is recognised AT PAYMENT (payment-date
-    // rate), so a full foreign-currency settlement has no kursdifferens — the
+    // rate), so a full foreign-currency settlement has no kursdifferens: the
     // builder translates the whole entry to the actual bank SEK (settledBankSek)
     // below, leaving 1930 equal to the bank line. Only a PARTIAL cash-method
     // payment across rates can't be modelled cleanly (the builder books the
@@ -292,9 +346,13 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
           transaction.date,
           invoice.supplier?.supplier_type || 'swedish_business',
           undefined, // supplierName (unchanged default)
-          undefined, // paymentAccount (unchanged default 1930)
-          // Pin a foreign-currency settlement to the payment-date rate so 1930
-          // equals the bank movement. No-op for SEK / same-rate settlements.
+          // Settle from the transaction's own resolved cash account; the
+          // internal 1930 default only stands for unlinked transactions, via
+          // resolveSettlementAccount's own fallback (#1000).
+          paymentAccount,
+          // Pin a foreign-currency settlement to the payment-date rate so the
+          // settlement account equals the bank movement. No-op for SEK /
+          // same-rate settlements.
           exchangeRateDifference !== 0 && fullSettlement ? actualBankSek : undefined,
         )
         if (je) journalEntryId = je.id
@@ -307,19 +365,35 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
           paymentAmountSek,
           transaction.date,
           exchangeRateDifference !== 0 ? exchangeRateDifference : undefined,
+          undefined, // supplierName (unchanged default)
+          // Resolved settlement account for pure-SEK and FX matches alike:
+          // the internal 1930 default only stands for unlinked transactions,
+          // via resolveSettlementAccount's own fallback (#1000).
+          paymentAccount,
         )
         if (je) journalEntryId = je.id
       }
     } catch (err) {
-      txLog.error('match-supplier-invoice: payment JE creation failed — aborting before state mutation', err as Error)
-      const message = isBookkeepingError(err)
-        ? getErrorMessage(err, { context: 'supplier_invoice' })
-        : err instanceof Error
-          ? err.message
-          : 'Unknown error'
+      txLog.error('match-supplier-invoice: payment JE creation failed: aborting before state mutation', err as Error)
+      // AccountsNotInChartError means the account was deactivated between our
+      // pre-validation above and the engine call (race): return the same
+      // structured error rather than falling through to the generic
+      // MATCH_SI_RECORD_PAYMENT_FAILED, mirroring the categorize routes.
+      if (err instanceof AccountsNotInChartError) {
+        return v1ErrorResponse(err, txLog, { requestId: ctx.requestId })
+      }
+      // The cash-method builder converts every leg through toSekOrThrow, so a
+      // foreign invoice with no usable rate surfaces here as
+      // SupplierInvoiceFxRateMissingError. Dispatch on its `code` (not
+      // instanceof: the class is routinely vi.mock'ed away) so the envelope
+      // carries the registered 400 rather than a generic 500. Mirrors the
+      // dashboard route and the preview for the same row.
+      if ((err as { code?: unknown })?.code === 'SI_FX_RATE_MISSING') {
+        return v1ErrorResponse(err, txLog, { requestId: ctx.requestId })
+      }
       return v1ErrorResponseFromCode('MATCH_SI_RECORD_PAYMENT_FAILED', txLog, {
         requestId: ctx.requestId,
-        details: { reason: message },
+        details: { reason: getErrorMessage(err, { context: 'supplier_invoice' }) },
       })
     }
 
@@ -344,7 +418,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       })
       .eq('id', supplier_invoice_id)
       .eq('company_id', ctx.companyId!)
-      // 'overdue' must appear here — the early status guard accepts it as
+      // 'overdue' must appear here: the early status guard accepts it as
       // matchable, so excluding it here would return MATCH_SI_NOT_OPEN
       // for a legitimately payable invoice.
       .in('status', ['registered', 'approved', 'partially_paid', 'overdue'])
@@ -353,7 +427,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
     if (!updatedRows || updatedRows.length === 0) {
       // CAS guard: the invoice was settled by a concurrent request between
       // our read and write. The payment voucher we just posted belongs to no
-      // payment — cancel it and document the gap (mirrors mark-paid).
+      // payment: cancel it and document the gap (mirrors mark-paid).
       if (journalEntryId) {
         await cancelOrphanedPaymentEntry(
           ctx.supabase, ctx.companyId!, ctx.userId, journalEntryId,
@@ -402,6 +476,31 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       return v1ErrorResponseFromCode('MATCH_SI_LINK_TX_FAILED', txLog, {
         requestId: ctx.requestId,
       })
+    }
+
+    // Propagate a document pinned to the transaction onto the payment
+    // verifikat, mirroring the dashboard route (BFL 5 kap 6 §). Guarded to
+    // unlinked current-version docs only: a doc already serving another
+    // verifikat (e.g. the supplier invoice's own document on the registration
+    // entry) must not move. Non-fatal: the match is already committed.
+    if (transaction.document_id) {
+      const { error: docLinkErr } = await ctx.supabase
+        .from('document_attachments')
+        .update({ journal_entry_id: journalEntryId })
+        .eq('id', transaction.document_id)
+        .eq('company_id', ctx.companyId!)
+        .is('journal_entry_id', null)
+        .eq('is_current_version', true)
+      if (docLinkErr) {
+        // Structured fields so the half-linked state (doc retained but not
+        // anchored to the payment JE) can be reconstructed without an audit
+        // trail dig.
+        txLog.warn('failed to link transaction document to payment JE (non-critical)', {
+          error: docLinkErr,
+          documentId: transaction.document_id,
+          journalEntryId,
+        })
+      }
     }
 
     logMatchEvent(ctx.supabase, ctx.userId, txId, 'matched', {

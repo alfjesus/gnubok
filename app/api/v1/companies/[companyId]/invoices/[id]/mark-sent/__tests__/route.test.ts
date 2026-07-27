@@ -27,7 +27,7 @@ vi.mock('@supabase/supabase-js', async () => {
   return { ...actual, createClient: vi.fn().mockReturnValue({}) }
 })
 
-// Stub the F-series allocator — the route's flow is what we're testing.
+// Stub the F-series allocator: the route's flow is what we're testing.
 vi.mock('@/lib/invoices/ensure-invoice-number', () => ({
   ensureInvoiceNumber: vi.fn().mockResolvedValue(undefined),
 }))
@@ -41,15 +41,22 @@ vi.mock('@/lib/bookkeeping/invoice-entries', () => ({
   }),
 }))
 
+const mockRecordManualInvoiceDelivery = vi.fn().mockResolvedValue({ id: 'delivery-1' })
+vi.mock('@/lib/invoices/invoice-deliveries', () => ({
+  recordManualInvoiceDelivery: (...args: unknown[]) => mockRecordManualInvoiceDelivery(...args),
+}))
+
 import { validateApiKey, createServiceClientNoCookies } from '@/lib/auth/api-keys'
 import {
   createInvoiceJournalEntry as mockedCreateEntry,
 } from '@/lib/bookkeeping/invoice-entries'
+import { ensureInvoiceNumber as mockedEnsureInvoiceNumber } from '@/lib/invoices/ensure-invoice-number'
 import { POST as markSent } from '../route'
 
 const mockValidate = validateApiKey as ReturnType<typeof vi.fn>
 const mockServiceClient = createServiceClientNoCookies as ReturnType<typeof vi.fn>
 const mockCreateJournalEntry = mockedCreateEntry as ReturnType<typeof vi.fn>
+const mockEnsureInvoiceNumber = mockedEnsureInvoiceNumber as ReturnType<typeof vi.fn>
 
 type MockResult = { data?: unknown; error?: unknown }
 function makeFlexibleSupabase(byTable: Record<string, MockResult | MockResult[]>) {
@@ -127,6 +134,7 @@ beforeEach(() => {
     scopes: ['invoices:write'],
     mode: 'live',
   })
+  mockRecordManualInvoiceDelivery.mockResolvedValue({ id: 'delivery-1' })
 })
 
 describe('POST /api/v1/companies/:companyId/invoices/:id/mark-sent', () => {
@@ -139,7 +147,10 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-sent', () => {
           { data: DRAFT_INVOICE, error: null },
           { data: SENT_INVOICE, error: null },
         ],
-        company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
+        company_settings: {
+          data: { accounting_method: 'accrual', entity_type: 'enskild_firma', bankgiro: '123-4567' },
+          error: null,
+        },
       }),
     )
 
@@ -156,6 +167,12 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-sent', () => {
     expect(body.data.invoice_number).toBe('2026-0042')
     expect(body.data.journal_entry_id).toBe('jjjjjjjj-jjjj-4jjj-8jjj-jjjjjjjjjjjj')
     expect(mockCreateJournalEntry).toHaveBeenCalledTimes(1)
+    expect(mockRecordManualInvoiceDelivery).toHaveBeenCalledWith({
+      supabase: expect.anything(),
+      companyId: COMPANY_ID,
+      userId: USER_ID,
+      invoiceId: INVOICE_ID,
+    })
   })
 
   it('returns 409 INVOICE_UPDATE_NOT_DRAFT when the invoice is already sent', async () => {
@@ -178,6 +195,65 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-sent', () => {
     expect(body.error.code).toBe('INVOICE_UPDATE_NOT_DRAFT')
     expect(body.error.details.current_status).toBe('sent')
   })
+
+  it.each([
+    ['missing row', { data: null, error: null }],
+    ['database error', { data: null, error: { message: 'connection reset' } }],
+  ])('fails closed when company settings have a %s', async (_label, settingsResult) => {
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        invoices: { data: DRAFT_INVOICE, error: null },
+        company_settings: settingsResult,
+      }),
+    )
+
+    const res = await markSent(
+      makeMarkSentRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/mark-sent`,
+      ),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    expect(res.status).toBe(404)
+    const body = await res.json()
+    expect(body.error.code).toBe('INVOICE_SEND_COMPANY_SETTINGS_MISSING')
+    expect(mockEnsureInvoiceNumber).not.toHaveBeenCalled()
+    expect(mockCreateJournalEntry).not.toHaveBeenCalled()
+  })
+
+  it.each(['SEK', 'EUR'] as const)(
+    'rejects a %s invoice without a payment account before number allocation',
+    async (currency) => {
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        invoices: { data: { ...DRAFT_INVOICE, currency }, error: null },
+        company_settings: {
+          data: {
+            accounting_method: 'accrual',
+            entity_type: 'enskild_firma',
+            invoice_payment_accounts: {},
+          },
+          error: null,
+        },
+      }),
+    )
+
+    const res = await markSent(
+      makeMarkSentRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/mark-sent`,
+      ),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error.code).toBe('INVOICE_SEND_PAYMENT_ACCOUNT_MISSING')
+    expect(mockEnsureInvoiceNumber).not.toHaveBeenCalled()
+    expect(mockCreateJournalEntry).not.toHaveBeenCalled()
+    },
+  )
 
   it('rejects delivery notes with VALIDATION_ERROR (regardless of status)', async () => {
     // Critical: the delivery-note guard must run BEFORE the status check
@@ -256,7 +332,10 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-sent', () => {
           { data: DRAFT_INVOICE, error: null },
           { data: SENT_INVOICE, error: null },
         ],
-        company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
+        company_settings: {
+          data: { accounting_method: 'accrual', entity_type: 'enskild_firma', bankgiro: '123-4567' },
+          error: null,
+        },
       }),
     )
     // Force the journal-entry generator to throw.
@@ -324,7 +403,10 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-sent', () => {
       makeFlexibleSupabase({
         company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
         invoices: { data: DRAFT_INVOICE, error: null },
-        company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
+        company_settings: {
+          data: { accounting_method: 'accrual', entity_type: 'enskild_firma', bankgiro: '123-4567' },
+          error: null,
+        },
       }),
     )
 
@@ -354,7 +436,10 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-sent', () => {
           { data: DRAFT_INVOICE, error: null },
           { data: SENT_INVOICE, error: null },
         ],
-        company_settings: { data: { accounting_method: 'cash', entity_type: 'enskild_firma' }, error: null },
+        company_settings: {
+          data: { accounting_method: 'cash', entity_type: 'enskild_firma', bankgiro: '123-4567' },
+          error: null,
+        },
       }),
     )
 

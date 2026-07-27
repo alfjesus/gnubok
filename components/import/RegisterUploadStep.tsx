@@ -6,7 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Upload, FileSpreadsheet, AlertCircle, Loader2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
-export type RegisterEntity = 'customers' | 'suppliers'
+export type RegisterEntity = 'customers' | 'suppliers' | 'articles'
 
 interface RegisterUploadStepProps {
   entity: RegisterEntity
@@ -21,14 +21,21 @@ const COPY: Record<RegisterEntity, { title: string; description: string; hint: s
     description:
       'Ladda upp en Excel- eller CSV-fil med ditt kundregister. Filen bör innehålla minst en kolumn med kundnamn.',
     hint:
-      'Vanliga kolumner identifieras automatiskt — t.ex. "Namn", "Orgnr", "E-post", "Telefon", "Adress", "Postort".',
+      'Vanliga kolumner identifieras automatiskt: t.ex. "Namn", "Orgnr", "E-post", "Telefon", "Adress", "Postort".',
   },
   suppliers: {
     title: 'Ladda upp fil med leverantörer',
     description:
       'Ladda upp en Excel- eller CSV-fil med ditt leverantörsregister. Filen bör innehålla minst en kolumn med leverantörsnamn.',
     hint:
-      'Vanliga kolumner identifieras automatiskt — t.ex. "Namn", "Orgnr", "Bankgiro", "Plusgiro", "IBAN", "E-post".',
+      'Vanliga kolumner identifieras automatiskt: t.ex. "Namn", "Orgnr", "Bankgiro", "Plusgiro", "IBAN", "E-post".',
+  },
+  articles: {
+    title: 'Ladda upp fil med artiklar',
+    description:
+      'Ladda upp en Excel- eller CSV-fil med ditt artikelregister. Filen bör innehålla minst en kolumn med benämning. Filer exporterade från Fortnox, Visma och Bokio känns igen automatiskt.',
+    hint:
+      'Vanliga kolumner identifieras automatiskt: t.ex. "Benämning", "Artikelnummer", "Pris", "Moms", "Enhet", "Försäljningskonto".',
   },
 }
 
@@ -98,7 +105,7 @@ export default function RegisterUploadStep({
                   <span>Välj fil</span>
                 </Button>
               </label>
-              <p className="text-xs text-muted-foreground mt-3">XLSX, XLS, CSV, ODS — max 10 MB</p>
+              <p className="text-xs text-muted-foreground mt-3">XLSX, XLS, CSV, ODS: max 10 MB</p>
             </>
           )}
         </div>

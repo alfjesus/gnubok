@@ -1,9 +1,15 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import JSZip from 'jszip'
-import { generateFullArchive, estimateArchiveSize } from '../full-archive-export'
+import {
+  generateFullArchive,
+  generateBaseDataArchive,
+  estimateArchiveSize,
+  MASTER_DATA_DUMP_TABLES,
+} from '../full-archive-export'
 import { createQueuedMockSupabase } from '@/tests/helpers'
 import { getAuditLog } from '@/lib/core/audit/audit-service'
+import type { AuditLogEntry } from '@/types'
 
 vi.mock('../sie-export', () => ({
   generateSIEExport: vi.fn().mockResolvedValue('#FLAGGA 0\n#PROGRAM "ERPBase"'),
@@ -17,7 +23,10 @@ vi.mock('../trial-balance', () => ({
 
 vi.mock('../income-statement', () => ({
   generateIncomeStatement: vi.fn().mockResolvedValue({
-    sections: [], netResult: 0, period: { start: '2024-01-01', end: '2024-12-31' },
+    revenue_sections: [], total_revenue: 0,
+    expense_sections: [], total_expenses: 0,
+    financial_sections: [], total_financial: 0,
+    net_result: 0, period: { start: '2024-01-01', end: '2024-12-31' },
   }),
 }))
 
@@ -85,6 +94,27 @@ const PERIOD_2023 = {
   opening_balance_entry_id: null,
 }
 
+/**
+ * Queue one mock response per query writeMasterData issues, in order.
+ *
+ * Direct tables issue a single query; via-tables issue a parent-id query and,
+ * only when parents exist, one chunked child query. Tables not named in
+ * `opts` come back empty.
+ */
+function buildMasterDataQueue(opts: {
+  direct?: Record<string, unknown[]>
+  via?: Record<string, { parents: unknown[]; children: unknown[] }>
+}): { data: unknown }[] {
+  return MASTER_DATA_DUMP_TABLES.flatMap((t): { data: unknown }[] => {
+    if (t.via) {
+      const spec = opts.via?.[t.name]
+      if (!spec || spec.parents.length === 0) return [{ data: [] }]
+      return [{ data: spec.parents }, { data: spec.children }]
+    }
+    return [{ data: opts.direct?.[t.name] ?? [] }]
+  })
+}
+
 describe('generateFullArchive', () => {
   let supabase: ReturnType<typeof createQueuedMockSupabase>['supabase']
   let enqueueMany: ReturnType<typeof createQueuedMockSupabase>['enqueueMany']
@@ -122,6 +152,16 @@ describe('generateFullArchive', () => {
       expect(zip.file('dokument/manifest.json')).not.toBeNull()
       expect(zip.file('revision/behandlingshistorik.json')).not.toBeNull()
       expect(zip.file('revision/systemdokumentation.json')).not.toBeNull()
+      // Human-readable layer: CSV twins + the Swedish README.
+      expect(zip.file('rapporter/saldobalans.csv')).not.toBeNull()
+      expect(zip.file('rapporter/resultatrakning.csv')).not.toBeNull()
+      expect(zip.file('rapporter/balansrakning.csv')).not.toBeNull()
+      expect(zip.file('rapporter/huvudbok.csv')).not.toBeNull()
+      const readme = zip.file('LÄSMIG.txt')
+      expect(readme).not.toBeNull()
+      const readmeText = await readme!.async('text')
+      expect(readmeText).toContain('Test AB')
+      expect(readmeText).toContain('Räkenskapsår')
     })
 
     it('handles missing documents gracefully', async () => {
@@ -171,6 +211,53 @@ describe('generateFullArchive', () => {
       expect(manifest[0].voucher_number).toBe('A17')
       expect(manifest[0].entry_date).toBe('2024-03-15')
       expect(manifest[0].zip_path).toBe('dokument/2024/A17_receipt.pdf')
+    })
+
+    it('falls back to the company-scoped key when the stored pointer is stale', async () => {
+      // A concurrent Phase B backfill re-homed the object mid-run: the
+      // legacy pointer 404s but the company-scoped copy exists. The archive
+      // must contain the bytes, not a manifest error.
+      enqueueMany([
+        { data: COMPANY_ROW },
+        { data: PERIOD_2024 },
+        {
+          data: [
+            {
+              id: 'doc-1',
+              file_name: 'receipt.pdf',
+              storage_path: 'documents/user-1/receipt.pdf',
+              journal_entry_id: 'entry-1',
+              journal_entries: {
+                voucher_number: 17,
+                voucher_series: 'A',
+                entry_date: '2024-03-15',
+              },
+            },
+          ],
+        },
+        { data: [{ id: 'entry-1', fiscal_period_id: PERIOD_2024.id }] },
+      ])
+
+      const download = vi.fn(async (path: string) =>
+        path === 'documents/company-1/user-1/receipt.pdf'
+          ? { data: new Blob(['receipt bytes']), error: null }
+          : { data: null, error: { message: 'Object not found' } },
+      )
+      supabase.storage.from = vi.fn().mockReturnValue({ download })
+
+      const buffer = await generateFullArchive(supabase as any, 'company-1', {
+        scope: 'period',
+        period_id: PERIOD_2024.id,
+      })
+
+      const zip = await JSZip.loadAsync(buffer)
+      const manifest = JSON.parse(await zip.file('dokument/manifest.json')!.async('text'))
+      expect(manifest).toHaveLength(1)
+      expect(manifest[0].status).toBe('downloaded')
+      expect(zip.file('dokument/2024/A17_receipt.pdf')).not.toBeNull()
+      // Stored pointer first, alternate layout second.
+      expect(download).toHaveBeenNthCalledWith(1, 'documents/user-1/receipt.pdf')
+      expect(download).toHaveBeenNthCalledWith(2, 'documents/company-1/user-1/receipt.pdf')
     })
 
     it('skips documents when include_documents is false', async () => {
@@ -227,6 +314,76 @@ describe('generateFullArchive', () => {
         })
       )
     })
+
+    it("includes audit rows for the period's entries booked outside the window", async () => {
+      // Bokslut reality: the FY2024 year-end entry is committed in March 2025,
+      // so its audit rows fall outside the period's date window. The year's
+      // archive must still carry them (BFNAR 2013:2 kap 8).
+      const inWindow: AuditLogEntry = {
+        id: 'audit-1',
+        user_id: 'user-1',
+        company_id: 'company-1',
+        action: 'INSERT',
+        table_name: 'journal_entries',
+        record_id: 'e-1',
+        actor_id: 'user-1',
+        actor_type: null,
+        actor_label: null,
+        old_state: null,
+        new_state: null,
+        description: 'Created journal_entries record',
+        created_at: '2024-06-01T10:00:00Z',
+      }
+      const outOfWindowCommit: AuditLogEntry = {
+        ...inWindow,
+        id: 'audit-2',
+        action: 'COMMIT',
+        description: 'Committed journal entry A55',
+        created_at: '2025-03-15T09:00:00Z',
+      }
+      // Line audit rows carry company_id NULL (write_audit_log finds no
+      // company_id column on journal_entry_lines).
+      const lineRow: AuditLogEntry = {
+        ...inWindow,
+        id: 'audit-3',
+        company_id: null,
+        table_name: 'journal_entry_lines',
+        record_id: 'l-1',
+        created_at: '2025-03-15T09:00:01Z',
+      }
+
+      mockGetAuditLog.mockResolvedValue({ data: [inWindow], count: 1 })
+
+      enqueueMany([
+        { data: COMPANY_ROW }, // company_settings
+        { data: PERIOD_2024 }, // fiscal_periods
+        { data: [] }, // document_attachments
+        { data: [{ id: 'e-1' }] }, // journal_entries ids for the period
+        { data: [{ id: 'l-1' }] }, // journal_entry_lines ids
+        // audit_log by record id: returns the in-window row again (dedupe)
+        // plus the two out-of-window rows
+        { data: [inWindow, outOfWindowCommit, lineRow] },
+      ])
+
+      const buffer = await generateFullArchive(supabase as any, 'company-1', {
+        scope: 'period',
+        period_id: PERIOD_2024.id,
+      })
+
+      const zip = await JSZip.loadAsync(buffer)
+      const history = JSON.parse(
+        await zip.file('revision/behandlingshistorik.json')!.async('text')
+      ) as Array<{ id: string }>
+
+      // Deduped: audit-1 appears once despite arriving via both fetches.
+      expect(history).toHaveLength(3)
+      const ids = history.map((h) => h.id)
+      expect(ids).toContain('audit-2')
+      expect(ids).toContain('audit-3')
+      // Newest first, matching getAuditLog's output order.
+      expect(ids[0]).toBe('audit-3')
+      expect(ids[2]).toBe('audit-1')
+    })
   })
 
   describe('scope: all', () => {
@@ -247,8 +404,12 @@ describe('generateFullArchive', () => {
       expect(zip.file('sie/2024-01-01_2024-12-31.se')).not.toBeNull()
       expect(zip.file('rapporter/2023-01-01_2023-12-31/saldobalans.json')).not.toBeNull()
       expect(zip.file('rapporter/2024-01-01_2024-12-31/saldobalans.json')).not.toBeNull()
+      expect(zip.file('rapporter/2024-01-01_2024-12-31/saldobalans.csv')).not.toBeNull()
+      expect(zip.file('rapporter/2024-01-01_2024-12-31/huvudbok.csv')).not.toBeNull()
       expect(zip.file('revision/behandlingshistorik.json')).not.toBeNull()
       expect(zip.file('revision/systemdokumentation.json')).not.toBeNull()
+      const readmeText = await zip.file('LÄSMIG.txt')!.async('text')
+      expect(readmeText).toContain('Hela bokföringen')
       // No root bokforing.se in all-mode
       expect(zip.file('bokforing.se')).toBeNull()
     })
@@ -335,7 +496,16 @@ describe('generateFullArchive', () => {
         { data: [PERIOD_2024] },
         {
           data: [
-            // Draft entry — journal_entry_id present but voucher_number is null
+            // True orphan: uploaded but never linked to any entry. Backups
+            // must still carry it (inbox items are räkenskapsinformation).
+            {
+              id: 'doc-orphan',
+              file_name: 'inbox.pdf',
+              storage_path: 'p/inbox.pdf',
+              journal_entry_id: null,
+              journal_entries: null,
+            },
+            // Draft entry: journal_entry_id present but voucher_number is null
             {
               id: 'doc-draft',
               file_name: 'invoice.pdf',
@@ -360,7 +530,7 @@ describe('generateFullArchive', () => {
             },
           ],
         },
-        // entryIdToPeriodId map — draft and posted both resolve to PERIOD_2024
+        // entryIdToPeriodId map: draft and posted both resolve to PERIOD_2024
         {
           data: [
             { id: 'e-draft', fiscal_period_id: PERIOD_2024.id },
@@ -381,6 +551,10 @@ describe('generateFullArchive', () => {
       }>
       const byId = Object.fromEntries(manifest.map((m) => [m.document_id, m]))
 
+      // Unlinked orphan -> _okopplade, included in the backup
+      expect(byId['doc-orphan'].voucher_number).toBeNull()
+      expect(byId['doc-orphan'].zip_path).toBe('dokument/_okopplade/inbox.pdf')
+
       // Draft -> _okopplade, no voucher prefix
       expect(byId['doc-draft'].voucher_number).toBeNull()
       expect(byId['doc-draft'].zip_path).toBe('dokument/_okopplade/invoice.pdf')
@@ -392,7 +566,8 @@ describe('generateFullArchive', () => {
         'dokument/2024/A5_kvitto_doc-coll.pdf'
       )
 
-      // Both files exist in the ZIP
+      // All files exist in the ZIP
+      expect(zip.file('dokument/_okopplade/inbox.pdf')).not.toBeNull()
       expect(zip.file('dokument/_okopplade/invoice.pdf')).not.toBeNull()
       expect(zip.file('dokument/2024/A5_kvitto.pdf')).not.toBeNull()
       expect(zip.file('dokument/2024/A5_kvitto_doc-coll.pdf')).not.toBeNull()
@@ -428,26 +603,29 @@ describe('generateFullArchive', () => {
         created_at: '2024-11-01T09:55:00Z',
       }
 
+      // Master-data dump runs sequentially over MASTER_DATA_DUMP_TABLES.
+      // Direct tables issue one query; via-tables issue a parent-id query and,
+      // when parents exist, one chunked child query.
+      const masterDataQueue = buildMasterDataQueue({
+        direct: {
+          customers: [{ id: 'cust-1', name: 'Acme AB' }],
+          company_settings: [COMPANY_ROW],
+        },
+        via: {
+          invoice_items: {
+            parents: [{ id: 'inv-1', currency: 'SEK', exchange_rate: null }],
+            children: [{ id: 'item-1', invoice_id: 'inv-1', description: 'Konsulttid' }],
+          },
+        },
+      })
+
       enqueueMany([
         { data: COMPANY_ROW }, // fetchCompany
         { data: [PERIOD_2024] }, // fetchAllPeriods
         { data: [] }, // document_attachments
         { data: [importRow] }, // sie_imports
         { data: [{ source_account: '9999', target_account: '1510' }] }, // sie_account_mappings
-        { data: [{ id: 'cust-1', name: 'Acme AB' }] }, // customers
-        { data: [{ id: 'sup-1', name: 'Supplier AB' }] }, // suppliers
-        { data: [{ id: 'inv-1', invoice_number: 'F-001' }] }, // invoices
-        { data: [] }, // invoice_items
-        { data: [] }, // invoice_payments
-        { data: [] }, // supplier_invoices
-        { data: [] }, // supplier_invoice_items
-        { data: [] }, // receipts
-        { data: [] }, // receipt_line_items
-        { data: [] }, // transactions
-        { data: [] }, // mapping_rules
-        { data: [] }, // categorization_templates
-        { data: [] }, // bank_file_imports
-        { data: [COMPANY_ROW] }, // company_settings
+        ...masterDataQueue,
       ])
 
       const buffer = await generateFullArchive(supabase as any, 'company-1', {
@@ -468,23 +646,183 @@ describe('generateFullArchive', () => {
       expect(imports[0].filename).toBe('original.se')
       expect(zip.file('sie/account_mappings.json')).not.toBeNull()
 
-      expect(zip.file('data/customers.json')).not.toBeNull()
-      expect(zip.file('data/suppliers.json')).not.toBeNull()
-      expect(zip.file('data/invoices.json')).not.toBeNull()
-      expect(zip.file('data/invoice_items.json')).not.toBeNull()
-      expect(zip.file('data/invoice_payments.json')).not.toBeNull()
-      expect(zip.file('data/supplier_invoices.json')).not.toBeNull()
-      expect(zip.file('data/supplier_invoice_items.json')).not.toBeNull()
-      expect(zip.file('data/receipts.json')).not.toBeNull()
-      expect(zip.file('data/receipt_line_items.json')).not.toBeNull()
-      expect(zip.file('data/transactions.json')).not.toBeNull()
-      expect(zip.file('data/mapping_rules.json')).not.toBeNull()
-      expect(zip.file('data/categorization_templates.json')).not.toBeNull()
-      expect(zip.file('data/bank_file_imports.json')).not.toBeNull()
-      expect(zip.file('data/company_settings.json')).not.toBeNull()
+      // Every table in the dump contract gets a file, even when empty.
+      for (const t of MASTER_DATA_DUMP_TABLES) {
+        expect(zip.file(`data/${t.file}`), `data/${t.file}`).not.toBeNull()
+      }
 
       const customers = JSON.parse(await zip.file('data/customers.json')!.async('text'))
       expect(customers).toEqual([{ id: 'cust-1', name: 'Acme AB' }])
+
+      // Child table fetched via parent ids (invoice_items has no company_id).
+      // A SEK company's rows are unchanged apart from the appended unit.
+      const items = JSON.parse(await zip.file('data/invoice_items.json')!.async('text'))
+      expect(items).toEqual([
+        {
+          id: 'item-1',
+          invoice_id: 'inv-1',
+          description: 'Konsulttid',
+          invoice_currency: 'SEK',
+          invoice_exchange_rate: null,
+        },
+      ])
+      expect(supabase.rpc).toHaveBeenCalledWith(
+        'export_invoice_delivery_evidence',
+        { p_company_id: 'company-1' },
+      )
+    })
+
+    it('makes a foreign-currency invoice line readable without joining the parent', async () => {
+      // A revisor opening data/invoice_items.json must be able to tell that
+      // line_total 1000 is EUR, not SEK. The row's own `unit` column says
+      // "st" (the quantity unit), so nothing in the file used to state the
+      // money unit: it was only recoverable by joining data/invoices.json.
+      enqueueMany([
+        { data: COMPANY_ROW },
+        { data: [PERIOD_2024] },
+        { data: [] }, // document_attachments
+        { data: [] }, // sie_imports
+        { data: [] }, // sie_account_mappings
+        ...buildMasterDataQueue({
+          via: {
+            invoice_items: {
+              parents: [
+                { id: 'inv-eur', currency: 'EUR', exchange_rate: 11.23 },
+                { id: 'inv-sek', currency: 'SEK', exchange_rate: null },
+              ],
+              children: [
+                {
+                  id: 'item-eur',
+                  invoice_id: 'inv-eur',
+                  description: 'Konsulttid',
+                  quantity: 10,
+                  unit: 'st',
+                  unit_price: 100,
+                  line_total: 1000,
+                  vat_amount: 250,
+                },
+                {
+                  id: 'item-sek',
+                  invoice_id: 'inv-sek',
+                  description: 'Support',
+                  line_total: 500,
+                  vat_amount: 125,
+                },
+              ],
+            },
+          },
+        }),
+      ])
+
+      const buffer = await generateFullArchive(supabase as any, 'company-1', {
+        scope: 'all',
+      })
+      const zip = await JSZip.loadAsync(buffer)
+      const items = JSON.parse(
+        await zip.file('data/invoice_items.json')!.async('text')
+      ) as Array<Record<string, unknown>>
+
+      const byId = Object.fromEntries(items.map((i) => [i.id as string, i]))
+      expect(byId['item-eur'].invoice_currency).toBe('EUR')
+      expect(byId['item-eur'].invoice_exchange_rate).toBe(11.23)
+      // The SEK line says SEK explicitly rather than leaving it implied.
+      expect(byId['item-sek'].invoice_currency).toBe('SEK')
+      expect(byId['item-sek'].invoice_exchange_rate).toBeNull()
+
+      // Every money-bearing row states its unit: no row is ambiguous.
+      for (const item of items) {
+        expect(item, `row ${item.id} has no unit`).toHaveProperty('invoice_currency')
+        expect(item.invoice_currency).not.toBeNull()
+      }
+
+      // Additive: the row keeps every column it shipped with before, and the
+      // unit is appended rather than replacing anything.
+      expect(byId['item-eur']).toMatchObject({
+        id: 'item-eur',
+        invoice_id: 'inv-eur',
+        description: 'Konsulttid',
+        quantity: 10,
+        unit: 'st',
+        unit_price: 100,
+        line_total: 1000,
+        vat_amount: 250,
+      })
+    })
+
+    it('carries the unit on supplier invoice lines and receipt lines too', async () => {
+      enqueueMany([
+        { data: COMPANY_ROW },
+        { data: [PERIOD_2024] },
+        { data: [] }, // document_attachments
+        { data: [] }, // sie_imports
+        { data: [] }, // sie_account_mappings
+        ...buildMasterDataQueue({
+          via: {
+            supplier_invoice_items: {
+              parents: [{ id: 'sinv-1', currency: 'USD', exchange_rate: 9.87 }],
+              children: [
+                { id: 'sitem-1', supplier_invoice_id: 'sinv-1', line_total: 200 },
+              ],
+            },
+            // receipts has no exchange_rate column: currency alone.
+            receipt_line_items: {
+              parents: [{ id: 'rec-1', currency: 'NOK' }],
+              children: [{ id: 'rline-1', receipt_id: 'rec-1', line_total: 49 }],
+            },
+          },
+        }),
+      ])
+
+      const buffer = await generateFullArchive(supabase as any, 'company-1', {
+        scope: 'all',
+      })
+      const zip = await JSZip.loadAsync(buffer)
+
+      const supplierItems = JSON.parse(
+        await zip.file('data/supplier_invoice_items.json')!.async('text')
+      )
+      expect(supplierItems[0].supplier_invoice_currency).toBe('USD')
+      expect(supplierItems[0].supplier_invoice_exchange_rate).toBe(9.87)
+
+      const receiptLines = JSON.parse(
+        await zip.file('data/receipt_line_items.json')!.async('text')
+      )
+      expect(receiptLines[0].receipt_currency).toBe('NOK')
+      expect(receiptLines[0]).not.toHaveProperty('receipt_exchange_rate')
+    })
+
+    it('does not invent a unit for rot/rut payout items (parent has no currency)', async () => {
+      enqueueMany([
+        { data: COMPANY_ROW },
+        { data: [PERIOD_2024] },
+        { data: [] }, // document_attachments
+        { data: [] }, // sie_imports
+        { data: [] }, // sie_account_mappings
+        ...buildMasterDataQueue({
+          via: {
+            rot_rut_payout_request_items: {
+              parents: [{ id: 'req-1' }],
+              children: [
+                { id: 'ritem-1', request_id: 'req-1', requested_amount: 5000 },
+              ],
+            },
+          },
+        }),
+      ])
+
+      const buffer = await generateFullArchive(supabase as any, 'company-1', {
+        scope: 'all',
+      })
+      const zip = await JSZip.loadAsync(buffer)
+      const rows = JSON.parse(
+        await zip.file('data/rot_rut_payout_request_items.json')!.async('text')
+      )
+
+      // HUS-avdrag is SEK by statute and the parent carries no currency
+      // column, so there is nothing to copy: the row stays as the DB has it.
+      expect(rows).toEqual([
+        { id: 'ritem-1', request_id: 'req-1', requested_amount: 5000 },
+      ])
     })
 
     it('skips raw SIE blobs when include_documents is false but keeps metadata', async () => {
@@ -519,6 +857,73 @@ describe('generateFullArchive', () => {
       expect(zip.file('sie/original/manifest.json')).toBeNull()
       expect(zip.file('data/customers.json')).not.toBeNull()
     })
+  })
+})
+
+describe('generateBaseDataArchive', () => {
+  let supabase: ReturnType<typeof createQueuedMockSupabase>['supabase']
+  let enqueueMany: ReturnType<typeof createQueuedMockSupabase>['enqueueMany']
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockGetAuditLog.mockResolvedValue({ data: [], count: 0 })
+    const mock = createQueuedMockSupabase()
+    supabase = mock.supabase
+    enqueueMany = mock.enqueueMany
+  })
+
+  it('bundles unlinked documents, master data, SIE sources and the audit trail', async () => {
+    const masterDataQueue = buildMasterDataQueue({
+      direct: { customers: [{ id: 'cust-1', name: 'Acme AB' }] },
+    })
+
+    enqueueMany([
+      { data: COMPANY_ROW }, // fetchCompany
+      { data: [PERIOD_2024] }, // fetchAllPeriods
+      {
+        data: [
+          // Orphan: goes into Grunddata.
+          {
+            id: 'doc-orphan',
+            file_name: 'inbox.pdf',
+            storage_path: 'p/inbox.pdf',
+            journal_entry_id: null,
+            journal_entries: null,
+          },
+          // Linked to a posted entry: belongs to the period archive, not here.
+          {
+            id: 'doc-linked',
+            file_name: 'kvitto.pdf',
+            storage_path: 'p/kvitto.pdf',
+            journal_entry_id: 'e-1',
+            journal_entries: { voucher_number: 5, voucher_series: 'A', entry_date: '2024-05-01' },
+          },
+        ],
+      }, // document_attachments
+      { data: [{ id: 'e-1', fiscal_period_id: PERIOD_2024.id }] }, // entry->period map
+      { data: [] }, // sie_imports
+      { data: [] }, // sie_account_mappings
+      ...masterDataQueue,
+    ])
+
+    const buffer = await generateBaseDataArchive(supabase as any, 'company-1')
+    const zip = await JSZip.loadAsync(buffer)
+
+    const manifest = JSON.parse(await zip.file('dokument/manifest.json')!.async('text'))
+    expect(manifest).toHaveLength(1)
+    expect(manifest[0].document_id).toBe('doc-orphan')
+    expect(zip.file('dokument/_okopplade/inbox.pdf')).not.toBeNull()
+
+    expect(zip.file('data/customers.json')).not.toBeNull()
+    expect(zip.file('sie/imports.json')).not.toBeNull()
+    expect(zip.file('revision/behandlingshistorik.json')).not.toBeNull()
+    expect(zip.file('revision/systemdokumentation.json')).not.toBeNull()
+
+    const readme = await zip.file('LÄSMIG.txt')!.async('text')
+    expect(readme).toContain('Grunddata')
+    // Period-scoped content stays out of Grunddata.
+    expect(zip.file('bokforing.se')).toBeNull()
+    expect(zip.file('rapporter/saldobalans.json')).toBeNull()
   })
 })
 

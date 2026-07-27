@@ -1,8 +1,17 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js'
 import { NextResponse } from 'next/server'
 import { syncAccountTransactions } from '@/extensions/general/enable-banking/lib/sync'
-import { runReconciliation } from '@/lib/reconciliation/bank-reconciliation'
-import { isConsentExpiringSoon, getDaysUntilExpiry } from '@/extensions/general/enable-banking/lib/api-client'
+import {
+  runReconciliation,
+  DEFAULT_UNATTENDED_CONFIDENCE_THRESHOLD,
+} from '@/lib/reconciliation/bank-reconciliation'
+import {
+  isConsentExpiringSoon,
+  getDaysUntilExpiry,
+  SessionExpiredError,
+  REAUTH_REQUIRED_MESSAGE,
+  SYNC_FAILED_MESSAGE,
+} from '@/extensions/general/enable-banking/lib/api-client'
 import { getEmailService } from '@/lib/email/service'
 import {
   generateConsentExpiryEmailHtml,
@@ -10,6 +19,8 @@ import {
   generateConsentExpiryEmailSubject,
 } from '@/lib/email/consent-notification-templates'
 import { ensureInitialized } from '@/lib/init'
+import { hasCapability } from '@/lib/entitlements/has-capability'
+import { CAPABILITY } from '@/lib/entitlements/keys'
 import { withCronContext } from '@/lib/api/with-cron-context'
 import { errorResponse, errorResponseFromCode } from '@/lib/errors/get-structured-error'
 import { getBranding } from '@/lib/branding/service'
@@ -72,7 +83,7 @@ export const GET = withCronContext('cron.bank_sync', async (_request, ctx) => {
   }
 
   const startTime = Date.now()
-  const TIME_BUDGET_MS = 50_000 // 50s — leave 10s margin for Vercel timeout
+  const TIME_BUDGET_MS = 50_000 // 50s: leave 10s margin for Vercel timeout
   const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'
 
   const results: {
@@ -90,6 +101,11 @@ export const GET = withCronContext('cron.bank_sync', async (_request, ctx) => {
     if (Date.now() - startTime > TIME_BUDGET_MS) {
       ctx.log.info('time budget reached', { processedSoFar: results.length })
       break
+    }
+
+    if (!(await hasCapability(supabase, connection.company_id, CAPABILITY.bank_sync))) {
+      ctx.log.info('skip: capability not entitled', { companyId: connection.company_id })
+      continue
     }
 
     try {
@@ -131,13 +147,13 @@ export const GET = withCronContext('cron.bank_sync', async (_request, ctx) => {
 
       const toDate = new Date().toISOString().split('T')[0]
       // First sync: 90-day lookback (PSD2 max). Subsequent: 7-day window.
-      // Gate on initial_sync_completed_at, not last_synced_at — manual "Sync now"
+      // Gate on initial_sync_completed_at, not last_synced_at: manual "Sync now"
       // sets last_synced_at without doing the deep backfill, and we want the cron
       // to still fall back to 90 days if the inline activation backfill failed.
       const isFirstSync = !connection.initial_sync_completed_at
       const lookbackDays = isFirstSync ? 90 : 7
       if (isFirstSync) {
-        ctx.log.info('first sync for connection — using 90-day lookback', {
+        ctx.log.info('first sync for connection: using 90-day lookback', {
           connectionId: connection.id,
           lookbackDays,
         })
@@ -153,7 +169,7 @@ export const GET = withCronContext('cron.bank_sync', async (_request, ctx) => {
       const accounts = allAccounts.filter(a => a.enabled !== false)
 
       if (accounts.length === 0) {
-        ctx.log.info('all accounts disabled — skipping sync', {
+        ctx.log.info('all accounts disabled: skipping sync', {
           connectionId: connection.id,
           totalAccounts: allAccounts.length,
         })
@@ -170,7 +186,7 @@ export const GET = withCronContext('cron.bank_sync', async (_request, ctx) => {
         continue
       }
 
-      // Detect SIE overlap — skip auto-categorization if the sync range
+      // Detect SIE overlap: skip auto-categorization if the sync range
       // overlaps with a completed SIE import to prevent double-booking
       const { data: sieOverlap } = await supabase
         .from('sie_imports')
@@ -182,7 +198,7 @@ export const GET = withCronContext('cron.bank_sync', async (_request, ctx) => {
         .maybeSingle()
 
       // First sync uses strategy=longest to pull the deepest history available
-      // from the ASPSP. Incremental syncs skip it — the implicit default is
+      // from the ASPSP. Incremental syncs skip it: the implicit default is
       // faster and we already have the older data.
       const syncOptions = {
         ...(sieOverlap ? { skipAutoCategorization: true } : {}),
@@ -210,10 +226,21 @@ export const GET = withCronContext('cron.bank_sync', async (_request, ctx) => {
       // Batch reconciliation sweep when SIE overlap detected
       if (sieOverlap && totalImported > 0) {
         try {
-          await runReconciliation(supabase, connection.company_id, connection.user_id, {
+          const reconResult = await runReconciliation(supabase, connection.company_id, connection.user_id, {
             dateFrom: fromDate,
             dateTo: toDate,
+            // Unattended run: nobody reviews a dry-run first, so never commit
+            // low-confidence (fuzzy / date-range) matches automatically.
+            confidenceThreshold: DEFAULT_UNATTENDED_CONFIDENCE_THRESHOLD,
           })
+          if (reconResult.applied > 0 || reconResult.skippedBelowThreshold > 0) {
+            ctx.log.info('batch reconciliation after sync', {
+              companyId: connection.company_id,
+              applied: reconResult.applied,
+              skippedBelowThreshold: reconResult.skippedBelowThreshold,
+              total: reconResult.matches.length,
+            })
+          }
         } catch {
           // Non-critical
         }
@@ -257,7 +284,6 @@ export const GET = withCronContext('cron.bank_sync', async (_request, ctx) => {
         daysUntilExpiry: daysLeft,
       })
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown error'
       ctx.log.error('sync failed for connection', error as Error, {
         connectionId: connection.id,
         userId: connection.user_id,
@@ -266,10 +292,21 @@ export const GET = withCronContext('cron.bank_sync', async (_request, ctx) => {
         lastSyncedAt: connection.last_synced_at,
       })
 
-      // Persist error status on sync failure
+      // A dead PSD2 session (closed/expired/invalid consent) is a re-auth
+      // condition, not a transient failure: flip it to 'expired' (same state
+      // the consent-elapsed branch uses) so the UI offers a reconnect instead
+      // of a retry. Other errors stay 'error'.
+      //
+      // error_message is rendered verbatim on the settings panel, so it gets
+      // the short Swedish user message in both cases: the raw Enable Banking
+      // error body (an English JSON envelope) stays in the server log above.
+      const isSessionDead = error instanceof SessionExpiredError
+      const failureStatus = isSessionDead ? 'expired' : 'error'
+      const failureMessage = isSessionDead ? REAUTH_REQUIRED_MESSAGE : SYNC_FAILED_MESSAGE
+
       await supabase
         .from('bank_connections')
-        .update({ status: 'error', error_message: message })
+        .update({ status: failureStatus, error_message: failureMessage })
         .eq('id', connection.id)
 
       results.push({
@@ -279,7 +316,7 @@ export const GET = withCronContext('cron.bank_sync', async (_request, ctx) => {
         imported: 0,
         duplicates: 0,
         errors: 1,
-        status: 'error',
+        status: failureStatus,
       })
     }
   }
@@ -311,8 +348,8 @@ export const GET = withCronContext('cron.bank_sync', async (_request, ctx) => {
  * Send consent expiry notification email.
  * Guards with last_expiry_notification_at to avoid spamming (2-day cooldown).
  */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function sendConsentExpiryNotification(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   supabase: SupabaseClient<any>,
   connection: Record<string, unknown>,
   daysLeft: number,
@@ -364,7 +401,7 @@ async function sendConsentExpiryNotification(
       .update({ last_expiry_notification_at: new Date().toISOString() })
       .eq('id', connection.id as string)
   } catch (error) {
-    // Notification failure must not break the cron job — log only.
+    // Notification failure must not break the cron job: log only.
     // eslint-disable-next-line no-console
     console.error('[bank-sync-cron] failed to send consent expiry notification:', error)
   }

@@ -14,6 +14,7 @@ import { Separator } from '@/components/ui/separator'
 import { useToast } from '@/components/ui/use-toast'
 import { BankNameCombobox } from '@/components/settings/BankNameCombobox'
 import { validateBankgiroNumber, formatBankgiroNumber } from '@/lib/bankgiro/luhn'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 interface BankDetailsSetupDialogProps {
   open: boolean
@@ -116,7 +117,7 @@ export function BankDetailsSetupDialog({ open, onOpenChange, onComplete }: BankD
     // Include bank name from combobox
     data.bank_name = bankName
 
-    // Omit empty strings — API schema accepts undefined but not null
+    // Omit empty strings: API schema accepts undefined but not null
     const payload: Record<string, string | number | null> = {}
     for (const [key, val] of Object.entries(data)) {
       if (key === 'next_invoice_number') {
@@ -148,7 +149,7 @@ export function BankDetailsSetupDialog({ open, onOpenChange, onComplete }: BankD
     } catch (error) {
       toast({
         title: t('save_failed_title'),
-        description: error instanceof Error ? error.message : t('save_failed_fallback'),
+        description: error instanceof Error ? getUserErrorMessage(error) : t('save_failed_fallback'),
         variant: 'destructive',
       })
     } finally {
@@ -239,7 +240,7 @@ export function BankDetailsSetupDialog({ open, onOpenChange, onComplete }: BankD
             )}
           </div>
 
-          {/* International payments — collapsible */}
+          {/* International payments: collapsible */}
           <div>
             <button
               type="button"

@@ -11,6 +11,10 @@ import { useToast } from '@/components/ui/use-toast'
 import { Loader2, ShieldCheck, LogOut } from 'lucide-react'
 import { SupportLink } from '@/components/ui/support-link'
 import { safeReturnTo } from '@/lib/auth/safe-return-to'
+import {
+  consumeInviteCookie,
+  INVITE_PROBLEM_MESSAGE_KEYS,
+} from '@/lib/auth/consume-invite-cookie'
 
 export default function MfaVerifyPage() {
   return (
@@ -23,6 +27,7 @@ export default function MfaVerifyPage() {
 function MfaVerifyContent() {
   const t = useTranslations('mfa')
   const tCommon = useTranslations('common')
+  const tInvite = useTranslations('invite')
   const [code, setCode] = useState('')
   const [isLoading, setIsLoading] = useState(false)
   const [factorId, setFactorId] = useState<string | null>(null)
@@ -36,7 +41,7 @@ function MfaVerifyContent() {
   const supabase = createClient()
 
   // Step-up landing target. Set by callers that need AAL2 to do something
-  // sensitive (set/change password, unenroll MFA, etc.) — /api/account/password
+  // sensitive (set/change password, unenroll MFA, etc.): /api/account/password
   // and SecuritySettings redirect here when GoTrue rejects with "AAL2 session
   // is required". Falls back to the dashboard for direct visits.
   const returnTo = safeReturnTo(searchParams.get('returnTo'), '/')
@@ -67,6 +72,24 @@ function MfaVerifyContent() {
     const interval = setInterval(tick, 1000)
     return () => clearInterval(interval)
   }, [lockoutUntil])
+
+  // Accept a pending invite, if any, and report a non-definitive failure.
+  // Returns true when the caller should land the user in the app directly.
+  // The invite cookie survives anything that is not a settled outcome, so
+  // /onboarding and /select-company can retry acceptance server-side.
+  const acceptPendingInvite = async (): Promise<boolean> => {
+    const invite = await consumeInviteCookie()
+    if (invite.accepted) return true
+    if (invite.problem) {
+      const keys = INVITE_PROBLEM_MESSAGE_KEYS[invite.problem]
+      toast({
+        title: tInvite(keys.title),
+        description: tInvite(keys.body),
+        variant: 'destructive',
+      })
+    }
+    return false
+  }
 
   const handleVerify = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault()
@@ -116,26 +139,16 @@ function MfaVerifyContent() {
         return
       }
 
-      const cookieMatch = document.cookie.match(/gnubok-invite-token=([^;]+)/)
-      const inviteToken = cookieMatch?.[1]
+      if (await acceptPendingInvite()) {
+        window.location.href = '/'
+        return
+      }
 
-      if (inviteToken) {
-        try {
-          const res = await fetch('/api/team/accept', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ token: inviteToken }),
-          })
-
-          if (res.ok) {
-            document.cookie = 'gnubok-invite-token=; path=/; max-age=0'
-            window.location.href = '/'
-            return
-          }
-        } catch (err) {
-          console.error('[mfa/verify] invite acceptance failed:', err)
-        }
-        document.cookie = 'gnubok-invite-token=; path=/; max-age=0'
+      if (returnTo.startsWith('/api/')) {
+        // Route-handler destinations (e.g. the MCP OAuth consent page)
+        // return raw HTML the client router cannot render: hard-navigate.
+        window.location.assign(returnTo)
+        return
       }
 
       router.push(returnTo)
@@ -171,7 +184,7 @@ function MfaVerifyContent() {
           </p>
         </div>
 
-        <div className="rounded-xl border bg-card p-6" style={{ boxShadow: 'var(--shadow-md)' }}>
+        <div className="rounded-lg border bg-card p-6">
           <form onSubmit={handleVerify} className="space-y-5">
             <div className="space-y-2">
               <Label htmlFor="code">{t('verify_code_label')}</Label>
@@ -221,7 +234,7 @@ function MfaVerifyContent() {
 
         <p className="text-xs text-muted-foreground text-center mt-4">
           {t('lost_authenticator')}{' '}
-          <SupportLink variant="muted" subject="MFA — cannot sign in" className="inline">
+          <SupportLink variant="muted" subject="MFA: cannot sign in" className="inline">
             {t('contact_support')}
           </SupportLink>
         </p>

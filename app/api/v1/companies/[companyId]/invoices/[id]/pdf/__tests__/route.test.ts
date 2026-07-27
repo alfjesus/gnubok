@@ -2,7 +2,7 @@
  * Integration tests for GET /api/v1/companies/:companyId/invoices/:id/pdf.
  *
  * The PDF renderer is mocked so the test is about routing, auth, error
- * mapping and filename composition — not about actual PDF bytes.
+ * mapping and filename composition: not about actual PDF bytes.
  */
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -40,9 +40,11 @@ vi.mock('@react-pdf/renderer', () => ({
 vi.mock('@/lib/invoices/pdf-template', () => ({
   InvoicePDF: vi.fn().mockReturnValue({}),
   brandingFromCompanySettings: vi.fn().mockReturnValue({}),
+  SHOW_SWISH_ON_INVOICE: false,
 }))
 
 import { validateApiKey, createServiceClientNoCookies } from '@/lib/auth/api-keys'
+import { contentDispositionFilename } from '@/lib/api/content-disposition'
 import { GET as pdf } from '../route'
 
 const mockValidate = validateApiKey as ReturnType<typeof vi.fn>
@@ -108,6 +110,7 @@ const COMPANY_SETTINGS = {
   company_name: 'Test AB',
   entity_type: 'enskild_firma',
   accounting_method: 'accrual',
+  bankgiro: '123-4567',
 }
 
 beforeEach(() => {
@@ -124,7 +127,7 @@ beforeEach(() => {
 })
 
 describe('GET /api/v1/companies/:companyId/invoices/:id/pdf', () => {
-  it('returns a PDF for a sent invoice with the faktura-<number> filename', async () => {
+  it('returns a PDF for a sent invoice with a descriptive filename', async () => {
     mockServiceClient.mockReturnValue(
       makeFlexibleSupabase({
         company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
@@ -140,11 +143,13 @@ describe('GET /api/v1/companies/:companyId/invoices/:id/pdf', () => {
 
     expect(res.status).toBe(200)
     expect(res.headers.get('Content-Type')).toBe('application/pdf')
-    expect(res.headers.get('Content-Disposition')).toBe('attachment; filename="faktura-2026-0042.pdf"')
+    expect(res.headers.get('Cache-Control')).toBe('private, no-store')
+    expect(contentDispositionFilename(res.headers.get('Content-Disposition')))
+      .toBe('Test AB x Acme AB Faktura nr 2026-0042 20260512.pdf')
     expect(res.headers.get('X-Request-Id')).toMatch(/^req_/)
   })
 
-  it('uses utkast-<id-slice>.pdf filename for drafts', async () => {
+  it('uses an identifiable descriptive filename for drafts', async () => {
     mockServiceClient.mockReturnValue(
       makeFlexibleSupabase({
         company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
@@ -162,15 +167,11 @@ describe('GET /api/v1/companies/:companyId/invoices/:id/pdf', () => {
     )
 
     expect(res.status).toBe(200)
-    // Same composition as the dashboard's internal pdf route: the
-    // "faktura-" prefix is preserved, the number slot is the "utkast-<slice>"
-    // placeholder.
-    expect(res.headers.get('Content-Disposition')).toBe(
-      'attachment; filename="faktura-utkast-bbbbbbbb.pdf"',
-    )
+    expect(contentDispositionFilename(res.headers.get('Content-Disposition')))
+      .toBe('Test AB x Acme AB Faktura utkast-bbbbbbbb 20260512.pdf')
   })
 
-  it('uses kreditfaktura-<number>.pdf for credit notes and embeds original number', async () => {
+  it('identifies credit notes in the filename and embeds the original number', async () => {
     mockServiceClient.mockReturnValue(
       makeFlexibleSupabase({
         company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
@@ -195,10 +196,9 @@ describe('GET /api/v1/companies/:companyId/invoices/:id/pdf', () => {
     )
 
     expect(res.status).toBe(200)
-    expect(res.headers.get('Content-Disposition')).toBe(
-      'attachment; filename="kreditfaktura-2026-0099.pdf"',
-    )
-    // The template received the original number — verify via the InvoicePDF mock call.
+    expect(contentDispositionFilename(res.headers.get('Content-Disposition')))
+      .toBe('Test AB x Acme AB Kreditfaktura nr 2026-0099 20260512.pdf')
+    // The template received the original number: verify via the InvoicePDF mock call.
     const call = (mockRender.mock.calls[0]?.[0] as unknown) as { props?: unknown } | undefined
     expect(call).toBeDefined()
   })
@@ -239,6 +239,26 @@ describe('GET /api/v1/companies/:companyId/invoices/:id/pdf', () => {
     expect(res.status).toBe(500)
     const body = await res.json()
     expect(body.error.code).toBe('INVOICE_PDF_RENDER_FAILED')
+  })
+
+  it('returns 400 when a foreign payment account is missing', async () => {
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        invoices: { data: { ...SENT_INVOICE, currency: 'EUR' }, error: null },
+        company_settings: { data: { ...COMPANY_SETTINGS, invoice_payment_accounts: {} }, error: null },
+      }),
+    )
+
+    const res = await pdf(
+      makeRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/pdf`),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error.code).toBe('INVOICE_SEND_PAYMENT_ACCOUNT_MISSING')
+    expect(mockRender).not.toHaveBeenCalled()
   })
 
   it('returns 400 VALIDATION_ERROR for non-UUID id', async () => {

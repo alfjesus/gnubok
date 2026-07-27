@@ -6,8 +6,15 @@ import { createLogger } from '@/lib/logger'
 
 const log = createLogger('year-end-service')
 import { generateTrialBalance } from '@/lib/reports/trial-balance'
-import { generateIncomeStatement } from '@/lib/reports/income-statement'
+import { fetchAllRows } from '@/lib/supabase/fetch-all'
+import {
+  fetchPaymentsAsOf,
+  outstandingAsOf,
+  todayIsoDate,
+  type PaymentsAsOf,
+} from '@/lib/reports/reskontra-payments'
 import { lockPeriod, closePeriod, createNextPeriod, findNextPeriod } from './period-service'
+import { generateResultAppropriation } from './result-appropriation-service'
 import {
   previewCurrencyRevaluation,
   executeCurrencyRevaluation,
@@ -45,10 +52,14 @@ export async function validateYearEndReadiness(
     .eq('company_id', companyId)
     .single()
 
+  // The error/warning strings below are Swedish: they render verbatim in the
+  // bokslut wizard (a "stays Swedish" surface per .claude/rules/i18n.md).
+  // The MCP year_end_readiness tool classifies them by regex; keep
+  // extensions/general/mcp-server/server.ts in sync when changing wording.
   if (fetchError || !period) {
     return {
       ready: false,
-      errors: ['Fiscal period not found'],
+      errors: ['Räkenskapsperioden hittades inte'],
       warnings: [],
       draftCount: 0,
       voucherGaps: [],
@@ -61,17 +72,17 @@ export async function validateYearEndReadiness(
   // Check: period must have ended (BFNAR 2017:3 / ÅRL 2:1)
   const today = new Date().toISOString().split('T')[0]
   if (period.period_end > today) {
-    errors.push('Cannot close a fiscal period that has not yet ended')
+    errors.push('Perioden kan inte stängas: slutdatumet har inte passerat ännu')
   }
 
   // Check: period not already closed
   if (period.is_closed) {
-    errors.push('Period is already closed')
+    errors.push('Perioden är redan stängd')
   }
 
   // Check: closing entry doesn't already exist
   if (period.closing_entry_id) {
-    errors.push('Year-end closing entry already exists for this period')
+    errors.push('Bokslutsverifikation finns redan för perioden')
   }
 
   // Check: no draft entries
@@ -84,11 +95,11 @@ export async function validateYearEndReadiness(
 
   const drafts = draftCount ?? 0
   if (drafts > 0) {
-    errors.push(`${drafts} draft journal entries must be posted or deleted before closing`)
+    errors.push(`${drafts} utkast måste bokföras eller raderas innan bokslut`)
   }
 
   // Check: voucher continuity across all series
-  let voucherGaps: VoucherGap[] = []
+  const voucherGaps: VoucherGap[] = []
   const { data: seriesRows } = await supabase
     .from('voucher_sequences')
     .select('voucher_series')
@@ -115,8 +126,8 @@ export async function validateYearEndReadiness(
     }
   }
 
-  // Check gap explanations — unexplained gaps block year-end (BFNAR 2013:2 punkt 5.8)
-  let unexplainedGaps: VoucherGap[] = []
+  // Check gap explanations: unexplained gaps block year-end (BFNAR 2013:2 punkt 5.8)
+  const unexplainedGaps: VoucherGap[] = []
   if (voucherGaps.length > 0) {
     const { data: explanations } = await supabase
       .from('voucher_gap_explanations')
@@ -135,12 +146,12 @@ export async function validateYearEndReadiness(
       const key = `${gap.series}:${gap.gap_start}:${gap.gap_end}`
       if (explanationSet.has(key)) {
         warnings.push(
-          `Voucher gap in series ${gap.series} (${gap.gap_start}-${gap.gap_end}) — documented`
+          `Verifikationsnummerglapp i serie ${gap.series} (${gap.gap_start}-${gap.gap_end}): dokumenterat`
         )
       } else {
         unexplainedGaps.push(gap)
         errors.push(
-          `Unexplained voucher gap in series ${gap.series}: ${gap.gap_start}-${gap.gap_end}`
+          `Oförklarat verifikationsnummerglapp i serie ${gap.series}: ${gap.gap_start}-${gap.gap_end}`
         )
       }
     }
@@ -181,11 +192,11 @@ export async function validateYearEndReadiness(
 
         if (sequenceCounter < actualMax) {
           errors.push(
-            `Sequence counter integrity error in series ${row.voucher_series}: counter=${sequenceCounter} but max voucher=${actualMax}`
+            `Nummerserien i serie ${row.voucher_series} stämmer inte: räknaren står på ${sequenceCounter} men högsta verifikationsnummer är ${actualMax}`
           )
         } else {
           warnings.push(
-            `Sequence counter ahead of actual entries in series ${row.voucher_series}: counter=${sequenceCounter}, max voucher=${actualMax}`
+            `Nummerräknaren ligger före bokförda verifikationer i serie ${row.voucher_series}: räknare=${sequenceCounter}, högsta verifikationsnummer=${actualMax}`
           )
         }
       }
@@ -198,7 +209,7 @@ export async function validateYearEndReadiness(
 
   if (!trialBalanceBalanced) {
     errors.push(
-      `Trial balance is not balanced: debit=${trialBalance.totalDebit}, credit=${trialBalance.totalCredit}`
+      `Råbalansen balanserar inte: debet=${trialBalance.totalDebit}, kredit=${trialBalance.totalCredit}`
     )
   }
 
@@ -211,54 +222,78 @@ export async function validateYearEndReadiness(
     .eq('status', 'posted')
 
   if ((entryCount ?? 0) === 0) {
-    warnings.push('No posted journal entries in this period')
+    warnings.push('Inga bokförda verifikationer i perioden')
   }
 
-  // Check: foreign currency items exist but haven't been revalued
-  const { count: revalCount } = await supabase
+  // Check: foreign-currency items open on balansdagen (ÅRL 4 kap. 13 §).
+  //
+  // Only a revaluation dated ON balansdagen discharges the duty. The previous
+  // gate accepted any currency_revaluation verifikat anywhere in the period,
+  // so one interim run (a June month-end revaluation) silenced the check for
+  // every item still outstanding on 31 December: "we already did one, so stop
+  // looking". An interim revaluation says nothing about the balansdagen value.
+  const { count: balansdagenRevalCount } = await supabase
     .from('journal_entries')
     .select('id', { count: 'exact', head: true })
     .eq('company_id', companyId)
     .eq('fiscal_period_id', fiscalPeriodId)
     .eq('source_type', 'currency_revaluation')
     .eq('status', 'posted')
+    .eq('entry_date', period.period_end)
 
-  if ((revalCount ?? 0) === 0) {
-    // Check if there are any open foreign currency items
-    const { count: fxReceivables } = await supabase
-      .from('invoices')
-      .select('id', { count: 'exact', head: true })
-      .eq('company_id', companyId)
-      .in('status', ['sent', 'overdue'])
-      .neq('currency', 'SEK')
-      .not('exchange_rate', 'is', null)
+  // Both states below are warnings, never blockers: nothing in the bokslut
+  // rules makes an unvalued FX item a bar to closing, and executeYearEndClosing
+  // runs the revaluation itself in step 2. Escalating would block a close that
+  // the very next step performs.
+  try {
+    const openFx = await countOpenFxItemsAtBalansdagen(supabase, companyId, period.period_end)
 
-    const { count: fxPayables } = await supabase
-      .from('supplier_invoices')
-      .select('id', { count: 'exact', head: true })
-      .eq('company_id', companyId)
-      .in('status', ['registered', 'approved', 'overdue', 'partially_paid'])
-      .neq('currency', 'SEK')
-      .not('exchange_rate', 'is', null)
-
-    if (((fxReceivables ?? 0) + (fxPayables ?? 0)) > 0) {
+    // Loudest case first. A row with no exchange_rate is invisible to the
+    // revaluation: previewCurrencyRevaluation partitions it into
+    // `unconvertedFx` and drops it, so re-running the year-end will never
+    // value it. It needs a rate on the invoice, and these rows are typically
+    // the largest unmeasured exposure precisely because nothing warns on them.
+    // The old query's `.not('exchange_rate','is',null)`, inherited from the
+    // revaluation code, excluded exactly this case: a company whose only open
+    // FX items were unconverted got no warning at all.
+    if (openFx.unconverted > 0) {
       warnings.push(
-        'Open foreign currency items exist but have not been revalued (ÅRL 4:13)'
+        `${openFx.unconverted} post(er) i utländsk valuta var öppna på balansdagen ${period.period_end} men saknar valutakurs: de kan inte värderas till balansdagskurs (ÅRL 4 kap. 13 §) och utelämnas ur omvärderingen. Registrera kursen på fakturan.`
       )
     }
+
+    // Separate state, separate remedy: these can be valued, they just have not
+    // been yet. Suppressed only by a revaluation dated on balansdagen.
+    if (openFx.revaluable > 0 && (balansdagenRevalCount ?? 0) === 0) {
+      warnings.push(
+        `${openFx.revaluable} post(er) i utländsk valuta var öppna på balansdagen ${period.period_end} och har inte omvärderats till balansdagskurs (ÅRL 4 kap. 13 §)`
+      )
+    }
+  } catch (err) {
+    // A failed lookup must not read as "no FX exposure". Say the check did not
+    // run rather than let silence pass for a clean bill of health.
+    log.error('year-end: could not measure open FX items at balansdagen', err as Error, {
+      operation: 'year_end.fx_readiness',
+      companyId,
+      entityType: 'fiscal_period',
+      entityId: fiscalPeriodId,
+    })
+    warnings.push(
+      'Kontrollen av öppna poster i utländsk valuta (ÅRL 4 kap. 13 §) kunde inte genomföras: stäm av dem manuellt innan bokslut'
+    )
   }
 
   // Check: continuity_verified flag from prior year-end
   if (period.continuity_verified === false) {
-    errors.push('Opening balance continuity check failed for this period — resolve discrepancies before closing')
+    errors.push('IB/UB-kontinuiteten stämmer inte för perioden: åtgärda avvikelserna innan bokslut')
   }
 
   // Check: next period state. A pre-existing next period (from SIE import,
-  // manual creation, or a prior partial run) is fine — we'll reuse it — but
+  // manual creation, or a prior partial run) is fine (we'll reuse it), but
   // one with opening balances already booked blocks closing because we
   // can't post a second IB on top.
   //
-  // The period name is not interpolated into the message — although the
+  // The period name is not interpolated into the message: although the
   // name is user-supplied at create time and confined to the company,
   // surfacing DB-sourced strings through error paths is the kind of
   // injection footgun we'd rather close at the source than rely on the UI
@@ -266,9 +301,9 @@ export async function validateYearEndReadiness(
   const nextPeriod = await findNextPeriod(supabase, companyId, fiscalPeriodId)
   if (nextPeriod) {
     if (nextPeriod.opening_balance_entry_id) {
-      errors.push('Next fiscal period already has opening balances posted')
+      errors.push('Nästa räkenskapsperiod har redan ingående balanser bokförda')
     } else {
-      warnings.push('Next fiscal period already exists — opening balances will be booked into it')
+      warnings.push('Nästa räkenskapsperiod finns redan: ingående balanser bokförs i den')
     }
   }
 
@@ -308,10 +343,6 @@ export async function previewYearEndClosing(
     entityType === 'enskild_firma'
       ? 'Eget kapital'
       : 'Årets resultat'
-
-  // Get income statement for net result
-  const incomeStatement = await generateIncomeStatement(supabase, companyId, fiscalPeriodId)
-  const netResult = incomeStatement.net_result
 
   // Get trial balance for individual account balances in class 3-8
   const { rows } = await generateTrialBalance(supabase, companyId, fiscalPeriodId)
@@ -360,6 +391,16 @@ export async function previewYearEndClosing(
   // If negative (loss): debit to equity (2099/2010)
   const totalClosingDebit = closingLines.reduce((sum, l) => sum + l.debit_amount, 0)
   const totalClosingCredit = closingLines.reduce((sum, l) => sum + l.credit_amount, 0)
+
+  // netResult must equal, by construction, the signed amount transferred to the
+  // closing account (2099/2010) by the balancing line below: positive = credit
+  // = vinst, negative = debit = forlust. It is deliberately NOT taken from
+  // generateIncomeStatement: that report excludes source_type='year_end'
+  // entries, and bokslut-flow entries (annual depreciation, dispositioner)
+  // carry that tag, so the income-statement figure misses them and the
+  // summary card would mismatch the bokslutsverifikation table (issue #766).
+  const netResult = roundOre(totalClosingDebit - totalClosingCredit)
+
   const balancingAmount = roundOre(Math.abs(totalClosingDebit - totalClosingCredit))
 
   if (balancingAmount > ORE_TOLERANCE) {
@@ -402,6 +443,22 @@ export async function previewYearEndClosing(
     }
   }
 
+  // Advisory check: an AB closing a profit year should normally have booked
+  // bolagsskatt (Dr 8910 / Cr 2512) in the dispositions step. If no 89xx tax
+  // account is among the accounts being closed, the profit is untaxed. This
+  // is a warning, not a blocker: zero tax is legitimate when underskotts-
+  // avdrag zeroes the taxable result. 8999 is excluded: it is the manual
+  // result-closing account, not a tax account.
+  // Scanning resultAccountSummary is equivalent to a full 89xx trial-balance
+  // scan: it is built from every class 3-8 account with a non-zero closing
+  // balance, regardless of voucher series, so a booked tax entry cannot be
+  // missed by this check.
+  const hasTaxAccount = resultAccountSummary.some(
+    (a) => a.account_number.startsWith('89') && a.account_number !== '8999'
+  )
+  const bolagsskattMissing =
+    closingAccount === '2099' && netResult > ORE_TOLERANCE && !hasTaxAccount
+
   return {
     netResult,
     closingAccount,
@@ -409,6 +466,7 @@ export async function previewYearEndClosing(
     closingLines,
     resultAccountSummary,
     currencyRevaluation,
+    bolagsskattMissing,
   }
 }
 
@@ -422,9 +480,10 @@ export async function previewYearEndClosing(
  * 5. Set closing_entry_id on the period
  * 6. Resolve next fiscal period (reuse existing or create new)
  * 7. Lock the period
- * 8. Close the period (irreversible — every guard must run before this)
+ * 8. Close the period (irreversible, every guard must run before this)
  * 9. Generate opening balances in next period
  * 10. Validate IB/UB continuity
+ * 11. Omföra föregående års resultat (2099 → 2098) in the new period (AB only)
  */
 export async function executeYearEndClosing(
   supabase: SupabaseClient,
@@ -435,7 +494,7 @@ export async function executeYearEndClosing(
   // 1. Validate readiness
   const validation = await validateYearEndReadiness(supabase, companyId, userId, fiscalPeriodId)
   if (!validation.ready) {
-    throw new Error(`Year-end closing not ready: ${validation.errors.join('; ')}`)
+    throw new Error(`Bokslutet kan inte verkställas: ${validation.errors.join('; ')}`)
   }
 
   // Fetch the period for dates
@@ -465,11 +524,11 @@ export async function executeYearEndClosing(
   const preview = await previewYearEndClosing(supabase, companyId, userId, fiscalPeriodId)
 
   if (preview.closingLines.length === 0) {
-    throw new Error('No result accounts to close — period has no activity')
+    throw new Error('No result accounts to close: period has no activity')
   }
 
   // 3a. INVARIANT: closing entry must balance to the öre before commit.
-  // This guards against rounding drift in previewYearEndClosing — the DB
+  // This guards against rounding drift in previewYearEndClosing: the DB
   // balance trigger would catch it too, but we want a clear Swedish error
   // surfaced to the user, not a generic Postgres exception.
   const preCommitDebit = roundOre(
@@ -495,7 +554,7 @@ export async function executeYearEndClosing(
   })
 
   // 4a. INVARIANT: after the closing entry, class 3-8 net must be exactly 0
-  // (to the öre). If not, we have a logic bug — fail loud rather than
+  // (to the öre). If not, we have a logic bug: fail loud rather than
   // proceed into IB generation with a corrupt trial balance.
   // createJournalEntry has no transactional grouping with the next call;
   // the engine commits atomically per-entry via commit_journal_entry RPC,
@@ -539,7 +598,7 @@ export async function executeYearEndClosing(
   //    period between validateYearEndReadiness and step 8 (TOCTOU race).
   //
   //    The thrown error is intentionally a stable English string with no
-  //    DB-sourced data interpolated — the route layer maps it to a
+  //    DB-sourced data interpolated: the route layer maps it to a
   //    structured error code, and the next period name (if any) is surfaced
   //    only through the structured details payload after explicit checks.
   const existingNextPeriod = await findNextPeriod(supabase, companyId, fiscalPeriodId)
@@ -558,7 +617,7 @@ export async function executeYearEndClosing(
   // 7. Lock the period
   await lockPeriod(supabase, companyId, userId, fiscalPeriodId)
 
-  // 8. Close the period — irreversible per BFL. Every guard that can fail
+  // 8. Close the period: irreversible per BFL. Every guard that can fail
   //    on prior state must run before this point.
   await closePeriod(supabase, companyId, userId, fiscalPeriodId)
 
@@ -579,10 +638,10 @@ export async function executeYearEndClosing(
   // Note on atomicity: createJournalEntry uses an atomic commit_journal_entry
   // RPC per entry, but the closing + IB entries are two separate commits with
   // a period lock/close in between. Once committed, posted entries are
-  // immutable by DB trigger — true rollback isn't possible. reverseEntry()
+  // immutable by DB trigger: true rollback isn't possible. reverseEntry()
   // posts a compensating storno entry instead. The closed period was also
-  // locked & closed, but reverseEntry uses an entry_date that — under the
-  // period-lock trigger — may be blocked. We attempt reversal but tolerate
+  // locked & closed, but reverseEntry uses an entry_date that (under the
+  // period-lock trigger) may be blocked. We attempt reversal but tolerate
   // failure, surfacing the original continuity error either way.
   const continuity = await validateBalanceContinuity(supabase, companyId, nextPeriod.id)
 
@@ -610,6 +669,39 @@ export async function executeYearEndClosing(
     )
   }
 
+  // 11. Omföra föregående års resultat: move 2099 "Årets resultat" off onto
+  //     2098 in the new period so it starts the year at zero (aktiebolag only).
+  //     This is a SEPARATE verifikat by design: folding it into the IB entry
+  //     would make the continuity check above fail, since that check reads IB
+  //     solely from the opening_balance entry. Non-fatal: the close and IB are
+  //     already valid and immutable; a failure here is logged and left for the
+  //     retroactive catch-up script (scripts/repair-result-appropriation.ts).
+  let resultAppropriationEntry: JournalEntry | null = null
+  let resultAppropriationFailed = false
+  try {
+    resultAppropriationEntry = await generateResultAppropriation(
+      supabase,
+      companyId,
+      userId,
+      nextPeriod.id
+    )
+  } catch (err) {
+    resultAppropriationFailed = true
+    // alert:true routes this to the observability sink (lib/observability) in
+    // addition to the log line: a silent accounting failure must not wait for
+    // a manual audit. The sink is a no-op until a provider is configured, so
+    // today this reaches the JSON log only. The new period now opens with 2099 still carrying the
+    // prior result; resultAppropriationFailed below drives a UI warning and the
+    // catch-up script (scripts/repair-result-appropriation.ts) posts the fix.
+    log.error('year-end: result appropriation omföring failed (non-fatal)', err as Error, {
+      operation: 'year_end.result_appropriation',
+      alert: true,
+      companyId,
+      entityType: 'fiscal_period',
+      entityId: nextPeriod.id,
+    })
+  }
+
   // Fetch the now-closed period for the event payload
   const { data: closedPeriod } = await supabase
     .from('fiscal_periods')
@@ -630,6 +722,8 @@ export async function executeYearEndClosing(
     nextPeriod,
     openingBalanceEntry,
     revaluationEntry: revaluationResult?.entry ?? null,
+    resultAppropriationEntry,
+    resultAppropriationFailed,
     continuity,
   }
 }
@@ -737,9 +831,165 @@ export async function generateOpeningBalances(
 }
 
 /**
+ * Open foreign-currency items as they stood on balansdagen, split by whether
+ * the ÅRL 4 kap. 13 § valuation can reach them at all. The two states have
+ * different remedies, so they are counted apart rather than summed.
+ */
+interface OpenFxAtBalansdagen {
+  /** Carries a usable exchange_rate: revaluable to the balansdagen rate. */
+  revaluable: number
+  /**
+   * No exchange_rate on file, so there is no original SEK value to revalue
+   * from. Counted rather than dropped, the same contract `unconverted_fx_count`
+   * carries on the reskontra reports (lib/reports/supplier-ledger.ts): an
+   * excluded row has to show up as a number somewhere.
+   */
+  unconverted: number
+}
+
+/** The subset of an invoice row this check reads. */
+interface FxLedgerRow {
+  id: string
+  status: string | null
+  currency: string | null
+  exchange_rate: number | string | null
+  total: number | string | null
+  paid_amount: number | string | null
+  remaining_amount: number | string | null
+  paid_at: string | null
+}
+
+/** A stored rate is usable only when present and strictly positive. */
+function hasUsableFxRate(rate: number | string | null | undefined): boolean {
+  return rate != null && Number(rate) > 0
+}
+
+/**
+ * Count the foreign-currency receivables and payables that were still open on
+ * balansdagen.
+ *
+ * Measured AS OF balansdagen, not as of now. ÅRL 4 kap. 13 § values monetary
+ * items at the balance-sheet date, so an invoice settled in March of the
+ * following year was still an open FX item on 31 December and still had to be
+ * valued there; the live `status` column only says what is open today. For a
+ * historical balansdagen the population is therefore widened to invoices dated
+ * on or before it (including ones settled since) and the outstanding amount is
+ * recomputed from the payment history, the same reconstruction the reskontra
+ * reports use (lib/reports/ar-ledger.ts, lib/reports/supplier-ledger.ts). For
+ * today or a future balansdagen the stored open-invoice state IS the as-of
+ * state, so no reconstruction is attempted.
+ *
+ * Limits, inherited from `outstandingAsOf` and identical to what the reskontra
+ * reports already accept: an invoice with no payment rows and no `paid_at`
+ * cannot be dated, so its live outstanding is assumed to have stood at
+ * balansdagen; and an invoice cancelled or credited since is treated as never
+ * having been open, because neither event carries a reliable date. The status
+ * population is kept identical to what the revaluation engine actually acts on
+ * (`getOpenForeignCurrencyReceivables` / `...Payables`), so the warning never
+ * points at rows for which no remedy exists.
+ */
+async function countOpenFxItemsAtBalansdagen(
+  supabase: SupabaseClient,
+  companyId: string,
+  balansdagen: string
+): Promise<OpenFxAtBalansdagen> {
+  const isHistorical = balansdagen < todayIsoDate()
+  const columns =
+    'id, status, currency, exchange_rate, total, paid_amount, remaining_amount, paid_at'
+
+  const receivables = await fetchAllRows<FxLedgerRow>(
+    ({ from, to }) => {
+      const base = supabase
+        .from('invoices')
+        .select(columns)
+        .eq('company_id', companyId)
+        .neq('currency', 'SEK')
+      // 'partially_paid' is a live status for customer invoices (payment-sync
+      // sets it on partial settlements); the unpaid remainder was open on
+      // balansdagen just like a 'sent' invoice. Kept in lockstep with
+      // getOpenForeignCurrencyReceivables so this warning never points at
+      // rows the revaluation engine cannot see.
+      const scoped = isHistorical
+        ? base
+            .in('status', ['sent', 'overdue', 'partially_paid', 'paid'])
+            .lte('invoice_date', balansdagen)
+        : base.in('status', ['sent', 'overdue', 'partially_paid'])
+      // Stable total order for correct paging (see fetch-all.ts).
+      return scoped.order('id', { ascending: true }).range(from, to)
+    },
+    { dedupeBy: (r) => r.id }
+  )
+
+  const payables = await fetchAllRows<FxLedgerRow>(
+    ({ from, to }) => {
+      const base = supabase
+        .from('supplier_invoices')
+        .select(columns)
+        .eq('company_id', companyId)
+        .neq('currency', 'SEK')
+      const scoped = isHistorical
+        ? base
+            .in('status', ['registered', 'approved', 'overdue', 'partially_paid', 'paid'])
+            .lte('invoice_date', balansdagen)
+        : base.in('status', ['registered', 'approved', 'overdue', 'partially_paid'])
+      return scoped.order('id', { ascending: true }).range(from, to)
+    },
+    { dedupeBy: (r) => r.id }
+  )
+
+  // Payment history is only needed to walk a since-settled invoice back to what
+  // it owed on balansdagen, and only when there is something to walk back.
+  const receivablePayments =
+    isHistorical && receivables.length > 0
+      ? await fetchPaymentsAsOf(supabase, 'invoice_payments', 'invoice_id', companyId, balansdagen)
+      : null
+  const payablePayments =
+    isHistorical && payables.length > 0
+      ? await fetchPaymentsAsOf(
+          supabase,
+          'supplier_invoice_payments',
+          'supplier_invoice_id',
+          companyId,
+          balansdagen
+        )
+      : null
+
+  const counts: OpenFxAtBalansdagen = { revaluable: 0, unconverted: 0 }
+
+  function tally(
+    rows: FxLedgerRow[],
+    payments: PaymentsAsOf | null,
+    liveOutstanding: (row: FxLedgerRow) => number
+  ): void {
+    for (const row of rows) {
+      const total = Number(row.total) || 0
+      const live = liveOutstanding(row)
+      const outstanding = payments
+        ? outstandingAsOf(row, total, live, payments, balansdagen)
+        : live
+      // Settled on or before balansdagen: nothing was open to value.
+      if (outstanding <= 0) continue
+      if (hasUsableFxRate(row.exchange_rate)) counts.revaluable += 1
+      else counts.unconverted += 1
+    }
+  }
+
+  // Each side uses its own reskontra's definition of outstanding so these
+  // counts reconcile with what the user sees there: kundreskontran derives it
+  // from paid_amount, leverantörsreskontran reads the maintained
+  // remaining_amount.
+  tally(receivables, receivablePayments, (r) =>
+    roundOre((Number(r.total) || 0) - (Number(r.paid_amount) || 0))
+  )
+  tally(payables, payablePayments, (r) => Number(r.remaining_amount) || 0)
+
+  return counts
+}
+
+/**
  * Best-effort reversal used by executeYearEndClosing's rollback paths.
  *
- * Posted journal entries are immutable per DB trigger — we can't truly
+ * Posted journal entries are immutable per DB trigger: we can't truly
  * roll them back, only post a compensating storno via reverseEntry().
  * Closed/locked periods may also block the reversal date. We swallow
  * failures here so the caller can re-throw the original invariant error

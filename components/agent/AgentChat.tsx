@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react'
 import Link from 'next/link'
 import {
   Send,
@@ -10,14 +10,81 @@ import {
   BookmarkX,
   Check,
   Brain,
+  Copy,
+  ThumbsUp,
+  ThumbsDown,
+  ArrowDown,
 } from 'lucide-react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
+import dynamic from 'next/dynamic'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
+import { useCapability } from '@/contexts/CompanyContext'
+import { CAPABILITY } from '@/lib/entitlements/keys'
+import { UpgradeNote } from '@/components/billing/UpgradeNote'
 import ApprovalCard from './ApprovalCard'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
+import type { StoredStagedOperation } from '@/types'
+import type { AgentStatusEvent } from './agent-status'
+import { sendFeedback, type FeedbackSentiment } from './feedback-client'
 
-// Reusable chat surface — used both inside the right-hand AgentSheet and on
+// Markdown parser loads separately from the chat surface: react-markdown +
+// remark-gfm pull in the whole unified/remark tree.
+//
+// It used to render `null` while the chunk loaded. That is invisible while a
+// reply streams (nobody reads that fast) but very visible on RESUME: every
+// assistant bubble in a hydrated conversation was an empty bordered card until
+// the chunk landed, then all the text appeared at once and reflowed the thread.
+// Two changes: the chunk is prefetched as soon as any chat surface mounts, and
+// until it resolves the raw text renders in place of nothing, so a bubble is
+// never blank.
+const MarkdownMessage = dynamic(() => import('./MarkdownMessage'), {
+  ssr: false,
+  loading: () => null,
+})
+
+// Module-scoped so the chunk is fetched once per page load and every later
+// chat surface (sheet, /chat, a resumed conversation) renders markdown on its
+// first frame instead of falling back to plain text again.
+let markdownReady = false
+let markdownPromise: Promise<unknown> | null = null
+
+/** Start the markdown chunk before anything needs to render with it. */
+function prefetchMarkdown(): Promise<unknown> {
+  if (!markdownPromise) {
+    markdownPromise = import('./MarkdownMessage')
+      .then((mod) => {
+        markdownReady = true
+        return mod
+      })
+      .catch(() => {
+        // A chunk can 404 after a deploy, or the network can blip. Clear the
+        // cached promise so a later surface retries, instead of every bubble
+        // for the rest of the session being stuck on the plain-text fallback,
+        // and swallow the rejection so it is not an unhandled one.
+        markdownPromise = null
+        return null
+      })
+  }
+  return markdownPromise
+}
+
+/** True once the markdown chunk is usable; triggers the fetch if it isn't. */
+function useMarkdownReady(): boolean {
+  const [ready, setReady] = useState(markdownReady)
+  useEffect(() => {
+    if (ready) return
+    let alive = true
+    void prefetchMarkdown().then(() => {
+      if (alive) setReady(true)
+    })
+    return () => {
+      alive = false
+    }
+  }, [ready])
+  return ready
+}
+
+// Reusable chat surface: used both inside the right-hand AgentSheet and on
 // the full-page /chat route. Owns:
 //   * Message state (rendered list)
 //   * NDJSON stream consumer for /api/agent/invoke
@@ -25,8 +92,8 @@ import ApprovalCard from './ApprovalCard'
 //   * Input form
 //
 // What it does NOT own:
-//   * Sheet chrome (title bar, close button) — wrapper's job
-//   * Page layout / sidebar — wrapper's job
+//   * Sheet chrome (title bar, close button): wrapper's job
+//   * Page layout / sidebar: wrapper's job
 //
 // Two modes:
 //   * Fresh start (initialMessages empty, initialConversationId null):
@@ -40,7 +107,7 @@ export interface ChatMessage {
   role: 'user' | 'assistant'
   text: string
   // Extended-thinking reasoning, streamed token-by-token via reasoning_delta.
-  // Shown in a collapsible "Tänkte…" block. Stream-time only — not hydrated.
+  // Shown in a collapsible "Tänkte…" block. Stream-time only: not hydrated.
   reasoning?: string
   // Tool-use chips. `completed` flips true when the matching `tool_result`
   // event arrives so the UI can swap the pulsing dot for a static check
@@ -49,11 +116,14 @@ export interface ChatMessage {
   toolCalls?: { tool_use_id: string; name: string; completed?: boolean }[]
   staged?: StagedOperation[]
   memoryEvents?: MemoryEvent[]
+  // Set when the user pressed Stop mid-stream: the partial text stays, with a
+  // marker so a truncated answer is never mistaken for a complete one.
+  interrupted?: boolean
 }
 
 // Emitted by run-turn.ts after a successful remember_fact / forget_fact call
 // so the chat surface can render a quiet "Sparat som minne: …" chip below the
-// assistant message. Stream-time only — not hydrated on /chat resume.
+// assistant message. Stream-time only: not hydrated on /chat resume.
 interface MemoryEvent {
   tool_use_id: string
   action: 'remembered' | 'forgotten'
@@ -74,7 +144,7 @@ interface StagedOperation {
   // by tool; ApprovalCard's renderers do the type-narrowing.
   preview?: unknown
   // Period state at the operation's effective date. Surfaced as a small
-  // badge — open|locked|closed.
+  // badge: open|locked|closed.
   period_status?: {
     period_id?: string | null
     status: 'open' | 'locked' | 'closed'
@@ -89,15 +159,18 @@ export interface AgentChatProps {
   initialMessages?: ChatMessage[]
   initialConversationId?: string | null
   onConversationIdChange?: (id: string) => void
-  // Fires after the first turn_complete in a fresh-start session — used by
+  // Fires after the first turn_complete in a fresh-start session: used by
   // bootstrap starters (ChatNewStarter, ChatIntakeStarter) to defer the URL
   // swap until streaming is done. Swapping on the early `conversation`
   // event unmounts the component mid-stream and the assistant reply is
   // never persisted before /chat/[id] hydrates.
   onFirstTurnComplete?: (id: string) => void
-  // Optional vertical padding override — defaults to py-6 inside the
+  // Optional vertical padding override: defaults to py-6 inside the
   // scroller. The full-page chat uses py-8 for breathing room.
   scrollerClassName?: string
+  // Publishes turn boundaries and the current tool to the shared status
+  // channel. Optional: /chat is its own surface and has nothing to notify.
+  onStatus?: (event: AgentStatusEvent) => void
   // Pre-baked first user message. When set, the mount effect fires the first
   // turn with this verbatim (skipping the intent's promptTemplate path) AND
   // renders it as a user-side message in the timeline. Used by /chat empty
@@ -115,16 +188,55 @@ export default function AgentChat({
   onFirstTurnComplete,
   scrollerClassName,
   seedUserMessage,
+  onStatus,
 }: AgentChatProps) {
   const [conversationId, setConversationId] = useState<string | null>(initialConversationId ?? null)
   // Track whether the first-turn callback has fired so the bootstrap
   // starters get exactly one notification even if a turn fires before
-  // the conversation_id event (defensive — order shouldn't matter).
+  // the conversation_id event (defensive: order shouldn't matter).
   const firstTurnFiredRef = useRef(false)
   const conversationIdRef = useRef<string | null>(initialConversationId ?? null)
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages ?? [])
+  // Read by the announcement effect, which must not re-run on every token: a
+  // `messages` dependency would fire it hundreds of times per turn. Written in
+  // an effect rather than during render: React may replay a render, and a
+  // render-phase ref write can therefore leave the announcement reading a
+  // snapshot the user never saw. Declared BEFORE the announcement effect so it
+  // is already current when that one runs for the same commit.
+  const messagesRef = useRef(messages)
+  useEffect(() => {
+    messagesRef.current = messages
+  }, [messages])
+  // Where the current turn's messages start. Without it the announcement
+  // searches the whole thread, so a turn that produces no text of its own (a
+  // tool-only turn, an error) finds the PREVIOUS answer and reads it out as
+  // though it were the new one.
+  const turnStartRef = useRef(0)
+  const hasAi = useCapability(CAPABILITY.ai)
   const [input, setInput] = useState('')
   const [streaming, setStreaming] = useState(false)
+  // Turn boundaries for the status channel are derived from the streaming flag
+  // rather than published at each call site: a turn can end by completing,
+  // erroring, aborting or being stopped, and a channel that misses one of
+  // those leaves the trigger claiming the agent is still working forever.
+  const turnOpenRef = useRef(false)
+  // Screen-reader announcement for the turn. Deliberately NOT the streaming
+  // text: a live region over token deltas re-announces on every delta and
+  // renders the chat unusable with a screen reader. Announce the two states
+  // that matter instead, and the finished answer once, when it is finished.
+  const [announcement, setAnnouncement] = useState('')
+  useEffect(() => {
+    if (streaming) {
+      turnOpenRef.current = true
+      turnStartRef.current = messagesRef.current.length
+      onStatus?.({ type: 'turn_start' })
+      setAnnouncement('Assistenten skriver ett svar.')
+    } else if (turnOpenRef.current) {
+      turnOpenRef.current = false
+      onStatus?.({ type: 'turn_end' })
+      setAnnouncement(announceableAnswer(messagesRef.current.slice(turnStartRef.current)))
+    }
+  }, [streaming, onStatus])
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const scrollerRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -134,29 +246,33 @@ export default function AgentChat({
   // Set when a tool call runs; consumed by the NEXT text_delta to insert a
   // single paragraph break so post-tool narration starts on its own line.
   // A ref (not state) because it must be read/cleared synchronously inside
-  // the streaming loop without triggering re-renders — and because the
+  // the streaming loop without triggering re-renders, and because the
   // break must fire exactly once per resume, not on every delta.
   const breakBeforeNextTextRef = useRef(false)
-  // Fresh-start vs. resume — only kick off the first turn when we have neither
+  // Fresh-start vs. resume: only kick off the first turn when we have neither
   // a hydrated conversation nor pre-existing messages. React 19 Strict Mode
   // runs effects twice in dev; the first call's cleanup aborts its fetch, the
   // second completes. The invoke endpoint is idempotent on first-turn when
   // no conversation_id is supplied (it creates a fresh row each time, so a
-  // transient duplicate just orphans the first conversation — harmless).
+  // transient duplicate just orphans the first conversation: harmless).
   useEffect(() => {
-    // Only bootstrap a first turn on a genuine fresh start — i.e. NO
+    // Only bootstrap a first turn on a genuine fresh start: i.e. NO
     // conversation id. A present id means the conversation already exists
     // (or is mid-creation elsewhere), so we must not fire an invoke.
     //
     // Why id-alone, not id+messages: the intake flow fires an invoke with
     // no conversation_id, then swaps the URL to /chat/[id] the moment the
-    // `conversation` event lands — which can beat the greeting being
+    // `conversation` event lands: which can beat the greeting being
     // persisted. /chat/[id] then hydrates with 0 messages. If we keyed the
     // guard on messages.length we'd auto-fire a SECOND invoke against the
     // same conversation and render two greetings. Keying on id presence
     // alone closes that race.
     const hasResumeState = !!initialConversationId
     if (hasResumeState) return
+
+    // Paywall: never auto-fire the first invoke without the ai capability;
+    // the composer is already replaced by the upgrade note.
+    if (!hasAi) return
 
     // Seed-message path: render the user's pre-baked starter in the timeline
     // and send it as the first turn's user_message (skips intent.capture +
@@ -180,16 +296,21 @@ export default function AgentChat({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Autoscroll on new content — but only if the user was already pinned to the
+  // Autoscroll on new content, but only if the user was already pinned to the
   // bottom. Scrolling up to re-read a long answer should NOT yank the user
   // back on every streaming token. Threshold accounts for sub-pixel rounding.
   const wasAtBottomRef = useRef(true)
+  // True when the user has scrolled up AND new content has landed below them.
+  // Without this, reading back through a long answer while the next one streams
+  // silently buries the reply: no yank (that would be worse), but a way back.
+  const [hasUnseenBelow, setHasUnseenBelow] = useState(false)
   useEffect(() => {
     const el = scrollerRef.current
     if (!el) return
     const onScroll = () => {
       const distance = el.scrollHeight - (el.scrollTop + el.clientHeight)
       wasAtBottomRef.current = distance < 64
+      if (wasAtBottomRef.current) setHasUnseenBelow(false)
     }
     el.addEventListener('scroll', onScroll, { passive: true })
     return () => el.removeEventListener('scroll', onScroll)
@@ -199,8 +320,19 @@ export default function AgentChat({
     if (!el) return
     if (wasAtBottomRef.current) {
       el.scrollTop = el.scrollHeight
+      setHasUnseenBelow(false)
+    } else {
+      setHasUnseenBelow(true)
     }
   }, [messages])
+
+  function jumpToLatest() {
+    const el = scrollerRef.current
+    if (!el) return
+    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
+    wasAtBottomRef.current = true
+    setHasUnseenBelow(false)
+  }
 
   async function startTurn(body: {
     conversationId: string | null
@@ -209,8 +341,11 @@ export default function AgentChat({
     // hidden so it never renders as a user bubble (e.g. a rejection correction
     // fed back into the chat). The caller also skips adding a visible bubble.
     hidden?: boolean
-  }): Promise<void> {
-    // Abort any in-flight turn before starting a new one — guards against
+    // Resolves false when the turn never reached the server (network error or
+    // a non-2xx), so the caller can hand the user's text back to the composer
+    // instead of stranding a bubble that was never persisted.
+  }): Promise<boolean> {
+    // Abort any in-flight turn before starting a new one: guards against
     // racing two turns when handleSend is triggered twice fast.
     activeControllerRef.current?.abort()
     const controller = new AbortController()
@@ -241,11 +376,11 @@ export default function AgentChat({
         signal,
       })
     } catch (err) {
-      if (signal.aborted) return
-      setErrorMessage(err instanceof Error ? err.message : 'Kunde inte nå assistenten.')
+      if (signal.aborted) return false
+      setErrorMessage(err instanceof Error ? getUserErrorMessage(err) : 'Kunde inte nå assistenten.')
       setStreaming(false)
       activeControllerRef.current = null
-      return
+      return false
     }
 
     if (!response.ok || !response.body) {
@@ -258,15 +393,15 @@ export default function AgentChat({
           msg = errBody.error
         }
       } catch {
-        // non-JSON / empty body — keep the generic message
+        // non-JSON / empty body: keep the generic message
       }
       setErrorMessage(msg)
       setStreaming(false)
       activeControllerRef.current = null
-      return
+      return false
     }
 
-    // Assistant bubble is appended LAZILY — only when the first event that
+    // Assistant bubble is appended LAZILY: only when the first event that
     // produces user-visible content arrives. Eagerly appending here would
     // leave an empty bubble dangling if the stream errors or yields zero
     // events (e.g. proxy hiccup) before any content.
@@ -290,7 +425,7 @@ export default function AgentChat({
           const line = buffer.slice(0, nl).trim()
           buffer = buffer.slice(nl + 1)
           if (!line) continue
-          // Guard JSON.parse per line — a malformed line (proxy split,
+          // Guard JSON.parse per line: a malformed line (proxy split,
           // partial buffer flush) must NOT abort the entire stream. Skip and
           // continue; the next well-formed line will be handled normally.
           let parsed: unknown
@@ -315,7 +450,7 @@ export default function AgentChat({
       }
     } catch (err) {
       if (!signal.aborted) {
-        setErrorMessage(err instanceof Error ? err.message : 'Streamen avbröts.')
+        setErrorMessage(err instanceof Error ? getUserErrorMessage(err) : 'Streamen avbröts.')
       }
     } finally {
       try {
@@ -324,21 +459,34 @@ export default function AgentChat({
         // already released
       }
       // Guard against an aborted prior turn clobbering the new turn's
-      // streaming flag — only the active controller may reset the state.
+      // streaming flag: only the active controller may reset the state.
       if (activeControllerRef.current === controller) {
         setStreaming(false)
         activeControllerRef.current = null
       }
     }
+
+    // The request reached the server. A mid-stream failure is reported through
+    // errorMessage and leaves whatever streamed on screen, so it does not count
+    // as "never sent".
+    return true
   }
 
   function handleStop() {
     activeControllerRef.current?.abort()
     activeControllerRef.current = null
     setStreaming(false)
+    // Keep whatever streamed, but mark it: a half-finished answer that looks
+    // finished is worse than no answer, especially when it stopped mid-figure.
+    setMessages((prev) => {
+      const last = prev[prev.length - 1]
+      if (!last || last.role !== 'assistant' || last.interrupted) return prev
+      return [...prev.slice(0, -1), { ...last, interrupted: true }]
+    })
   }
 
   function handleRegenerate() {
+    if (!hasAi) return
     // Re-run the last user message and let the agent produce a fresh
     // response. UI truncates back to the last user message; DB rows are
     // append-only, so the previous assistant turn stays in agent_messages
@@ -352,15 +500,61 @@ export default function AgentChat({
     }
     if (lastUserIdx === -1) return
     const userMsg = messages[lastUserIdx]
-    setMessages(messages.slice(0, lastUserIdx + 1))
-    void startTurn({ conversationId, userMessage: userMsg.text })
+
+    // Anything the discarded turn staged has to be withdrawn BEFORE the
+    // replacement runs. Otherwise the operation stays pending server-side while
+    // the regenerated turn stages a second proposal for the same booking: two
+    // live proposals for one action, each with its own 30-day expiry. Rejecting
+    // is the same path the Avslå button uses, so the audit trail records why it
+    // went away.
+    const abandoned = messages
+      .slice(lastUserIdx + 1)
+      .flatMap((m) => m.staged ?? [])
+      .map((s) => s.operation_id)
+      .filter((id): id is string => typeof id === 'string')
+
+    void (async () => {
+      const withdrawn = await Promise.all(
+        abandoned.map(async (operationId) => {
+          try {
+            const res = await fetch(`/api/pending-operations/${operationId}/reject`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                rejection_category: 'other',
+                rejection_reason: 'Ersatt: användaren begärde ett nytt svar.',
+              }),
+            })
+            // 409 means someone already resolved it (approved in Granskning, or
+            // a parallel client): it is no longer pending either way, which is
+            // all we need.
+            return res.ok || res.status === 409
+          } catch {
+            return false
+          }
+        }),
+      )
+
+      if (withdrawn.some((ok) => !ok)) {
+        // Leave the turn on screen: hiding a card whose operation is still
+        // pending is the failure mode this whole change exists to remove.
+        setErrorMessage(
+          'Kunde inte dra tillbaka det tidigare förslaget, så svaret behölls. Försök igen.',
+        )
+        return
+      }
+
+      setMessages((prev) => prev.slice(0, lastUserIdx + 1))
+      void startTurn({ conversationId, userMessage: userMsg.text })
+    })()
   }
 
   // Fired after the user rejects a proposal with a reason. The rejection is
   // already recorded server-side; here we feed the correction back as a HIDDEN
-  // user turn so the agent re-proposes inline — no synthetic user bubble (we
+  // user turn so the agent re-proposes inline: no synthetic user bubble (we
   // don't add a user row, and the turn is persisted hidden).
   function handleCorrection(correctionMessage: string) {
+    if (!hasAi) return
     void startTurn({ conversationId, userMessage: correctionMessage, hidden: true })
   }
 
@@ -392,7 +586,7 @@ export default function AgentChat({
         // gluing onto the previous sentence ("kategoriseras.Inget historik").
         // breakBeforeNextTextRef is set by tool_use/tool_result and consumed
         // here on the first delta. Critically, the break is applied to the
-        // delta exactly once — NOT re-evaluated per delta, which previously
+        // delta exactly once: NOT re-evaluated per delta, which previously
         // split mid-word ("minnes\n\nno\n\nterna") because streaming deltas
         // arrive in sub-word chunks.
         setMessages((prev) =>
@@ -414,6 +608,9 @@ export default function AgentChat({
       case 'tool_use':
         // Next text_delta should open a fresh paragraph.
         breakBeforeNextTextRef.current = true
+        // Same label the in-thread chip shows, so a hidden panel and a visible
+        // one describe the step identically.
+        onStatus?.({ type: 'step', label: prettyToolName(ev.name as string) })
         setMessages((prev) =>
           updateLastAssistant(prev, (m) => ({
             ...m,
@@ -426,7 +623,7 @@ export default function AgentChat({
         break
       case 'tool_result':
         // Mark the matching chip as completed instead of removing it. Tools
-        // run in 100–500 ms so yanking the chip the moment it finishes makes
+        // run in 100-500 ms so yanking the chip the moment it finishes makes
         // the indicator feel like a flicker rather than a record of what
         // happened. Leaving the chip in place (with a static check dot,
         // no pulse) gives the user a stable trace of which calls ran.
@@ -451,7 +648,7 @@ export default function AgentChat({
           updateLastAssistant(prev, (m) => ({
             ...m,
             memoryEvents: [...(m.memoryEvents ?? []), evt],
-            // Drop the matching tool_use chip — the richer memory chip
+            // Drop the matching tool_use chip: the richer memory chip
             // replaces it and they convey the same event.
             toolCalls: m.toolCalls?.filter((tc) => tc.tool_use_id !== evt.tool_use_id),
           })),
@@ -507,7 +704,18 @@ export default function AgentChat({
     if (!text || streaming) return
     setInput('')
     setMessages((prev) => [...prev, { role: 'user', text }])
-    await startTurn({ conversationId, userMessage: text })
+    const ok = await startTurn({ conversationId, userMessage: text })
+    if (!ok) {
+      // The turn never reached the server, so nothing was persisted and the
+      // dangling user bubble would vanish on reload. Put the text back in the
+      // composer instead of making the user retype it, and drop the bubble so
+      // what is on screen matches what was actually sent.
+      setMessages((prev) => {
+        const last = prev[prev.length - 1]
+        return last?.role === 'user' && last.text === text ? prev.slice(0, -1) : prev
+      })
+      setInput((current) => (current.length > 0 ? current : text))
+    }
   }
 
   // Auto-resize the textarea as the user types. Capped at 8rem (~128px) so
@@ -521,7 +729,7 @@ export default function AgentChat({
     el.style.height = `${Math.min(el.scrollHeight, max)}px`
   }, [input])
 
-  // Index of the last assistant bubble — used to gate the Regenerate
+  // Index of the last assistant bubble: used to gate the Regenerate
   // affordance so it only appears on the latest response.
   let lastAssistantIdx = -1
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -531,8 +739,31 @@ export default function AgentChat({
     }
   }
 
+  // A vote needs the thread it belongs to. Without a conversation id there is
+  // nothing to attach the report to, so the buttons stay inert rather than
+  // posting a vote the backlog cannot trace to an answer.
+  const handleVote = useCallback(
+    async (sentiment: FeedbackSentiment) => {
+      const id = conversationIdRef.current
+      if (!id) return false
+      return sendFeedback({ conversationId: id, sentiment })
+    },
+    [],
+  )
+
   return (
     <div className="relative flex flex-col h-full min-h-0">
+      {/* The chat had no live region at all, so a screen-reader user got no
+          signal that the assistant had answered: the reply simply appeared for
+          people who could see it. role="status" is the polite variant, which
+          waits for a pause rather than interrupting. */}
+      <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+        {announcement}
+      </div>
+      {/* The pill is positioned against THIS box, not the whole component: the
+          composer below grows as the user types, and a fixed offset from the
+          bottom would slide the pill under it. */}
+      <div className="relative flex-1 min-h-0 flex flex-col">
       <div
         ref={scrollerRef}
         className={cn(
@@ -549,12 +780,14 @@ export default function AgentChat({
               streamingTail={streaming && i === messages.length - 1}
               showRegenerate={
                 !streaming &&
+                hasAi &&
                 i === lastAssistantIdx &&
                 m.role === 'assistant' &&
                 m.text.length > 0
               }
               onRegenerate={handleRegenerate}
               onCorrection={handleCorrection}
+              onVote={handleVote}
             />
           </div>
         ))}
@@ -566,6 +799,26 @@ export default function AgentChat({
         )}
       </div>
 
+      {hasUnseenBelow && (
+        <button
+          type="button"
+          onClick={jumpToLatest}
+          className="absolute left-1/2 -translate-x-1/2 bottom-3 z-10 inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1.5 text-[11px] text-foreground shadow-md hover:bg-secondary transition-colors"
+        >
+          <ArrowDown className="h-3 w-3" />
+          Nytt svar
+        </button>
+      )}
+      </div>
+
+      {/* Paywall: /api/agent/invoke 403s without the ai capability. Replace
+          the composer with an upsell so an already-open conversation (or a
+          deep link to /chat/*) never offers an input that can't send. */}
+      {!hasAi ? (
+        <div className="border-t border-border px-5 pt-4 pb-[calc(env(safe-area-inset-bottom,0px)+1rem)]">
+          <UpgradeNote>AI-assistenten kräver ett abonnemang.</UpgradeNote>
+        </div>
+      ) : (
       <form
         // padding-bottom = base 1rem + safe-area-inset-bottom on phones so
         // the iOS home indicator / Android gesture bar doesn't overlap the
@@ -592,7 +845,7 @@ export default function AgentChat({
             }}
           />
           {streaming ? (
-            // Stop button while the agent is producing tokens — biggest
+            // Stop button while the agent is producing tokens: biggest
             // pain killer. Aborts the in-flight fetch + reader.
             <Button
               type="button"
@@ -619,6 +872,7 @@ export default function AgentChat({
           Enter att skicka · Shift+Enter för ny rad
         </p>
       </form>
+      )}
     </div>
   )
 }
@@ -629,12 +883,14 @@ function MessageBubble({
   showRegenerate,
   onRegenerate,
   onCorrection,
+  onVote,
 }: {
   message: ChatMessage
   streamingTail: boolean
   showRegenerate?: boolean
   onRegenerate?: () => void
   onCorrection?: (message: string) => void
+  onVote?: (sentiment: FeedbackSentiment) => Promise<boolean>
 }) {
   const isUser = message.role === 'user'
   // An assistant turn that contains only tool calls (no text, no streaming
@@ -646,8 +902,11 @@ function MessageBubble({
   // suppress the empty cursor bubble underneath it.
   const isThinking = !isUser && streamingTail && !message.text && !!message.reasoning
   const hideEmptyBubble = (!isUser && !message.text && !streamingTail) || isThinking
+  const markdownLoaded = useMarkdownReady()
   return (
-    <div className={cn('flex flex-col gap-2', isUser ? 'items-end' : 'items-start')}>
+    <div
+      className={cn('group/msg flex flex-col gap-2', isUser ? 'items-end' : 'items-start')}
+    >
       {!isUser && message.reasoning && (
         <ReasoningBlock reasoning={message.reasoning} active={isThinking} />
       )}
@@ -664,12 +923,25 @@ function MessageBubble({
           message.text || (streamingTail ? <Cursor /> : '')
         ) : message.text ? (
           <div className="prose prose-sm max-w-none text-foreground [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 prose-headings:font-display prose-headings:font-normal prose-headings:tracking-tight prose-h2:text-base prose-h2:mt-3 prose-h2:mb-2 prose-h3:text-sm prose-h3:mt-3 prose-h3:mb-1 prose-p:my-2 prose-p:leading-6 prose-strong:font-semibold prose-strong:text-foreground prose-ul:my-2 prose-li:my-0.5 prose-blockquote:border-l-2 prose-blockquote:border-foreground/30 prose-blockquote:not-italic prose-blockquote:text-muted-foreground prose-blockquote:pl-3 prose-blockquote:my-2 prose-code:bg-secondary prose-code:rounded prose-code:px-1 prose-code:py-0.5 prose-code:text-xs prose-code:before:content-none prose-code:after:content-none prose-a:text-foreground prose-a:underline prose-a:underline-offset-2 prose-pre:bg-secondary prose-pre:text-foreground prose-pre:border prose-pre:border-border prose-pre:rounded-lg prose-pre:my-2 prose-pre:p-3 prose-pre:text-xs prose-pre:leading-relaxed prose-pre:overflow-x-auto [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_pre_code]:text-foreground [&_pre_code]:text-xs prose-table:my-2 prose-table:text-xs prose-table:border-collapse [&_table]:w-full [&_th]:border-b [&_th]:border-border [&_th]:py-1.5 [&_th]:px-2 [&_th]:text-left [&_th]:font-medium [&_th]:text-muted-foreground [&_th]:uppercase [&_th]:tracking-wider [&_th]:text-[10px] [&_td]:border-b [&_td]:border-border [&_td]:py-1.5 [&_td]:px-2 [&_td]:align-top [&_tbody_tr:last-child_td]:border-b-0">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.text}</ReactMarkdown>
+            {markdownLoaded ? (
+              <MarkdownMessage text={message.text} />
+            ) : (
+              // One frame at most, and only before the chunk resolves. Plain
+              // text keeps a resumed thread readable instead of showing a
+              // column of empty cards.
+              <p className="whitespace-pre-wrap">{message.text}</p>
+            )}
           </div>
         ) : streamingTail ? (
           <Cursor />
         ) : null}
       </div>
+      )}
+
+      {message.interrupted && (
+        <p className="text-[11px] text-muted-foreground border-t border-dashed border-border pt-1.5">
+          Avbrutet. Det som hann skrivas står kvar.
+        </p>
       )}
 
       {message.toolCalls && message.toolCalls.length > 0 && (
@@ -732,13 +1004,100 @@ function MessageBubble({
         </div>
       )}
 
-      {showRegenerate && onRegenerate && (
-        <button
-          type="button"
-          onClick={onRegenerate}
-          className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground hover:text-foreground transition-colors"
-          title="Generera om svaret"
-        >
+      {!isUser && message.text && !streamingTail && (
+        <MessageActions
+          text={message.text}
+          onRegenerate={showRegenerate ? onRegenerate : undefined}
+          onVote={onVote}
+        />
+      )}
+    </div>
+  )
+}
+
+/**
+ * Hover row under a finished assistant answer: copy, feedback, regenerate.
+ *
+ * The thumbs used to be local-only: they lit up and the vote died in component
+ * state. They now report to /api/agent/feedback, and the pressed state is set
+ * only once the server has accepted the vote, so the button never claims a
+ * report that did not happen.
+ *
+ * A vote does not toggle off. It emits an append-only telemetry event, and
+ * there is no un-emitting one, so offering an undo would be a control that
+ * lies. Changing your mind sends the other sentiment, which is a thing the
+ * backlog can actually see.
+ */
+function MessageActions({
+  text,
+  onRegenerate,
+  onVote,
+}: {
+  text: string
+  onRegenerate?: () => void
+  onVote?: (sentiment: FeedbackSentiment) => Promise<boolean>
+}) {
+  const [copied, setCopied] = useState(false)
+  const [vote, setVote] = useState<'up' | 'down' | null>(null)
+  const [voting, setVoting] = useState(false)
+
+  async function handleVote(next: 'up' | 'down') {
+    if (voting || vote === next || !onVote) return
+    setVoting(true)
+    const ok = await onVote(next === 'up' ? 'positive' : 'negative')
+    setVoting(false)
+    if (ok) setVote(next)
+  }
+
+  useEffect(() => {
+    if (!copied) return
+    const t = setTimeout(() => setCopied(false), 2000)
+    return () => clearTimeout(t)
+  }, [copied])
+
+  async function handleCopy() {
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopied(true)
+    } catch {
+      // Clipboard can be blocked (permissions, insecure context). Silent: the
+      // user can still select the text, and an error toast here would be noise.
+    }
+  }
+
+  const btn =
+    'inline-flex items-center gap-1.5 rounded-md px-1.5 py-1 text-[11px] text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors'
+
+  return (
+    <div className="flex items-center gap-0.5 opacity-0 focus-within:opacity-100 group-hover/msg:opacity-100 transition-opacity">
+      <button type="button" onClick={handleCopy} className={btn} title="Kopiera svaret">
+        {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+        {copied ? 'Kopierat' : 'Kopiera'}
+      </button>
+      <button
+        type="button"
+        onClick={() => handleVote('up')}
+        disabled={voting || !onVote}
+        className={cn(btn, vote === 'up' && 'text-foreground', voting && 'opacity-60')}
+        title="Bra svar"
+        aria-pressed={vote === 'up'}
+      >
+        <ThumbsUp className="h-3 w-3" />
+        <span className="sr-only">Bra svar</span>
+      </button>
+      <button
+        type="button"
+        onClick={() => handleVote('down')}
+        disabled={voting || !onVote}
+        className={cn(btn, vote === 'down' && 'text-foreground', voting && 'opacity-60')}
+        title="Dåligt svar"
+        aria-pressed={vote === 'down'}
+      >
+        <ThumbsDown className="h-3 w-3" />
+        <span className="sr-only">Dåligt svar</span>
+      </button>
+      {onRegenerate && (
+        <button type="button" onClick={onRegenerate} className={btn} title="Generera om svaret">
           <RotateCw className="h-3 w-3" />
           Generera om
         </button>
@@ -747,7 +1106,7 @@ function MessageBubble({
   )
 }
 
-// Pre-token "typing" indicator. Three staggered pulsing dots — reads as
+// Pre-token "typing" indicator. Three staggered pulsing dots: reads as
 // "Anna is typing" much faster than the single blinking caret it replaced.
 // Stays only until the first text_delta lands, then the message body takes
 // over.
@@ -762,7 +1121,7 @@ function Cursor() {
 }
 
 // Collapsible extended-thinking trace. While the model is still reasoning
-// (active), it auto-expands and streams — doubling as the "working" indicator
+// (active), it auto-expands and streams: doubling as the "working" indicator
 // in place of the typing cursor. Once the answer starts it collapses to a
 // quiet toggle so the reply stays the focus and the surface stays calm.
 function ReasoningBlock({ reasoning, active }: { reasoning: string; active: boolean }) {
@@ -813,7 +1172,7 @@ function MemoryChip({ event }: { event: MemoryEvent }) {
     : null
   return (
     <Link
-      href="/settings/assistant"
+      href="/settings/assistant?view=memory"
       className="group inline-flex items-start gap-2 rounded-lg border border-border bg-card px-3 py-2 text-xs text-muted-foreground transition-colors hover:border-foreground/30 hover:text-foreground"
       title="Visa i Assistentens minne"
     >
@@ -909,6 +1268,54 @@ function prettyToolName(name: string): string {
 // Helper used by /chat/[id] server component to normalize agent_messages
 // rows into the ChatMessage shape this component expects. Exported here so
 // both the sheet (for future "resume" support) and the page can use it.
+/**
+ * Re-attach unanswered proposals to a hydrated thread.
+ *
+ * Approval cards ride on streamed events that are never persisted, so without
+ * this a resumed conversation shows the tool trace and the answer but no card,
+ * and the proposal quietly waits out its 30-day expiry in Granskning. They land
+ * on the last assistant message so they read as that turn's proposal, which is
+ * where they were when the turn streamed.
+ */
+/**
+ * `pending_operations.operation_type` stores the bare action name
+ * ('categorize_transaction'), while the live streamed card carries the MCP tool
+ * name ('gnubok_categorize_transaction') and ApprovalCard's PreviewBlock
+ * dispatches on that. Without this, every hydrated card fell through to the
+ * flat generic preview instead of the journal-line one, so a resumed proposal
+ * looked materially worse than the same proposal did live.
+ */
+export function toolNameFor(operationType: string): string {
+  return operationType.startsWith('gnubok_') ? operationType : `gnubok_${operationType}`
+}
+
+export function attachStagedOperations(
+  messages: ChatMessage[],
+  staged: StoredStagedOperation[],
+): ChatMessage[] {
+  if (staged.length === 0) return messages
+
+  const cards: StagedOperation[] = staged.map((op) => ({
+    // Hydrated cards have no tool_use_id (it lived only in the stream); the
+    // operation id is the stable key and the only thing commit/reject need.
+    tool_use_id: `hydrated:${op.id}`,
+    operation_id: op.id,
+    risk_level:
+      op.risk_level === 'high' || op.risk_level === 'medium' ? op.risk_level : 'low',
+    message: op.title ?? 'Förslag väntar på granskning.',
+    tool_name: toolNameFor(op.operation_type),
+    preview: op.preview_data,
+  }))
+
+  const lastAssistantIdx = messages.map((m) => m.role).lastIndexOf('assistant')
+  if (lastAssistantIdx === -1) {
+    return [...messages, { role: 'assistant', text: '', staged: cards }]
+  }
+  return messages.map((m, i) =>
+    i === lastAssistantIdx ? { ...m, staged: [...(m.staged ?? []), ...cards] } : m,
+  )
+}
+
 export function normalizeStoredMessages(
   rows: { role: string; content: unknown; hidden?: boolean | null }[],
 ): ChatMessage[] {
@@ -927,7 +1334,7 @@ export function normalizeStoredMessages(
     for (const block of content as { type: string; text?: string; id?: string; name?: string }[]) {
       if (block.type === 'text' && block.text) text += block.text
       else if (block.type === 'tool_use' && block.id && block.name) {
-        // Hydrated rows are historical — the tool already finished by
+        // Hydrated rows are historical: the tool already finished by
         // definition (otherwise the assistant content wouldn't have been
         // persisted). Mark every chip as completed so the rendered state
         // matches the live tool_result-handled state.
@@ -941,4 +1348,33 @@ export function normalizeStoredMessages(
     })
   }
   return out
+}
+
+/**
+ * What to read out when a turn finishes.
+ *
+ * Takes only the CURRENT turn's messages: given the whole thread, a turn that
+ * produced no text of its own would find the previous answer and announce it
+ * again as if it were new.
+ *
+ * The cap exists because a screen reader reads a live region straight through:
+ * a 900-word bokslut explanation announced in one uninterruptible burst is
+ * worse than not announcing it. It covers the WHOLE announcement, suffix
+ * included, so the promise the constant makes is the one the output keeps.
+ */
+export const ANNOUNCEMENT_LIMIT = 400
+const CONTINUES = '… Svaret fortsätter i meddelandet.'
+
+export function announceableAnswer(messages: ChatMessage[]): string {
+  const last = [...messages].reverse().find((m) => m.role === 'assistant')
+
+  // Stop leaves the partial text in place with a visible marker. Reading it
+  // out as a finished answer would tell a screen-reader user the opposite of
+  // what the marker tells everyone else.
+  if (last?.interrupted) return 'Assistenten avbröts. Ett ofullständigt svar står i meddelandet.'
+
+  const text = last?.text?.trim()
+  if (!text) return 'Assistenten är klar.'
+  if (text.length <= ANNOUNCEMENT_LIMIT) return text
+  return text.slice(0, ANNOUNCEMENT_LIMIT - CONTINUES.length).trimEnd() + CONTINUES
 }

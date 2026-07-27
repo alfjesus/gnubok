@@ -11,6 +11,7 @@ import { Loader2, ShieldCheck, Copy, Check, ArrowLeft } from 'lucide-react'
 import { getBranding } from '@/lib/branding/service'
 import { userHasPassword } from '@/lib/auth/has-password'
 import { safeReturnTo } from '@/lib/auth/safe-return-to'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 export default function MfaEnrollPage() {
   return (
@@ -36,7 +37,7 @@ function MfaEnrollContent() {
 
   const returnTo = safeReturnTo(searchParams.get('returnTo'), '/')
 
-  // UX defense — middleware already blocks this route for BankID-only users
+  // UX defense: middleware already blocks this route for BankID-only users
   // without a password, but a stale tab might land here too. Bounce them to
   // the set-password flow before they enroll a factor they cannot later
   // un-enroll without AAL2.
@@ -83,7 +84,7 @@ function MfaEnrollContent() {
       if (error) {
         toast({
           title: 'Kunde inte aktivera 2FA',
-          description: error.message,
+          description: getUserErrorMessage(error),
           variant: 'destructive',
         })
         setIsEnrolling(false)
@@ -188,7 +189,7 @@ function MfaEnrollContent() {
             </p>
           </div>
 
-          <div className="rounded-xl border bg-card p-6" style={{ boxShadow: 'var(--shadow-md)' }}>
+          <div className="rounded-lg border bg-card p-6">
             <div className="space-y-4">
               <div className="rounded-lg border bg-muted/50 p-4">
                 <p className="text-sm text-muted-foreground leading-relaxed">
@@ -242,7 +243,7 @@ function MfaEnrollContent() {
           </p>
         </div>
 
-        <div className="rounded-xl border bg-card p-6 space-y-6" style={{ boxShadow: 'var(--shadow-md)' }}>
+        <div className="rounded-lg border bg-card p-6 space-y-6">
           {/* QR Code */}
           <div className="flex justify-center">
             <div

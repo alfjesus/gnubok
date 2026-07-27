@@ -7,7 +7,7 @@
  *
  * Generalises the existing MCP tools (gnubok_vat_close_check,
  * gnubok_year_end_readiness) under a single response shape. New check types
- * can be added by registering an entry in CHECK_RUNNERS — the response
+ * can be added by registering an entry in CHECK_RUNNERS: the response
  * envelope stays stable so agents only learn one shape.
  *
  * Response shape:
@@ -20,7 +20,7 @@
 import { z } from 'zod'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { ok } from '@/lib/api/v1/response'
-import { registerEndpoint } from '@/lib/api/v1/registry'
+import { registerEndpoint, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
 import { v1ErrorResponse, v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
 import { ownsFiscalPeriod } from '@/lib/api/v1/owns-fiscal-period'
@@ -32,7 +32,7 @@ import { validateYearEndReadiness } from '@/lib/core/bookkeeping/year-end-servic
 // routes can't import from `@/extensions/` (CI guard `core-only.yml`). A
 // follow-up PR will extract that function into `lib/reports/` so it can be
 // re-used from both the MCP tool and this endpoint without violating the
-// extension/core boundary. The CHECK_RUNNERS shape is ready — adding the
+// extension/core boundary. The CHECK_RUNNERS shape is ready: adding the
 // type back is a one-liner once the function is in `lib/`.
 
 // --------------------------------------------------------------------
@@ -158,28 +158,82 @@ async function runVoucherGapsCheck(
     return { error: 'voucher_gaps requires fiscal_period_id (UUID) query param.' }
   }
 
-  // Same ownership pre-check as year_end_readiness — the RPC scopes by
+  // Same ownership pre-check as year_end_readiness: the RPC scopes by
   // company_id but returning a clean error here is better UX.
   const periodCheck = await ownsFiscalPeriod(supabase, companyId, fiscalPeriodId)
   if (!periodCheck) {
     return { error: 'fiscal_period_id not found in this company.' }
   }
 
-  const { data, error } = await supabase.rpc('detect_voucher_gaps', {
-    p_company_id: companyId,
-    p_fiscal_period_id: fiscalPeriodId,
+  // `detect_voucher_gaps` checks ONE series per call (p_series defaults to
+  // 'A'), so the series have to be enumerated first: a company booking into
+  // B / F / ... would otherwise be told "no gaps" while a real break sits in
+  // another series. Same source and same ['A'] fallback as
+  // `validateYearEndReadiness` and GET /api/bookkeeping/voucher-gaps.
+  const { data: seriesRows, error: seriesError } = await supabase
+    .from('voucher_sequences')
+    .select('voucher_series')
+    .eq('company_id', companyId)
+    .eq('fiscal_period_id', fiscalPeriodId)
+  if (seriesError) throw seriesError
+
+  const seriesToCheck =
+    seriesRows && seriesRows.length > 0
+      ? (seriesRows as Array<{ voucher_series: string }>).map((r) => r.voucher_series)
+      : ['A']
+
+  // The RPC returns ONLY (gap_start, gap_end). The series is what we passed
+  // in; whether the gap is documented comes from voucher_gap_explanations
+  // below. Never read those off the RPC row.
+  const gaps: Array<{ voucher_series: string; gap_start: number; gap_end: number }> = []
+  for (const series of seriesToCheck) {
+    const { data, error } = await supabase.rpc('detect_voucher_gaps', {
+      p_company_id: companyId,
+      p_fiscal_period_id: fiscalPeriodId,
+      p_series: series,
+    })
+    // A failed detection must surface: silently dropping a series would
+    // report "clean" for books whose continuity was never checked.
+    if (error) throw error
+    for (const g of (data ?? []) as Array<{ gap_start: number; gap_end: number }>) {
+      gaps.push({ voucher_series: series, gap_start: g.gap_start, gap_end: g.gap_end })
+    }
+  }
+
+  // Explanations are keyed exactly like the table's UNIQUE constraint
+  // (company_id, fiscal_period_id, voucher_series, gap_start, gap_end).
+  // A failed lookup throws rather than defaulting gaps to "explained".
+  const explainedKeys = new Set<string>()
+  if (gaps.length > 0) {
+    const { data: explanations, error: explError } = await supabase
+      .from('voucher_gap_explanations')
+      .select('voucher_series, gap_start, gap_end')
+      .eq('company_id', companyId)
+      .eq('fiscal_period_id', fiscalPeriodId)
+    if (explError) throw explError
+    for (const e of (explanations ?? []) as Array<{
+      voucher_series: string
+      gap_start: number
+      gap_end: number
+    }>) {
+      explainedKeys.add(`${e.voucher_series}:${e.gap_start}:${e.gap_end}`)
+    }
+  }
+
+  const findings: FindingShape[] = gaps.map((g) => {
+    const hasExplanation = explainedKeys.has(`${g.voucher_series}:${g.gap_start}:${g.gap_end}`)
+    return {
+      severity: hasExplanation ? 'info' : 'blocker',
+      code: hasExplanation ? 'VOUCHER_GAP_EXPLAINED' : 'VOUCHER_GAP_UNEXPLAINED',
+      message: `Series ${g.voucher_series}: gap ${g.gap_start}${g.gap_end > g.gap_start ? `-${g.gap_end}` : ''}${hasExplanation ? ' (explained)' : ' (no explanation)'}.`,
+      details: {
+        voucher_series: g.voucher_series,
+        gap_start: g.gap_start,
+        gap_end: g.gap_end,
+        has_explanation: hasExplanation,
+      },
+    }
   })
-  if (error) throw error
-
-  type GapRow = { voucher_series: string; gap_start: number; gap_end: number; has_explanation: boolean }
-  const rows = (data ?? []) as GapRow[]
-
-  const findings: FindingShape[] = rows.map((r) => ({
-    severity: r.has_explanation ? 'info' : 'blocker',
-    code: r.has_explanation ? 'VOUCHER_GAP_EXPLAINED' : 'VOUCHER_GAP_UNEXPLAINED',
-    message: `Series ${r.voucher_series}: gap ${r.gap_start}${r.gap_end > r.gap_start ? `–${r.gap_end}` : ''}${r.has_explanation ? ' (explained)' : ' (no explanation)'}.`,
-    details: { voucher_series: r.voucher_series, gap_start: r.gap_start, gap_end: r.gap_end, has_explanation: r.has_explanation },
-  }))
 
   const unexplainedCount = findings.filter((f) => f.code === 'VOUCHER_GAP_UNEXPLAINED').length
 
@@ -187,10 +241,14 @@ async function runVoucherGapsCheck(
     ready: unexplainedCount === 0,
     findings,
     summary:
-      rows.length === 0
-        ? 'Verifikationsserie is continuous (no gaps).'
-        : `${unexplainedCount} unexplained gap(s) of ${rows.length} total. Document via POST /voucher-gap-explanations.`,
-    extra: { total_gaps: rows.length, unexplained_count: unexplainedCount },
+      gaps.length === 0
+        ? `Verifikationsserie ${seriesToCheck.join(', ')} is continuous (no gaps).`
+        : `${unexplainedCount} unexplained gap(s) of ${gaps.length} total. Document via POST /voucher-gap-explanations.`,
+    extra: {
+      total_gaps: gaps.length,
+      unexplained_count: unexplainedCount,
+      series_checked: seriesToCheck,
+    },
   }
 }
 
@@ -208,11 +266,12 @@ registerEndpoint({
   useWhen:
     'Before committing to an irreversible action (VAT close, year-end close), or as a periodic audit sweep to surface blockers before they become urgent.',
   doNotUseFor:
-    'Executing the underlying action — this is read-only. After a passing check, call the corresponding async endpoint (POST /fiscal-periods/{id}/year-end, etc).',
+    'Executing the underlying action: this is read-only. After a passing check, call the corresponding async endpoint (POST /fiscal-periods/{id}/year-end, etc).',
   pitfalls: [
     'year_end_readiness and voucher_gaps require fiscal_period_id (UUID).',
-    'A passing check is a SNAPSHOT — the state can change between the check and the action. The same blocker logic runs again on commit.',
-    'vat_close is documented in the plan but NOT yet supported by this endpoint — call gnubok_vat_close_check via the MCP server until the function is extracted into lib/reports/.',
+    'voucher_gaps covers EVERY voucher series registered for the period (A, B, F, ...), not only series A.',
+    'A passing check is a SNAPSHOT: the state can change between the check and the action. The same blocker logic runs again on commit.',
+    'vat_close is documented in the plan but NOT yet supported by this endpoint: call gnubok_vat_close_check via the MCP server until the function is extracted into lib/reports/.',
   ],
   example: {
     response: {
@@ -234,7 +293,7 @@ registerEndpoint({
   idempotent: true,
   reversible: false,
   dryRunSupported: false,
-  response: { success: ComplianceCheckResponse },
+  response: { success: dataEnvelope(ComplianceCheckResponse) },
 })
 
 export const GET = withApiV1<{ params: Promise<{ companyId: string }> }>(

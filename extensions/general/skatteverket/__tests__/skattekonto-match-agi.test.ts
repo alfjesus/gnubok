@@ -60,6 +60,35 @@ describe('parseAgiPeriod', () => {
   it('rejects implausible years', () => {
     expect(parseAgiPeriod('Arbetsgivardeklaration 199912')).toBeNull()
   })
+
+  it('parses production month-name rows', () => {
+    expect(parseAgiPeriod('Avdragen skatt maj 2026')).toEqual({
+      year: 2026,
+      month: 5,
+    })
+    expect(parseAgiPeriod('Arbetsgivaravgift maj 2026')).toEqual({
+      year: 2026,
+      month: 5,
+    })
+    expect(parseAgiPeriod('ARBETSGIVARAVGIFT December 2026')).toEqual({
+      year: 2026,
+      month: 12,
+    })
+  })
+
+  it('parses the period from production beslut rows', () => {
+    // The 6-digit beslut date must not be mistaken for a YYYYMM period; the
+    // month-name token is the real period.
+    expect(parseAgiPeriod('Beslut 260703 arbetsgivaravgift mars 2026')).toEqual({
+      year: 2026,
+      month: 3,
+    })
+  })
+
+  it('does not treat unrelated month-name rows as AGI periods', () => {
+    expect(parseAgiPeriod('Intäktsränta maj 2026')).toBeNull()
+    expect(parseAgiPeriod('Moms maj 2026')).toBeNull()
+  })
 })
 
 // ──────────────────────────────────────────────────────────────────────
@@ -90,17 +119,42 @@ function lineRow(opts: {
   }
 }
 
-describe('findMatchSuggestionsBulk — AGI period disambiguation', () => {
+/**
+ * Enqueue the two pages the two-step entry-lines fetch reads
+ * (lib/bookkeeping/entry-lines.ts): the parent entries first, then the bare
+ * lines keyed by journal_entry_id. Fixtures stay embed-shaped; the helper
+ * reattaches the parent under `journal_entries`, which is exactly what the
+ * old `journal_entries!inner(...)` embed produced.
+ */
+function enqueueLines(
+  enqueue: (result: { data?: unknown; error?: unknown }) => void,
+  rows: ReturnType<typeof lineRow>[],
+) {
+  const entries = [
+    ...new Map(rows.map((r) => [r.journal_entries.id, r.journal_entries])).values(),
+  ]
+  enqueue({ data: entries })
+  // No matching entry means the helper never queries the lines at all.
+  if (entries.length === 0) return
+  enqueue({
+    data: rows.map((r, i) => ({
+      id: `line-${String(i).padStart(4, '0')}`,
+      journal_entry_id: r.journal_entries.id,
+      debit_amount: r.debit_amount,
+      credit_amount: r.credit_amount,
+    })),
+  })
+}
+
+describe('findMatchSuggestionsBulk: AGI period disambiguation', () => {
   it('picks the AGI-linked entry even when two amount-matches exist', async () => {
     const { supabase, enqueue } = createQueuedMockSupabase()
-    // Two journal entries credit 1630 with the same amount — without period
+    // Two journal entries credit 1630 with the same amount: without period
     // disambiguation, this would be ambiguous and return no suggestion.
-    enqueue({
-      data: [
-        lineRow({ entryId: 'je-other-month', credit: 12345, entryDate: '2026-06-10' }),
-        lineRow({ entryId: 'je-agi-may', credit: 12345, entryDate: '2026-06-12' }),
-      ],
-    })
+    enqueueLines(enqueue, [
+      lineRow({ entryId: 'je-other-month', credit: 12345, entryDate: '2026-06-10' }),
+      lineRow({ entryId: 'je-agi-may', credit: 12345, entryDate: '2026-06-12' }),
+    ])
     enqueue({ data: [] }) // none already linked
     // AGI declarations lookup
     enqueue({
@@ -143,9 +197,8 @@ describe('findMatchSuggestionsBulk — AGI period disambiguation', () => {
 
   it('falls back to amount-only matching when no AGI declaration exists for the period', async () => {
     const { supabase, enqueue } = createQueuedMockSupabase()
-    enqueue({
-      data: [lineRow({ entryId: 'je-unique', credit: 9999, entryDate: '2026-06-12' })],
-    })
+    enqueueLines(enqueue, [lineRow({ entryId: 'je-unique', credit: 9999, entryDate: '2026-06-12' })
+    ])
     enqueue({ data: [] })
     // No AGI declaration for 2026-05
     enqueue({ data: [] })
@@ -171,12 +224,10 @@ describe('findMatchSuggestionsBulk — AGI period disambiguation', () => {
   it('returns no suggestion when AGI-linked entries do not match the amount', async () => {
     const { supabase, enqueue } = createQueuedMockSupabase()
     // Two amount-matching entries, neither is the AGI-linked one.
-    enqueue({
-      data: [
-        lineRow({ entryId: 'je-a', credit: 5000, entryDate: '2026-06-12' }),
-        lineRow({ entryId: 'je-b', credit: 5000, entryDate: '2026-06-13' }),
-      ],
-    })
+    enqueueLines(enqueue, [
+      lineRow({ entryId: 'je-a', credit: 5000, entryDate: '2026-06-12' }),
+      lineRow({ entryId: 'je-b', credit: 5000, entryDate: '2026-06-13' }),
+    ])
     enqueue({ data: [] })
     enqueue({
       data: [
@@ -225,18 +276,16 @@ function txRow(overrides: Record<string, unknown> = {}) {
   }
 }
 
-describe('findMatchCandidates — AGI period boost', () => {
+describe('findMatchCandidates: AGI period boost', () => {
   it('moves the AGI-linked entry to position 0 even when a closer-by-date entry exists', async () => {
     const { supabase, enqueue } = createQueuedMockSupabase()
     enqueue({ data: txRow() })
-    enqueue({
-      data: [
-        // closer to SKV date but unrelated
-        lineRow({ entryId: 'je-close', credit: 12345, entryDate: '2026-06-12' }),
-        // further from SKV date but AGI-linked
-        lineRow({ entryId: 'je-agi', credit: 12345, entryDate: '2026-06-05' }),
-      ],
-    })
+    enqueueLines(enqueue, [
+      // closer to SKV date but unrelated
+      lineRow({ entryId: 'je-close', credit: 12345, entryDate: '2026-06-12' }),
+      // further from SKV date but AGI-linked
+      lineRow({ entryId: 'je-agi', credit: 12345, entryDate: '2026-06-05' }),
+    ])
     enqueue({ data: [] }) // none linked
     enqueue({
       data: [

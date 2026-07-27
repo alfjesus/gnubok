@@ -1,5 +1,5 @@
 /**
- * Migration orchestrator — coordinates the data migration from
+ * Migration orchestrator: coordinates the data migration from
  * an external accounting system directly via provider APIs into gnubok.
  *
  * Bookkeeping data (accounts, balances, vouchers) is imported
@@ -22,6 +22,7 @@ import type { MigrationProgress, MigrationResults, SkipReasons } from '../types'
 import type { ProviderName } from '@/lib/providers/types'
 import type { CustomerDto, SupplierDto, SalesInvoiceDto, SupplierInvoiceDto, PartyDto } from '@/lib/providers/dto'
 import { resolveConsent } from '@/lib/providers/resolve-consent'
+import { normalizeVatNumber, isValidSwedishVatNumber } from '@/lib/vat/vat-number'
 import {
   fetchCompanyInfoDirect,
   fetchCustomersDirect,
@@ -30,6 +31,7 @@ import {
   fetchSupplierInvoicesDirect,
 } from '@/lib/providers/provider-data-fetcher'
 import { fetchAllRows } from '@/lib/supabase/fetch-all'
+import { createLogger } from '@/lib/logger'
 import { reconcileSupplierInvoiceVouchers } from '@/lib/invoices/bulk-reconcile-supplier-vouchers'
 import {
   mapCustomer,
@@ -38,7 +40,11 @@ import {
   mapSupplierInvoice,
   mapCompanyInfo,
   inferTypeFromParty,
+  buildFxRateIndex,
+  type FxUnresolved,
 } from './entity-mapper'
+
+const log = createLogger('extensions/arcim-migration/migration-orchestrator')
 
 export interface MigrationOptions {
   consentId: string
@@ -79,6 +85,28 @@ function getOrgNumberFromParty(party: PartyDto): string | null {
   )
 }
 
+/**
+ * Log a foreign-currency document that was imported WITHOUT a SEK conversion.
+ *
+ * It is still imported (dropping it would lose räkenskapsinformation), but it
+ * carries exchange_rate = null, so every booking path refuses it loudly rather
+ * than posting it as if 1 unit = 1 SEK. Counted into the step's result so the
+ * migration reports it instead of passing it off as an ordinary import.
+ */
+function logFxUnresolved(kind: string, invoiceNumber: string, fx: FxUnresolved): void {
+  // Structured logger, not console.error: the record passes the observability
+  // redaction pipeline (lib/observability/redact.ts) before it can reach any
+  // sink, so invoice identifiers in log output stay inside the same PII
+  // controls as every other server log line.
+  log.error('document imported without a SEK conversion; set an exchange rate before booking it', {
+    entityType: kind,
+    entityId: invoiceNumber,
+    currency: fx.currency,
+    documentDate: fx.date || null,
+    reason: fx.reason,
+  })
+}
+
 // ── Main orchestrator ─────────────────────────────────────────────
 
 export async function executeMigration(options: MigrationOptions): Promise<MigrationResults> {
@@ -109,8 +137,22 @@ export async function executeMigration(options: MigrationOptions): Promise<Migra
           if (!existing?.company_name && mapped.company_name) updates.company_name = mapped.company_name
           if (!existing?.org_number && mapped.org_number) updates.org_number = mapped.org_number
           if (!existing?.vat_number && mapped.vat_number) {
-            updates.vat_number = mapped.vat_number
-            updates.vat_registered = true
+            // Normalise provider input; only persist a structurally valid
+            // SE+12 momsregistreringsnummer so a malformed value from an
+            // external API can't enter company_settings unchecked.
+            const normalizedVat = normalizeVatNumber(mapped.vat_number)
+            if (isValidSwedishVatNumber(normalizedVat)) {
+              updates.vat_number = normalizedVat
+              updates.vat_registered = true
+            } else {
+              // Observability: a provider sent a VAT number we can't normalise
+              // to a valid SE+12 momsregistreringsnummer. We drop it (above),
+              // but surface the anomaly so consistently-bad provider data is
+              // visible. Don't log the raw value: it can embed a personnummer.
+              console.warn(
+                `[migration] Dropped malformed VAT number from ${provider} for company ${companyId} (normalized length ${normalizedVat.length})`,
+              )
+            }
           }
           if (mapped.fiscal_year_start_month !== 1) {
             updates.fiscal_year_start_month = mapped.fiscal_year_start_month
@@ -176,9 +218,18 @@ export async function executeMigration(options: MigrationOptions): Promise<Migra
             continue
           }
 
+          // Dedup against already-imported records: prefer org-number, but fall
+          // back to name when the party has no org-number. Otherwise org-less
+          // customers (private persons) are re-created on every re-sync, since
+          // the org-number map can never match them.
           const orgNumber = getOrgNumberFromParty(customer.party)
-          if (orgNumber && orgNumberToCustomerId.has(orgNumber)) {
-            customerIdMap.set(customer.id, orgNumberToCustomerId.get(orgNumber)!)
+          const existingCustomerId = orgNumber
+            ? orgNumberToCustomerId.get(orgNumber)
+            : customer.party.name
+              ? nameToCustomerId.get(customer.party.name)
+              : undefined
+          if (existingCustomerId) {
+            customerIdMap.set(customer.id, existingCustomerId)
             skipReasons.duplicate = (skipReasons.duplicate ?? 0) + 1
             skipped++
             continue
@@ -257,9 +308,16 @@ export async function executeMigration(options: MigrationOptions): Promise<Migra
             continue
           }
 
+          // Same org-number-then-name dedup as customers, so org-less suppliers
+          // (e.g. PostNord, IKANO BANK) aren't duplicated on every re-sync.
           const orgNumber = getOrgNumberFromParty(supplier.party)
-          if (orgNumber && orgNumberToSupplierId.has(orgNumber)) {
-            supplierIdMap.set(supplier.id, orgNumberToSupplierId.get(orgNumber)!)
+          const existingSupplierId = orgNumber
+            ? orgNumberToSupplierId.get(orgNumber)
+            : supplier.party.name
+              ? nameToSupplierId.get(supplier.party.name)
+              : undefined
+          if (existingSupplierId) {
+            supplierIdMap.set(supplier.id, existingSupplierId)
             skipReasons.duplicate = (skipReasons.duplicate ?? 0) + 1
             skipped++
             continue
@@ -355,7 +413,7 @@ export async function executeMigration(options: MigrationOptions): Promise<Migra
             continue
           }
 
-          // Need to create a minimal customer — dedupe by org number first,
+          // Need to create a minimal customer: dedupe by org number first,
           // then by name, so invoices sharing a missing party only create
           // one stub row.
           const key = (customerOrgNumber ?? `name:${inv.customer.name.toLowerCase()}`).trim()
@@ -429,10 +487,21 @@ export async function executeMigration(options: MigrationOptions): Promise<Migra
           return !!r.customerId
         })
 
+        // Phase B2: resolve the SEK conversion for every foreign-currency
+        // invoice, at the rate valid on its OWN issue date. The provider DTO
+        // carries no rate and no SEK amount, so without this every foreign
+        // invoice lands unconverted. One pass over the whole step (not per
+        // chunk) so repeat (currency, date) pairs are fetched once.
+        const fxRates = await buildFxRateIndex(
+          supabase,
+          ready.map((r) => ({ currencyCode: r.dto.currencyCode, issueDate: r.dto.issueDate }))
+        )
+        let fxUnresolved = 0
+
         // Phase C: chunk-insert invoices + their line items.
         for (const batch of chunk(ready, INSERT_CHUNK_SIZE)) {
           const mappedBatch = batch.map((r) => ({
-            ...mapSalesInvoice(r.dto, userId, companyId, r.customerId),
+            ...mapSalesInvoice(r.dto, userId, companyId, r.customerId, fxRates),
             dto: r.dto,
           }))
 
@@ -455,6 +524,11 @@ export async function executeMigration(options: MigrationOptions): Promise<Migra
             for (const item of mappedBatch[i].items) {
               allItems.push({ ...item, invoice_id: invoiceId })
             }
+            const fx = mappedBatch[i].fxUnresolved
+            if (fx) {
+              fxUnresolved++
+              logFxUnresolved('Sales invoice', mappedBatch[i].dto.invoiceNumber, fx)
+            }
             imported++
           }
 
@@ -468,7 +542,7 @@ export async function executeMigration(options: MigrationOptions): Promise<Migra
           }
         }
 
-        results.salesInvoices = { total: invoices.length, imported, skipped, skipReasons }
+        results.salesInvoices = { total: invoices.length, imported, skipped, skipReasons, fxUnresolved }
       } catch (err) {
         console.error('Failed to import sales invoices:', err)
       }
@@ -545,7 +619,7 @@ export async function executeMigration(options: MigrationOptions): Promise<Migra
             continue
           }
 
-          // Need to create a minimal supplier — dedupe the same way as customers.
+          // Need to create a minimal supplier: dedupe the same way as customers.
           const key = (supplierOrgNumber ?? `name:${inv.supplier.name.toLowerCase()}`).trim()
           let stub = stubByKey.get(key)
           if (!stub) {
@@ -622,11 +696,21 @@ export async function executeMigration(options: MigrationOptions): Promise<Migra
           return true
         })
 
+        // Resolve the SEK conversion for every foreign-currency invoice at the
+        // rate valid on its OWN issue date (see the sales-invoice step).
+        const fxRates = await buildFxRateIndex(
+          supabase,
+          ready.map((r) => ({ currencyCode: r.dto.currencyCode, issueDate: r.dto.issueDate }))
+        )
+        let fxUnresolved = 0
+
         for (const batch of chunk(ready, INSERT_CHUNK_SIZE)) {
           const mappedBatch = batch.map((r) => {
-            const { invoice, items } = mapSupplierInvoice(r.dto, userId, companyId, r.supplierId)
+            const { invoice, items, fxUnresolved: fx } = mapSupplierInvoice(
+              r.dto, userId, companyId, r.supplierId, fxRates
+            )
             invoice.arrival_number = nextArrivalNumber++
-            return { invoice, items, dto: r.dto }
+            return { invoice, items, fxUnresolved: fx, dto: r.dto }
           })
 
           const { data: insertedInvoices, error: invErr } = await supabase
@@ -650,6 +734,11 @@ export async function executeMigration(options: MigrationOptions): Promise<Migra
             for (const item of mappedBatch[i].items) {
               allItems.push({ ...item, supplier_invoice_id: invoiceId })
             }
+            const fx = mappedBatch[i].fxUnresolved
+            if (fx) {
+              fxUnresolved++
+              logFxUnresolved('Supplier invoice', mappedBatch[i].dto.invoiceNumber, fx)
+            }
             imported++
           }
 
@@ -663,7 +752,7 @@ export async function executeMigration(options: MigrationOptions): Promise<Migra
           }
         }
 
-        results.supplierInvoices = { total: invoices.length, imported, skipped, skipReasons }
+        results.supplierInvoices = { total: invoices.length, imported, skipped, skipReasons, fxUnresolved }
       } catch (err) {
         console.error('Failed to import supplier invoices:', err)
       }
@@ -674,7 +763,7 @@ export async function executeMigration(options: MigrationOptions): Promise<Migra
     // separately via SIE. Supplier invoices arrive (via ?filter=unpaid) as open
     // payables with no link to those vouchers, so settled invoices would surface
     // as overdue. Auto-link the unambiguous matches. Best-effort: a failure here
-    // must never fail the migration — the imported data is already persisted.
+    // must never fail the migration: the imported data is already persisted.
     if (options.reconcileVouchers !== false) {
       emitProgress(options, { status: 'importing', currentStep: 'Stämmer av betalningar mot verifikationer...', progress: 95 })
       try {

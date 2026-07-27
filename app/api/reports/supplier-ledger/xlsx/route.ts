@@ -1,13 +1,13 @@
-import { createClient } from '@/lib/supabase/server'
+import { withRouteContext } from '@/lib/api/with-route-context'
 import { NextResponse } from 'next/server'
 import { generateSupplierLedger } from '@/lib/reports/supplier-ledger'
-import { requireCompanyId } from '@/lib/company/context'
 import {
   reportToWorkbook,
   textColumn,
   currencyColumn,
   xlsxFilename,
 } from '@/lib/reports/xlsx-export'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 interface AgingRow {
   supplier_name: string
@@ -19,16 +19,7 @@ interface AgingRow {
   total_outstanding: number
 }
 
-export async function GET(request: Request) {
-  const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
-
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const companyId = await requireCompanyId(supabase, user.id)
-
+export const GET = withRouteContext('report.supplier_ledger.xlsx', async (request, { supabase, companyId }) => {
   const { searchParams } = new URL(request.url)
   const asOfDate = searchParams.get('as_of_date') || undefined
 
@@ -89,8 +80,8 @@ export async function GET(request: Request) {
     })
   } catch (err) {
     return NextResponse.json(
-      { error: err instanceof Error ? err.message : 'Kunde inte generera leverantörsreskontra' },
+      { error: err instanceof Error ? getUserErrorMessage(err) : 'Kunde inte generera leverantörsreskontra' },
       { status: 500 }
     )
   }
-}
+})

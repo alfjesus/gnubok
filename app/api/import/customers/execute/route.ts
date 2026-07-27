@@ -9,6 +9,7 @@ import { withRouteContext } from '@/lib/api/with-route-context'
 import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
 import type { Customer } from '@/types'
 import type { CustomerImportExecuteResult } from '@/lib/import/customers/types'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 ensureInitialized()
 
@@ -33,7 +34,7 @@ interface ExistingCustomer {
  * POST /api/import/customers/execute
  *
  * Imports validated customer rows. Duplicates (matched by org_number or email)
- * are either updated (merge — only non-empty file fields overwrite) or skipped
+ * are either updated (merge: only non-empty file fields overwrite) or skipped
  * based on `update_duplicates`.
  */
 export const POST = withRouteContext(
@@ -126,14 +127,14 @@ export const POST = withRouteContext(
             .single()
 
           if (error) {
-            errors.push({ row_index: row.row_index, name: row.name, reason: error.message })
+            errors.push({ row_index: row.row_index, name: row.name, reason: getUserErrorMessage(error) })
             continue
           }
           if (data) updated.push(data as Customer)
           continue
         }
 
-        // No match — create.
+        // No match, create.
         const { data, error } = await supabase
           .from('customers')
           .insert({
@@ -162,7 +163,7 @@ export const POST = withRouteContext(
             skipped++
             continue
           }
-          errors.push({ row_index: row.row_index, name: row.name, reason: error.message })
+          errors.push({ row_index: row.row_index, name: row.name, reason: getUserErrorMessage(error) })
           continue
         }
         if (data) {
@@ -200,7 +201,7 @@ export const POST = withRouteContext(
       opLog.error('customer import execute failed', err as Error)
       return errorResponseFromCode('REG_IMPORT_EXECUTE_FAILED', opLog, {
         requestId,
-        details: { reason: err instanceof Error ? err.message : 'unknown' },
+        details: { reason: err instanceof Error ? getUserErrorMessage(err) : 'unknown' },
       })
     }
   },

@@ -7,32 +7,37 @@ import { withRouteContext } from '@/lib/api/with-route-context'
 import { ensureArticleNumber } from '@/lib/articles/ensure-article-number'
 import { checkRevenueAccount } from '@/lib/articles/validate-revenue-account'
 import { AccountsNotInChartError, accountsNotInChartResponse } from '@/lib/bookkeeping/errors'
-import { errorResponse, errorResponseFromCode } from '@/lib/errors/get-structured-error'
+import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
+import { fetchAllRows } from '@/lib/supabase/fetch-all'
 import type { Article } from '@/types'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 ensureInitialized()
 
-// GET /api/articles — list the active company's articles. `?include_inactive=1`
+// GET /api/articles: list the active company's articles. `?include_inactive=1`
 // returns soft-deactivated ones too (the register page can show an archive view).
 export const GET = withRouteContext(
   'article.list',
   async (request, ctx) => {
-    const { supabase, companyId, log, requestId } = ctx
+    const { supabase, companyId } = ctx
 
     const includeInactive = new URL(request.url).searchParams.get('include_inactive') === '1'
 
-    let query = supabase
-      .from('articles')
-      .select('*')
-      .eq('company_id', companyId)
-    if (!includeInactive) query = query.eq('active', true)
-
-    const { data, error } = await query.order('name', { ascending: true })
-
-    if (error) {
-      log.error('article list failed', error)
-      return errorResponse(error, log, { requestId })
-    }
+    // Article registers can exceed PostgREST's silent 1000-row cap (imported
+    // product catalogs), so paginate. The secondary order on id gives the
+    // stable total order .range() paging requires — name alone is not unique.
+    // Errors thrown here surface via the wrapper's canonical envelope.
+    const data = await fetchAllRows(({ from, to }) => {
+      let query = supabase
+        .from('articles')
+        .select('*')
+        .eq('company_id', companyId)
+      if (!includeInactive) query = query.eq('active', true)
+      return query
+        .order('name', { ascending: true })
+        .order('id', { ascending: true })
+        .range(from, to)
+    })
 
     return NextResponse.json({ data })
   },
@@ -50,8 +55,8 @@ export const POST = withRouteContext(
     if (!result.success) return result.response
     const body = result.data
 
-    // Guard the optional revenue-account override against the chart of accounts.
-    // A class-3 account that merely isn't activated yet gets the standard
+    // Guard the optional posting-account override against the chart of accounts.
+    // A class 1-3 account that merely isn't activated yet gets the standard
     // ACCOUNTS_NOT_IN_CHART envelope so the client can offer activate-and-retry.
     if (body.revenue_account) {
       const status = await checkRevenueAccount(supabase, companyId!, body.revenue_account)
@@ -74,6 +79,7 @@ export const POST = withRouteContext(
         unit: body.unit ?? 'st',
         price_excl_vat: body.price_excl_vat,
         vat_rate: body.vat_rate ?? 25,
+        currency: body.currency ?? 'SEK',
         revenue_account: body.revenue_account ?? null,
         cost_price: body.cost_price ?? null,
         ean: body.ean ?? null,
@@ -94,7 +100,7 @@ export const POST = withRouteContext(
       log.error('article insert failed', error)
       return errorResponseFromCode('ARTICLE_CREATE_FAILED', log, {
         requestId,
-        details: { reason: error.message },
+        details: { reason: getUserErrorMessage(error) },
       })
     }
 

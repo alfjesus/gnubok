@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 
 vi.mock('../lib/tic-client', () => ({
   searchCompanyByOrgNumber: vi.fn(),
-  // The handler no longer calls these — kept mocked so the import doesn't
+  // The handler no longer calls these: kept mocked so the import doesn't
   // throw and so we can assert below that they're NOT invoked.
   getBankAccounts: vi.fn(),
   getIndustryCodes: vi.fn(),
@@ -60,8 +60,8 @@ function makeRequest(orgNumber?: string): Request {
 const profileHandler = ticExtension.apiRoutes![1].handler
 
 // The search doc now carries everything we used to pull from dedicated v2
-// endpoints — sniCodes, bankAccounts, emailAddresses, phoneNumbers,
-// mostRecentSignatory — at the top level. /profile reads those directly.
+// endpoints: sniCodes, bankAccounts, emailAddresses, phoneNumbers,
+// mostRecentSignatory: at the top level. /profile reads those directly.
 const mockDoc: TICCompanyDocument = {
   companyId: 42,
   registrationNumber: '5560360793',
@@ -70,7 +70,8 @@ const mockDoc: TICCompanyDocument = {
     { nameOrIdentifier: 'Test AB', companyNamingType: 'name' },
   ],
   legalEntityType: 'AB',
-  registrationDate: 946684800000,
+  // 2000-01-01 in Unix seconds (TIC's native unit; the route converts to ms)
+  registrationDate: 946684800,
   mostRecentPurpose: 'Software development',
   mostRecentRegisteredAddress: {
     streetAddress: 'Storgatan 1',
@@ -137,13 +138,13 @@ function mockKeptSupplementary() {
     {
       startMonthDay: '01-01',
       endMonthDay: '12-31',
-      startEndDescription: 'Jan–Dec',
+      startEndDescription: 'Jan-Dec',
       lastUpdatedAtUtc: '2024-06-01T00:00:00Z',
     },
     {
       startMonthDay: '07-01',
       endMonthDay: '06-30',
-      startEndDescription: 'Jul–Jun',
+      startEndDescription: 'Jul-Jun',
       lastUpdatedAtUtc: '2020-01-01T00:00:00Z',
     },
   ])
@@ -231,6 +232,8 @@ describe('TIC profile route', () => {
     expect(data.orgNumber).toBe('5560360793')
     expect(data.companyName).toBe('Test AB')
     expect(data.legalEntityType).toBe('AB')
+    // Converted from the doc's Unix seconds to a millisecond epoch.
+    expect(data.registrationDate).toBe(946684800000)
     expect(data.activityStatus).toBe('isActive')
     expect(data.purpose).toBe('Software development')
     expect(data.address).toEqual({
@@ -324,8 +327,8 @@ describe('TIC profile route', () => {
   })
 
   it('degrades gracefully when remaining Phase 2 calls fail', async () => {
-    // Doc still provides bankAccounts/sniCodes/email/phone/purpose/signatory
-    // — only the kept Phase 2 endpoints can now fail.
+    // Doc still provides bankAccounts/sniCodes/email/phone/purpose/signatory:
+    // only the kept Phase 2 endpoints can now fail.
     mockSearch.mockResolvedValue(mockDoc)
     mockDocuments.mockRejectedValue(new Error('timeout'))
     mockFiscalYears.mockRejectedValue(new Error('timeout'))
@@ -366,7 +369,7 @@ describe('TIC profile route', () => {
     expect(data.fiscalYear).toEqual({
       startMonthDay: '01-01',
       endMonthDay: '12-31',
-      description: 'Jan–Dec',
+      description: 'Jan-Dec',
     })
     expect(data.fiscalYearHistory).toHaveLength(2)
     expect(data.fiscalYearHistory[0]).toMatchObject({ startMonthDay: '01-01', endMonthDay: '12-31' })

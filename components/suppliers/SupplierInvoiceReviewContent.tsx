@@ -5,7 +5,7 @@ import { CalendarClock } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Separator } from '@/components/ui/separator'
 import { AccountNumber } from '@/components/ui/account-number'
-import { formatCurrency } from '@/lib/utils'
+import { formatCurrency, formatDate } from '@/lib/utils'
 import {
   resolveReverseChargeRate,
   isReverseChargeBasisAccount,
@@ -76,7 +76,7 @@ function buildJournalPreview(
   reverseCharge: boolean,
   supplierType: string | undefined,
   // FX multiplier applied to every amount. 1 when the invoice is in SEK or
-  // when no rate is set. Matches what the backend writes — items go through
+  // when no rate is set. Matches what the backend writes: items go through
   // resolveSekAmount(item.line_total, null, currency, exchange_rate), so the
   // saved verifikation is always in SEK, never in invoice currency.
   fxRate: number,
@@ -86,7 +86,7 @@ function buildJournalPreview(
 
   // Aggregate expense amounts by booking account (in SEK). Periodiserade
   // lines book their net to the 17xx interim account instead of the cost
-  // account — same resolveBookingAccount the entry generator uses, so the
+  // account: same resolveBookingAccount the entry generator uses, so the
   // preview matches the saved verifikat.
   const expenseByAccount = new Map<string, number>()
   for (const item of items) {
@@ -105,7 +105,7 @@ function buildJournalPreview(
     })
   }
 
-  // Per-line effective VAT — manual override wins over computed amount × rate.
+  // Per-line effective VAT: manual override wins over computed amount × rate.
   // The engine reads stored vat_amount; the preview must reflect the same.
   const itemVat = (item: ReviewLineItem) =>
     item.vat_amount != null
@@ -114,7 +114,7 @@ function buildJournalPreview(
 
   if (reverseCharge) {
     // Reverse charge: the supplier charges no VAT, so the buyer self-assesses at
-    // the Swedish statutory rate (resolveReverseChargeRate — 25% huvudregel
+    // the Swedish statutory rate (resolveReverseChargeRate: 25% huvudregel
     // default, or the per-item reverse_charge_rate). We book BOTH the fiktiv-moms
     // pair (2645/2647 + 2614/2624/2634) AND the basbeloppsrader (44xx/45xx +
     // 4598), exactly as the engine does, so this preview matches the saved
@@ -259,7 +259,7 @@ export function SupplierInvoiceReviewContent({
         </div>
         <div className="flex flex-wrap gap-1.5 sm:gap-2 shrink-0">
           {reverseCharge && (
-            <Badge variant="outline" className="border-orange-300 text-orange-700 dark:text-orange-400">
+            <Badge variant="warning">
               {t('reverse_charge_badge')}
             </Badge>
           )}
@@ -276,21 +276,21 @@ export function SupplierInvoiceReviewContent({
       <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 sm:gap-4 text-sm">
         <div>
           <span className="text-muted-foreground">{t('invoice_date_label')}</span>
-          <p className="font-medium">{invoiceDate}</p>
+          <p className="font-medium">{formatDate(invoiceDate)}</p>
         </div>
         <div>
           <span className="text-muted-foreground">{t('due_date_label')}</span>
-          <p className="font-medium">{dueDate}</p>
+          <p className="font-medium">{formatDate(dueDate)}</p>
         </div>
         {deliveryDate && (
           <div>
             <span className="text-muted-foreground">{t('delivery_date_label')}</span>
-            <p className="font-medium">{deliveryDate}</p>
+            <p className="font-medium">{formatDate(deliveryDate)}</p>
           </div>
         )}
       </div>
 
-      {/* Line items — table on desktop, cards on mobile */}
+      {/* Line items: table on desktop, cards on mobile */}
       <div className="hidden sm:block">
         <table className="w-full text-sm">
           <thead className="[&_th]:font-medium [&_th]:text-[11px] [&_th]:uppercase [&_th]:tracking-wider [&_th]:text-muted-foreground">
@@ -333,9 +333,9 @@ export function SupplierInvoiceReviewContent({
                       </p>
                     )}
                   </td>
-                  <td className="py-2 text-right font-mono">{formatAmount(item.amount)}</td>
+                  <td className="py-2 text-right tabular-nums">{formatAmount(item.amount)}</td>
                   <td className="py-2 text-right">{Math.round(displayRate * 100)}%</td>
-                  <td className="py-2 text-right font-mono">{formatAmount(vatAmount)}</td>
+                  <td className="py-2 text-right tabular-nums">{formatAmount(vatAmount)}</td>
                 </tr>
               )
             })}
@@ -380,21 +380,21 @@ export function SupplierInvoiceReviewContent({
       <div className="space-y-2 text-sm">
         <div className="flex justify-between">
           <span className="text-muted-foreground">{t('net_excl_vat')}</span>
-          <span>{formatCurrency(subtotal, currency)}</span>
+          <span className="tabular-nums">{formatCurrency(subtotal, currency)}</span>
         </div>
         <div className="flex justify-between">
           <span className="text-muted-foreground">{reverseCharge ? t('vat_reverse_charge') : t('vat_label_short')}</span>
-          <span>{formatCurrency(totalVat, currency)}</span>
+          <span className="tabular-nums">{formatCurrency(totalVat, currency)}</span>
         </div>
         <Separator />
         <div className="flex justify-between font-bold text-xl sm:text-2xl">
           <span>{t('total_label')}</span>
-          <span>{formatCurrency(total, currency)}</span>
+          <span className="tabular-nums">{formatCurrency(total, currency)}</span>
         </div>
         {currency !== 'SEK' && exchangeRate && (
           <div className="flex justify-between text-muted-foreground">
             <span>{t('review_sek_amount_at_rate', { rate: exchangeRate })}</span>
-            <span>{formatCurrency(total * parseFloat(exchangeRate))}</span>
+            <span className="tabular-nums">{formatCurrency(total * parseFloat(exchangeRate))}</span>
           </div>
         )}
       </div>
@@ -408,7 +408,7 @@ export function SupplierInvoiceReviewContent({
           )}
         </p>
         <div className="hidden sm:block">
-          <table className="w-full text-sm font-mono">
+          <table className="w-full text-sm">
             <thead className="[&_th]:font-medium [&_th]:text-[11px] [&_th]:uppercase [&_th]:tracking-wider [&_th]:text-muted-foreground">
               <tr className="text-left">
                 <th className="pb-1 w-16">{t('col_account')}</th>
@@ -426,10 +426,10 @@ export function SupplierInvoiceReviewContent({
                   <td className="py-1 text-xs">
                     {ACCOUNT_LABELS[line.account_number] || line.description}
                   </td>
-                  <td className="py-1 text-right">
+                  <td className="py-1 text-right tabular-nums">
                     {line.debit > 0 ? formatAmount(line.debit) : ''}
                   </td>
-                  <td className="py-1 text-right">
+                  <td className="py-1 text-right tabular-nums">
                     {line.credit > 0 ? formatAmount(line.credit) : ''}
                   </td>
                 </tr>
@@ -438,8 +438,8 @@ export function SupplierInvoiceReviewContent({
             <tfoot>
               <tr className="border-t font-semibold">
                 <td className="pt-1" colSpan={2}>{t('sum_label')}</td>
-                <td className="pt-1 text-right">{formatAmount(totalDebit)}</td>
-                <td className="pt-1 text-right">{formatAmount(totalCredit)}</td>
+                <td className="pt-1 text-right tabular-nums">{formatAmount(totalDebit)}</td>
+                <td className="pt-1 text-right tabular-nums">{formatAmount(totalCredit)}</td>
               </tr>
             </tfoot>
           </table>
@@ -455,12 +455,12 @@ export function SupplierInvoiceReviewContent({
                   </span>
                 </div>
               </div>
-              <span className="font-mono text-xs shrink-0 ml-2">
+              <span className="tabular-nums text-xs shrink-0 ml-2">
                 {line.debit > 0 ? t('debit_short', { amount: formatAmount(line.debit) }) : t('credit_short', { amount: formatAmount(line.credit) })}
               </span>
             </div>
           ))}
-          <div className="flex justify-between pt-1 border-t font-semibold text-xs font-mono">
+          <div className="flex justify-between pt-1 border-t font-semibold text-xs tabular-nums">
             <span>{t('sum_label')}</span>
             <span>{t('debit_credit_short', { debit: formatAmount(totalDebit), credit: formatAmount(totalCredit) })}</span>
           </div>

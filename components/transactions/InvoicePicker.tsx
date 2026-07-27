@@ -9,6 +9,11 @@ import { Search, FileText, Loader2 } from 'lucide-react'
 import { useCompany } from '@/contexts/CompanyContext'
 import type { Invoice, Customer } from '@/types'
 import type { TransactionWithInvoice } from './transaction-types'
+import {
+  DOMESTIC_CURRENCY,
+  normalizeCurrency,
+  rankInvoicesByAmountProximity,
+} from './invoice-candidate-ranking'
 
 type OpenInvoice = Invoice & { customer?: Customer }
 
@@ -36,11 +41,11 @@ export default function InvoicePicker({ transaction, onSelect, isProcessing }: I
     let cancelled = false
     async function load() {
       setIsLoading(true)
-      // Filter out fully-settled invoices defensively — match-invoice should
+      // Filter out fully-settled invoices defensively: match-invoice should
       // flip status to 'paid' on full settlement, but a stale 'sent'/'overdue'
       // row with remaining_amount=0 would otherwise be selectable here and
       // could be matched a second time, double-booking the income.
-      // Also exclude proformas (PF- series) — proforma is not a faktura per
+      // Also exclude proformas (PF- series): proforma is not a faktura per
       // ML 17 kap 24§, has no VAT obligation, and must never be matched
       // against a bank receipt or trigger a verifikation.
       const { data } = await supabase
@@ -48,6 +53,7 @@ export default function InvoicePicker({ transaction, onSelect, isProcessing }: I
         .select('*, customer:customers(*)')
         .eq('company_id', companyId)
         .eq('document_type', 'invoice')
+        .is('credited_invoice_id', null)
         .in('status', ['sent', 'overdue', 'partially_paid'])
         .gt('remaining_amount', 0)
         .order('invoice_date', { ascending: false })
@@ -57,7 +63,7 @@ export default function InvoicePicker({ transaction, onSelect, isProcessing }: I
 
       // Status-leak guard: if an invoice still says 'sent'/'overdue' but
       // already has a payment voucher attached (manual or system), hide it.
-      // Partially-paid invoices intentionally pass through — they may take
+      // Partially-paid invoices intentionally pass through: they may take
       // more payments. Mirrors the server-side filter in findMatchingInvoices.
       const fullIds = all
         .filter((inv) => inv.status === 'sent' || inv.status === 'overdue')
@@ -87,7 +93,6 @@ export default function InvoicePicker({ transaction, onSelect, isProcessing }: I
   }, [company, supabase])
 
   const sorted = useMemo(() => {
-    const txAmount = Math.abs(transaction.amount)
     const filtered = !search
       ? invoices
       : invoices.filter((inv) => {
@@ -98,15 +103,16 @@ export default function InvoicePicker({ transaction, onSelect, isProcessing }: I
           )
         })
 
-    return [...filtered].sort((a, b) => {
-      const remainA = a.remaining_amount ?? a.total
-      const remainB = b.remaining_amount ?? b.total
-      const diffA = Math.abs(remainA - txAmount)
-      const diffB = Math.abs(remainB - txAmount)
-      if (diffA !== diffB) return diffA - diffB
-      return b.invoice_date.localeCompare(a.invoice_date)
+    // Amount proximity is only meaningful between comparable amounts: ranking
+    // a 1 000 EUR invoice as a perfect hit for a 1 000 SEK deposit put the
+    // wrong row first. Foreign invoices stay in the list either way; see
+    // ./invoice-candidate-ranking.
+    return rankInvoicesByAmountProximity(filtered, {
+      amount: transaction.amount,
+      currency: transaction.currency,
+      amountSek: transaction.amount_sek,
     })
-  }, [invoices, search, transaction.amount])
+  }, [invoices, search, transaction.amount, transaction.currency, transaction.amount_sek])
 
   if (isLoading) {
     return (
@@ -139,16 +145,15 @@ export default function InvoicePicker({ transaction, onSelect, isProcessing }: I
       </div>
 
       <div className="space-y-1.5 max-h-[55vh] overflow-y-auto pr-1">
-        {sorted.map((invoice) => {
-          const txAmount = Math.abs(transaction.amount)
+        {sorted.map(({ invoice, proximity }) => {
           const remaining = invoice.remaining_amount ?? invoice.total
-          const sameCurrency = transaction.currency === invoice.currency
-          const exact = sameCurrency && Math.abs(remaining - txAmount) < 0.01
-          const close =
-            sameCurrency &&
-            !exact &&
-            txAmount > 0 &&
-            Math.abs(remaining - txAmount) / txAmount < 0.01
+          const { exact, close, candidateSek } = proximity
+          const invoiceCurrency = normalizeCurrency(invoice.currency)
+          // The currency earns a marker only when it deviates from the bank
+          // row's: the same marker on every row would say nothing (design.md,
+          // "chips mark exceptions"). It is what explains why a row is or is
+          // not ranked as close.
+          const foreignCurrency = proximity.basis !== 'same_currency'
 
           return (
             <button
@@ -181,6 +186,11 @@ export default function InvoicePicker({ transaction, onSelect, isProcessing }: I
                         {t('status_partially_paid')}
                       </span>
                     )}
+                    {foreignCurrency && (
+                      <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                        {invoiceCurrency}
+                      </span>
+                    )}
                   </div>
                   <p className="text-xs text-muted-foreground mt-0.5 truncate">
                     {invoice.customer?.name || t('unknown_customer')} · {t('due_short', { date: formatDate(invoice.due_date) })}
@@ -193,9 +203,14 @@ export default function InvoicePicker({ transaction, onSelect, isProcessing }: I
                       exact && 'text-success'
                     )}
                   >
-                    {formatCurrency(remaining, invoice.currency)}
+                    {formatCurrency(remaining, invoiceCurrency)}
                   </p>
                   {exact && <p className="text-[10px] text-success">{t('exact_match')}</p>}
+                  {candidateSek != null && (
+                    <p className="text-[10px] text-muted-foreground tabular-nums">
+                      ≈ {formatCurrency(candidateSek, DOMESTIC_CURRENCY)}
+                    </p>
+                  )}
                 </div>
               </div>
             </button>

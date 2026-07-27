@@ -10,6 +10,7 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { useToast } from '@/components/ui/use-toast'
+import { maskCustomerPersonalNumber } from '@/lib/customers/mask-personal-number'
 import CustomerForm from '@/components/customers/CustomerForm'
 import { DestructiveConfirmDialog, useDestructiveConfirm } from '@/components/ui/destructive-confirm-dialog'
 import {
@@ -23,7 +24,7 @@ import {
   Edit2,
   Trash2,
   Loader2,
-  Receipt,
+  ReceiptText,
   Lock,
 } from 'lucide-react'
 import { useCanWrite } from '@/lib/hooks/use-can-write'
@@ -203,8 +204,8 @@ export default function CustomerDetailPage({
               <Icon className="h-6 w-6 text-primary" />
             </div>
             <div>
-              <h1 className="font-display text-2xl md:text-3xl font-medium tracking-tight">{customer.name}</h1>
-              <Badge variant="secondary">{t(CUSTOMER_TYPE_KEY[customer.customer_type])}</Badge>
+              <h1 className="font-display text-2xl leading-8 tracking-tight">{customer.name}</h1>
+              <p className="text-sm text-muted-foreground">{t(CUSTOMER_TYPE_KEY[customer.customer_type])}</p>
             </div>
           </div>
         </div>
@@ -275,16 +276,30 @@ export default function CustomerDetailPage({
           </CardContent>
         </Card>
 
-        {/* Business details */}
+        {/* Customer details */}
         <Card>
           <CardHeader>
             <CardTitle className="text-base">{t('section_business')}</CardTitle>
           </CardHeader>
           <CardContent className="space-y-3">
-            {customer.org_number && (
+            {customer.customer_number && (
+              <div className="text-sm">
+                <span className="text-muted-foreground">{t('label_customer_number')} </span>
+                {customer.customer_number}
+              </div>
+            )}
+            {customer.customer_type !== 'individual' && customer.org_number && (
               <div className="text-sm">
                 <span className="text-muted-foreground">{t('label_org_number')} </span>
                 {customer.org_number}
+              </div>
+            )}
+            {customer.customer_type === 'individual' && (customer.personal_number || customer.org_number) && (
+              <div className="text-sm">
+                <span className="text-muted-foreground">{t('label_personal_number')} </span>
+                <span className="tabular-nums">
+                  {maskCustomerPersonalNumber(customer.personal_number || customer.org_number)}
+                </span>
               </div>
             )}
             {customer.vat_number && (
@@ -300,7 +315,7 @@ export default function CustomerDetailPage({
               <span className="text-muted-foreground">{t('label_payment_terms')} </span>
               {t('payment_terms_value', { days: customer.default_payment_terms || 30 })}
             </div>
-            {!customer.org_number && !customer.vat_number && (
+            {!customer.customer_number && !customer.org_number && !customer.personal_number && !customer.vat_number && (
               <p className="text-sm text-muted-foreground">{t('no_business_info')}</p>
             )}
           </CardContent>
@@ -313,7 +328,7 @@ export default function CustomerDetailPage({
           </CardHeader>
           <CardContent className="space-y-3">
             <div className="flex items-center gap-2 text-sm">
-              <Receipt className="h-4 w-4 text-muted-foreground" />
+              <ReceiptText className="h-4 w-4 text-muted-foreground" />
               <span>{t('invoice_count', { count: customer.invoices?.length || 0 })}</span>
             </div>
           </CardContent>
@@ -336,10 +351,10 @@ export default function CustomerDetailPage({
       <Card>
         <CardHeader>
           <CardTitle className="text-base flex items-center gap-2">
-            <Receipt className="h-4 w-4" />
+            <ReceiptText className="h-4 w-4" />
             {t('section_invoices')}
             {customer.invoices?.length > 0 && (
-              <Badge variant="secondary">{customer.invoices.length}</Badge>
+              <span className="text-sm text-muted-foreground tabular-nums">({customer.invoices.length})</span>
             )}
           </CardTitle>
         </CardHeader>
@@ -393,6 +408,7 @@ export default function CustomerDetailPage({
             initialData={{
               name: customer.name,
               customer_type: customer.customer_type,
+              customer_number: customer.customer_number || undefined,
               email: customer.email || undefined,
               phone: customer.phone || undefined,
               address_line1: customer.address_line1 || undefined,
@@ -402,6 +418,10 @@ export default function CustomerDetailPage({
               country: customer.country || undefined,
               org_number: customer.org_number || undefined,
               vat_number: customer.vat_number || undefined,
+              personal_number: customer.personal_number || undefined,
+              // Must round-trip: the form defaults omitted values ('sv') and
+              // submits every field, so leaving language out resets it on save.
+              language: customer.language,
               default_payment_terms: customer.default_payment_terms || undefined,
               notes: customer.notes || undefined,
             }}

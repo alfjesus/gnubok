@@ -1,14 +1,19 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import { useLocale } from 'next-intl'
 import { ChevronDown, GraduationCap, Loader2 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { AttnLine } from '@/components/ui/attn-line'
 import { Badge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/ui/empty-state'
+import { HelpPopover } from '@/components/ui/help-popover'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useToast } from '@/components/ui/use-toast'
+import { SettingsGroup, SettingsRowNote } from '@/components/settings/SettingsRows'
+import { cn } from '@/lib/utils'
+import { getErrorMessage, type ErrorLocale } from '@/lib/errors/get-error-message'
 
 type Tier = 'horizontal' | 'vertical' | 'modifier'
 
@@ -50,28 +55,73 @@ const PROSE =
   'prose-table:my-2 prose-table:text-xs [&_table]:w-full ' +
   '[&_th]:border-b [&_th]:border-border [&_th]:py-1.5 [&_th]:px-2 [&_th]:text-left [&_th]:font-medium ' +
   '[&_th]:text-muted-foreground [&_th]:uppercase [&_th]:tracking-wider [&_th]:text-[10px] ' +
-  '[&_td]:border-b [&_td]:border-border/60 [&_td]:py-1.5 [&_td]:px-2 [&_td]:align-top'
+  '[&_td]:border-b [&_td]:border-border [&_td]:py-1.5 [&_td]:px-2 [&_td]:align-top'
 
 export function AgentSkillsPanel() {
   const { toast } = useToast()
+  const errorLocale = useLocale() as ErrorLocale
 
+  // null = the atom list is not known: still loading, or the read failed
+  // (loadError). A failed read must never render the "Inga kunskapsområden
+  // ännu" EmptyState: that is a claim about the assistant's composition, and
+  // it is only true after a confirmed empty read.
   const [atoms, setAtoms] = useState<AtomMeta[] | null>(null)
+  // detail === null: transient, so the line carries a retry. A detail sentence
+  // means the user has to act (an expired session) and a retry cannot help.
+  const [loadError, setLoadError] = useState<{ detail: string | null } | null>(null)
+  const [reloadKey, setReloadKey] = useState(0)
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const [bodies, setBodies] = useState<Record<string, string>>({})
   const [loadingBody, setLoadingBody] = useState<string | null>(null)
 
-  const load = useCallback(async () => {
-    const res = await fetch('/api/agent/skills')
-    const json = await res.json()
-    if (!res.ok) {
-      toast({ title: 'Kunde inte hämta kunskap', description: json.error, variant: 'destructive' })
-      setAtoms([])
-      return
-    }
-    setAtoms(json.data as AtomMeta[])
-  }, [toast])
+  // The cancelled closure is the same idiom every sibling panel uses
+  // (TeamPanel, AccountDangerZone): a response that lands after unmount, or
+  // after a newer load superseded this one, must not setState.
+  useEffect(() => {
+    let cancelled = false
 
-  useEffect(() => { void load() }, [load])
+    async function load() {
+      setLoadError(null)
+      try {
+        const res = await fetch('/api/agent/skills')
+        if (!res.ok) {
+          // Not-JSON bodies (an HTML error page, an empty 502) leave null, and
+          // getErrorMessage falls back to the status map.
+          const json = await res.json().catch(() => null)
+          if (cancelled) return
+          const sessionGone = res.status === 401 || res.status === 403
+          setAtoms(null)
+          setLoadError({
+            detail: sessionGone
+              ? getErrorMessage(json, { statusCode: res.status, locale: errorLocale })
+              : null,
+          })
+          return
+        }
+        // A 200 whose body will not parse throws into the catch below; a 200
+        // without the list is a failed read too. Neither may become a
+        // fabricated "Inga kunskapsområden ännu".
+        const json = await res.json()
+        if (cancelled) return
+        if (!Array.isArray(json?.data)) {
+          setAtoms(null)
+          setLoadError({ detail: null })
+          return
+        }
+        setAtoms(json.data as AtomMeta[])
+      } catch {
+        if (!cancelled) {
+          setAtoms(null)
+          setLoadError({ detail: null })
+        }
+      }
+    }
+
+    void load()
+    return () => {
+      cancelled = true
+    }
+  }, [reloadKey, errorLocale])
 
   const grouped = useMemo(() => {
     const map: Record<Tier, AtomMeta[]> = { horizontal: [], vertical: [], modifier: [] }
@@ -95,124 +145,155 @@ export function AgentSkillsPanel() {
     setLoadingBody(atom.id)
     try {
       const res = await fetch(`/api/agent/skills?slug=${encodeURIComponent(atom.id)}`)
-      const json = await res.json()
       if (!res.ok) {
-        toast({ title: 'Kunde inte läsa kunskapen', description: json.error, variant: 'destructive' })
+        // Not-JSON bodies (an HTML error page, an empty 502) leave null, and
+        // getErrorMessage falls back to the status map.
+        const json = await res.json().catch(() => null)
+        toast({
+          title: 'Kunde inte läsa kunskapen',
+          description: getErrorMessage(json, { statusCode: res.status, locale: errorLocale }),
+          variant: 'destructive',
+        })
         return
       }
+      const json = await res.json()
       setBodies((prev) => ({ ...prev, [atom.id]: (json.data?.body as string) ?? '' }))
+    } catch (err) {
+      // A rejected fetch or a 200 whose body will not parse never reaches the
+      // !res.ok arm above: without this toast the expanded row just sits
+      // empty with zero feedback. One toast per outcome, never two:
+      // TOAST_LIMIT is 1 (components/ui/use-toast.tsx) and a second would
+      // evict the first.
+      toast({
+        title: 'Kunde inte läsa kunskapen',
+        description: getErrorMessage(err, { locale: errorLocale }),
+        variant: 'destructive',
+      })
     } finally {
       setLoadingBody(null)
     }
   }
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="text-base">Vad min assistent kan</CardTitle>
-        <CardDescription>
-          Utöver vad den minns om ditt företag bygger assistenten på en uppsättning kunskapsområden
-          om svensk bokföring och skatt. Kärnkompetensen gäller alla; bransch- och bolagsanpassningen
-          väljs utifrån ditt företag. Klicka för att läsa hela kunskapen.
-        </CardDescription>
-      </CardHeader>
-
-      <CardContent className="space-y-8">
-        {atoms && (
-          <div className="text-xs text-muted-foreground tabular-nums">
+    <div>
+      {/* Dynamic status stays visible; the static "what this is" copy sits
+          behind the "?" next to it. */}
+      {atoms && (
+        <div className="flex items-center gap-2 px-1">
+          <SettingsRowNote className="tabular-nums">
             {counts.total} kunskapsområden · {counts.active} aktiva för ditt företag
-          </div>
+          </SettingsRowNote>
+          <HelpPopover className="shrink-0">
+            Utöver vad den minns om ditt företag bygger assistenten på en uppsättning
+            kunskapsområden om svensk bokföring och skatt. Kärnkompetensen gäller alla;
+            bransch- och bolagsanpassningen väljs utifrån ditt företag. Klicka på ett
+            område för att läsa hela kunskapen.
+          </HelpPopover>
+        </div>
+      )}
+
+      {/* Live region always mounted so the failure is announced when it
+          appears, not merely inserted. */}
+      <div role="status" aria-live="polite" className="min-w-0 px-1">
+        {loadError && (
+          <AttnLine
+            action={
+              loadError.detail
+                ? undefined
+                : { label: 'Försök igen', onClick: () => setReloadKey((k) => k + 1) }
+            }
+          >
+            {loadError.detail
+              ? `Kunskapsområdena kunde inte läsas in just nu. ${loadError.detail}`
+              : 'Kunskapsområdena kunde inte läsas in just nu.'}
+          </AttnLine>
         )}
+      </div>
 
-        {atoms === null && (
-          <div className="space-y-3">
-            {[0, 1, 2, 3].map((i) => (
-              <Skeleton key={i} className="h-16 w-full rounded-lg" />
-            ))}
-          </div>
-        )}
+      {atoms === null && !loadError && (
+        <div className="space-y-3">
+          {[0, 1, 2, 3].map((i) => (
+            <Skeleton key={i} className="h-12 w-full" />
+          ))}
+        </div>
+      )}
 
-        {atoms && atoms.length === 0 && (
-          <EmptyState
-            icon={GraduationCap}
-            title="Inga kunskapsområden ännu"
-            description="När din assistent har komponerats dyker dess kunskapsområden upp här."
-          />
-        )}
+      {atoms && atoms.length === 0 && (
+        <EmptyState
+          icon={GraduationCap}
+          title="Inga kunskapsområden ännu"
+          description="När din assistent har komponerats dyker dess kunskapsområden upp här."
+        />
+      )}
 
-        {atoms && atoms.length > 0 &&
-          TIER_ORDER.filter((tier) => grouped[tier].length > 0).map((tier) => (
-            <section key={tier} className="space-y-3">
-              <div className="space-y-1">
-                <h2 className="text-sm font-medium uppercase tracking-wider text-muted-foreground">
-                  {TIER_SECTION[tier].title}
-                </h2>
-                <p className="text-xs text-muted-foreground">{TIER_SECTION[tier].blurb}</p>
-              </div>
-
-              <ul className="space-y-2">
-                {grouped[tier].map((atom) => {
-                  const isOpen = expandedId === atom.id
-                  const isLoading = loadingBody === atom.id
-                  const body = bodies[atom.id]
-                  const dormant = !atom.active
-                  return (
-                    <li
-                      key={atom.id}
-                      className={`rounded-lg border border-border transition-colors ${
-                        dormant ? 'bg-muted/30' : 'bg-card'
-                      }`}
-                    >
-                      <button
-                        onClick={() => toggle(atom)}
-                        aria-expanded={isOpen}
-                        className="flex w-full items-start gap-3 p-4 text-left"
+      {atoms && atoms.length > 0 &&
+        TIER_ORDER.filter((tier) => grouped[tier].length > 0).map((tier) => (
+          <SettingsGroup key={tier} label={TIER_SECTION[tier].title} help={TIER_SECTION[tier].blurb}>
+            {grouped[tier].map((atom) => {
+              const isOpen = expandedId === atom.id
+              const isLoading = loadingBody === atom.id
+              const body = bodies[atom.id]
+              const dormant = !atom.active
+              return (
+                <div key={atom.id} className="border-b border-border">
+                  <button
+                    onClick={() => toggle(atom)}
+                    aria-expanded={isOpen}
+                    className="flex w-full items-start gap-3 px-1 py-3 text-left"
+                  >
+                    <ChevronDown
+                      className={cn(
+                        'mt-0.5 h-4 w-4 shrink-0 text-muted-foreground transition-transform',
+                        !isOpen && '-rotate-90',
+                      )}
+                    />
+                    <span className="min-w-0 flex-1">
+                      <span
+                        className={cn(
+                          'block text-sm font-medium',
+                          dormant ? 'text-muted-foreground' : 'text-foreground',
+                        )}
                       >
-                        <ChevronDown
-                          className={`mt-0.5 h-4 w-4 shrink-0 text-muted-foreground transition-transform ${
-                            isOpen ? '' : '-rotate-90'
-                          }`}
-                        />
-                        <div className="flex-1 min-w-0 space-y-1">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <span className="text-sm font-medium text-foreground">{atom.title}</span>
-                            {tier !== 'horizontal' && (
-                              <Badge variant={atom.active ? 'success' : 'secondary'}>
-                                {atom.active ? 'Aktiv' : 'Vilande'}
-                              </Badge>
-                            )}
-                          </div>
-                          <p className="text-xs text-muted-foreground">{atom.description}</p>
-                        </div>
-                      </button>
+                        {atom.title}
+                      </span>
+                      <span className="block text-xs text-muted-foreground">{atom.description}</span>
+                    </span>
+                    {/* Chips mark exceptions: active is the normal state and
+                        renders as muted text, only dormant gets a Badge. */}
+                    {tier !== 'horizontal' && (
+                      atom.active ? (
+                        <span className="mt-0.5 shrink-0 text-xs text-muted-foreground">Aktiv</span>
+                      ) : (
+                        <Badge variant="outline" className="mt-0.5 shrink-0">Vilande</Badge>
+                      )
+                    )}
+                  </button>
 
-                      {isOpen && (
-                        <div className="border-t border-border px-4 py-4 pl-11">
-                          {isLoading && (
-                            <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                              Läser in…
-                            </div>
-                          )}
-                          {!isLoading && body !== undefined && body.length > 0 && (
-                            <div className={PROSE}>
-                              <ReactMarkdown remarkPlugins={[remarkGfm]}>{body}</ReactMarkdown>
-                            </div>
-                          )}
-                          {!isLoading && body !== undefined && body.length === 0 && (
-                            <p className="text-xs text-muted-foreground">
-                              Innehållet kunde inte läsas in.
-                            </p>
-                          )}
+                  {isOpen && (
+                    <div className="px-1 pb-4 pl-8">
+                      {isLoading && (
+                        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          Läser in…
                         </div>
                       )}
-                    </li>
-                  )
-                })}
-              </ul>
-            </section>
-          ))}
-      </CardContent>
-    </Card>
+                      {!isLoading && body !== undefined && body.length > 0 && (
+                        <div className={PROSE}>
+                          <ReactMarkdown remarkPlugins={[remarkGfm]}>{body}</ReactMarkdown>
+                        </div>
+                      )}
+                      {!isLoading && body !== undefined && body.length === 0 && (
+                        <p className="text-xs text-muted-foreground">
+                          Innehållet kunde inte läsas in.
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </SettingsGroup>
+        ))}
+    </div>
   )
 }

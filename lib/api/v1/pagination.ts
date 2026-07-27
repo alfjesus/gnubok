@@ -2,8 +2,8 @@
  * Cursor-based pagination for v1 list endpoints.
  *
  * Cursors are opaque base64-JSON tokens encoding the keyset position. The
- * default key is `(created_at, id)`, which is stable across concurrent writes
- * — a row inserted after a cursor was minted appears in a later page, never
+ * default key is `(created_at, id)`, which is stable across concurrent writes:
+ * a row inserted after a cursor was minted appears in a later page, never
  * mid-page. Endpoints that need a different sort key supply their own
  * encoder/decoder pair.
  *
@@ -29,7 +29,7 @@ export interface PaginationParams {
  * { limit, cursor } pair with limit clamped to [1, MAX_LIMIT].
  *
  * Invalid `limit` (non-numeric, negative) falls back to DEFAULT_LIMIT rather
- * than throwing — callers can always re-validate via Zod if strictness is
+ * than throwing: callers can always re-validate via Zod if strictness is
  * needed.
  */
 export function parsePaginationParams(url: URL): PaginationParams {
@@ -77,7 +77,7 @@ export function encodeDefaultCursor(row: { created_at: string; id: string } | nu
   return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')
 }
 
-// Strict format guards — defence-in-depth against tampered cursors that
+// Strict format guards: defence-in-depth against tampered cursors that
 // could otherwise inject untyped strings into a query's `.gt(field, value)`.
 // PostgREST would likely reject these, but validating here keeps the failure
 // mode predictable (stale cursor → "start over") rather than 400-ing.
@@ -86,7 +86,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 /**
  * Decode a cursor produced by encodeDefaultCursor. Returns null when the
- * input is missing or malformed — callers should treat null as "start from
+ * input is missing or malformed: callers should treat null as "start from
  * the beginning" rather than 400-ing on a stale cursor.
  *
  * `ts` must parse as an ISO 8601 timestamp and `id` must be a UUID; anything
@@ -111,14 +111,19 @@ export function decodeDefaultCursor(cursor: string | null | undefined): DefaultC
  * cursor for the *next* page (or null when this was the final page).
  *
  * Convention: the caller fetches `limit + 1` rows, passes the full slice in,
- * and we return either the cursor of row[limit] or null when the page wasn't
- * full. The caller should then trim the slice to `limit` before returning it
- * to the user.
+ * and we return either the cursor of the LAST ROW OF THE TRIMMED PAGE
+ * (rows[limit - 1]) or null when the page wasn't full. The caller should then
+ * trim the slice to `limit` before returning it to the user.
+ *
+ * Contract: the cursor marks the last row already returned; every v1 route's
+ * keyset predicate is strictly greater/less than the cursor, so encoding
+ * rows[limit] (the first row of the NEXT page) would skip that row at every
+ * page boundary.
  */
 export function nextCursorFromPage<T extends { created_at: string; id: string }>(
   rows: T[],
   limit: number,
 ): string | null {
   if (rows.length <= limit) return null
-  return encodeDefaultCursor(rows[limit])
+  return encodeDefaultCursor(rows[limit - 1])
 }

@@ -1,14 +1,15 @@
-import { createClient } from '@/lib/supabase/server'
+import { withRouteContext } from '@/lib/api/with-route-context'
 import { NextResponse } from 'next/server'
 import { generateResultatrapport } from '@/lib/reports/resultatrapport'
-import { requireCompanyId } from '@/lib/company/context'
 import { parseReportDateRange } from '@/lib/reports/date-range'
+import { parseDimensionFilterParams, dimensionFilterDisclosure, dimensionFilterFileSuffix } from '@/lib/reports/dimension-filter'
 import {
   reportToWorkbook,
   textColumn,
   currencyColumn,
   xlsxFilename,
 } from '@/lib/reports/xlsx-export'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 interface FlatRow {
   group: string
@@ -18,16 +19,7 @@ interface FlatRow {
   prior_period: number
 }
 
-export async function GET(request: Request) {
-  const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
-
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const companyId = await requireCompanyId(supabase, user.id)
-
+export const GET = withRouteContext('report.resultatrapport.xlsx', async (request, { supabase, companyId }) => {
   const { searchParams } = new URL(request.url)
   const periodId = searchParams.get('period_id')
 
@@ -58,8 +50,16 @@ export async function GET(request: Request) {
     range = parsed.range
   }
 
+  const dimFilter = parseDimensionFilterParams(searchParams)
+  if (!dimFilter.ok) {
+    return NextResponse.json({ error: dimFilter.error }, { status: 400 })
+  }
+
   try {
-    const report = await generateResultatrapport(supabase, companyId, periodId, range)
+    const report = await generateResultatrapport(supabase, companyId, periodId, {
+      ...range,
+      dimensions: dimFilter.dimensions,
+    })
 
     const rows: FlatRow[] = []
     for (const g of report.groups) {
@@ -88,6 +88,19 @@ export async function GET(request: Request) {
       prior_period: report.net_result_prior,
     })
 
+    // Partial-view disclosure survives the file boundary: a filtered export
+    // must never be mistakable for the authoritative report (BFNAR 2013:2).
+    const disclosure = dimensionFilterDisclosure(dimFilter.dimensions)
+    if (disclosure) {
+      rows.unshift({
+        group: disclosure,
+        account_number: '',
+        account_name: '',
+        current_period: null as unknown as number,
+        prior_period: null as unknown as number,
+      })
+    }
+
     const buffer = reportToWorkbook<FlatRow>([
       {
         name: 'Resultatrapport',
@@ -110,7 +123,7 @@ export async function GET(request: Request) {
     ])
 
     const filename = xlsxFilename(
-      'resultatrapport',
+      `resultatrapport${dimensionFilterFileSuffix(dimFilter.dimensions)}`,
       companyRow?.company_name ?? '',
       report.period.end,
     )
@@ -122,8 +135,8 @@ export async function GET(request: Request) {
     })
   } catch (err) {
     return NextResponse.json(
-      { error: err instanceof Error ? err.message : 'Kunde inte generera resultatrapport' },
+      { error: err instanceof Error ? getUserErrorMessage(err) : 'Kunde inte generera resultatrapport' },
       { status: 500 }
     )
   }
-}
+})

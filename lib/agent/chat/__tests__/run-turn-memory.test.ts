@@ -3,7 +3,7 @@ import type { AgentIntent } from '@/lib/agent/intents/types'
 import type { AgentTool } from '@/lib/agent/tools/types'
 import type { StreamEvent } from '../run-turn'
 
-// Anthropic client mock — returns a single round trip: one tool_use turn,
+// Anthropic client mock: returns a single round trip: one tool_use turn,
 // then a final text-only turn (so the loop terminates). run-turn now uses
 // `messages.stream()` for token-level streaming, so we expose a stream
 // adapter that delegates `finalMessage()` to the same queued mock.
@@ -21,10 +21,13 @@ vi.mock('@/lib/agent/composer/client', () => ({
       },
     },
   }),
-  SONNET_MODEL: 'claude-sonnet-4-6',
+  SONNET_MODEL: 'claude-sonnet-5',
+  MAX_TOKENS_NO_THINKING: 5400,
+  MAX_TOKENS_STANDARD: 16000,
+  MAX_TOKENS_DEEP: 24000,
 }))
 
-// system-prompt builder — return a minimal valid shape.
+// system-prompt builder: return a minimal valid shape.
 vi.mock('../system-prompt', () => ({
   buildSystemPrompt: vi.fn().mockResolvedValue({
     blocks: [],
@@ -33,7 +36,7 @@ vi.mock('../system-prompt', () => ({
   }),
 }))
 
-// Tool registry — return a controllable tool list. Tests overwrite per-case.
+// Tool registry: return a controllable tool list. Tests overwrite per-case.
 const getMock = vi.fn()
 const getManyMock = vi.fn()
 vi.mock('@/lib/agent/tools/registry', () => ({
@@ -66,7 +69,7 @@ function makeIntent(): AgentIntent {
     sheetTitle: 'x',
     atoms: { mode: 'progressive', horizontal: [], includeCompanyVertical: false, includeCompanyModifiers: false },
     tools: ['gnubok_remember_fact'],
-    model: 'claude-sonnet-4-6',
+    model: 'claude-sonnet-5',
     capture: async () => ({}),
     promptTemplate: () => '',
   }
@@ -76,7 +79,7 @@ beforeEach(() => {
   vi.clearAllMocks()
 })
 
-describe('runChatTurn — memory_captured emission', () => {
+describe('runChatTurn: memory_captured emission', () => {
   it('emits memory_captured after a successful remember_fact tool call', async () => {
     // First response: model issues a remember_fact tool_use.
     // Second response: model finishes with text (no more tools → loop ends).
@@ -193,7 +196,7 @@ describe('runChatTurn — memory_captured emission', () => {
   })
 
   it('bumps last_accessed_at for the memories included in the turn', async () => {
-    // Single-shot text response — no tool use, simplest path.
+    // Single-shot text response: no tool use, simplest path.
     messagesCreate.mockResolvedValueOnce({
       content: [{ type: 'text', text: 'OK.' }],
       stop_reason: 'end_turn',
@@ -216,7 +219,10 @@ describe('runChatTurn — memory_captured emission', () => {
     const messagesQueryChain = {
       select: () => messagesQueryChain,
       eq: () => messagesQueryChain,
-      order: () => Promise.resolve({ data: [], error: null }),
+      order: () => messagesQueryChain,
+      // History is capped (MAX_HISTORY_MESSAGES) so a long thread cannot grow
+      // past the context window; the load ends on .limit().
+      limit: () => Promise.resolve({ data: [], error: null }),
     }
     const profileChain = {
       select: () => profileChain,

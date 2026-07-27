@@ -13,7 +13,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/u
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
 import { useToast } from '@/components/ui/use-toast'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
-import { ArrowLeft, CheckCircle, CreditCard, FileText, Trash2, Lock, Undo2, Info, Pencil, Plus, CalendarClock } from 'lucide-react'
+import { ArrowLeft, CheckCircle, CreditCard, FileText, Trash2, Lock, Undo2, Info, Pencil, Plus, CalendarClock, Paperclip } from 'lucide-react'
 import AgentSparkleButton from '@/components/agent/AgentSparkleButton'
 import LinkVoucherPicker from '@/components/invoices/LinkVoucherPicker'
 import { useCanWrite } from '@/lib/hooks/use-can-write'
@@ -22,7 +22,11 @@ import Link from 'next/link'
 import { AccountNumber } from '@/components/ui/account-number'
 import { DestructiveConfirmDialog, useDestructiveConfirm } from '@/components/ui/destructive-confirm-dialog'
 import AccountCombobox from '@/components/bookkeeping/AccountCombobox'
-import { formatCurrency } from '@/lib/utils'
+import { DocumentViewButton } from '@/components/bookkeeping/DocumentViewButton'
+import { useCompanySettings } from '@/components/settings/useSettings'
+import { formatAmount, formatCurrency } from '@/lib/utils'
+import { getDisplayTotal } from '@/lib/invoices/rounding'
+import { canApproveSupplierInvoice } from '@/lib/supplier-invoices/lifecycle'
 import type { SupplierInvoice, SupplierInvoiceItem, SupplierInvoicePayment, BASAccount } from '@/types'
 
 interface EditableLine {
@@ -55,11 +59,7 @@ interface MarkPaidPreview {
   accounting_method: 'accrual' | 'cash'
 }
 
-function formatAmount(amount: number): string {
-  return amount.toLocaleString('sv-SE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-}
-
-// A line is periodiserad when both period dates are set — the cost was parked
+// A line is periodiserad when both period dates are set: the cost was parked
 // on the 17xx interim account and dissolves monthly via accrual_schedules.
 const itemHasAccrual = (item: SupplierInvoiceItem): boolean =>
   !!(item.accrual_period_start && item.accrual_period_end)
@@ -79,6 +79,7 @@ const statusVariants: Record<string, 'default' | 'secondary' | 'success' | 'warn
 
 export default function SupplierInvoiceDetailPage() {
   const { canWrite } = useCanWrite()
+  const { settings: companySettings } = useCompanySettings()
   const params = useParams()
   const router = useRouter()
   const { toast } = useToast()
@@ -91,6 +92,7 @@ export default function SupplierInvoiceDetailPage() {
   const [paymentDate, setPaymentDate] = useState(() => new Date().toISOString().split('T')[0])
   const [paymentAccount, setPaymentAccount] = useState('1930')
   const [accounts, setAccounts] = useState<BASAccount[]>([])
+  const [areAccountsLoading, setAreAccountsLoading] = useState(false)
   const [isProcessing, setIsProcessing] = useState(false)
   const [duplicateCandidates, setDuplicateCandidates] = useState<
     Array<{
@@ -146,7 +148,7 @@ export default function SupplierInvoiceDetailPage() {
   }, [isPayDialogOpen])
 
   // Mirror the preview into the editable working copy. Only resets when not
-  // currently editing — otherwise typing in the inputs would clobber on
+  // currently editing: otherwise typing in the inputs would clobber on
   // every keystroke since the preview refetches on input change.
   useEffect(() => {
     if (!isEditingLines && markPaidPreview) {
@@ -245,31 +247,27 @@ export default function SupplierInvoiceDetailPage() {
     }
   }, [isPayDialogOpen, invoice, payAmount, paymentAccount])
 
-  // Load chart of accounts and remember the last picked payment account so the
-  // dialog defaults to the user's previous choice instead of re-defaulting to
-  // 1930 every time.
+  // The chart of accounts is only needed by the payment dialog. Defer the
+  // request until the user opens it instead of blocking the detail page.
   useEffect(() => {
+    if (!isPayDialogOpen || accounts.length > 0) return
+
     let cancelled = false
     ;(async () => {
-      const [accountsRes, settingsRes] = await Promise.all([
-        fetch('/api/bookkeeping/accounts'),
-        fetch('/api/settings'),
-      ])
-      if (cancelled) return
-      if (accountsRes.ok) {
-        const { data } = await accountsRes.json()
+      setAreAccountsLoading(true)
+      try {
+        const response = await fetch('/api/bookkeeping/accounts')
+        if (cancelled || !response.ok) return
+        const { data } = await response.json()
         if (Array.isArray(data)) setAccounts(data as BASAccount[])
-      }
-      if (settingsRes.ok) {
-        const { data } = await settingsRes.json()
-        const last = (data as { last_supplier_payment_account?: string | null } | null)?.last_supplier_payment_account
-        if (last) setPaymentAccount(last)
+      } finally {
+        if (!cancelled) setAreAccountsLoading(false)
       }
     })()
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [accounts.length, isPayDialogOpen])
 
   async function handleApprove() {
     setIsProcessing(true)
@@ -279,6 +277,24 @@ export default function SupplierInvoiceDetailPage() {
       toast({ title: t('approve_failed_title'), description: getErrorMessage(result, { context: 'supplier_invoice' }), variant: 'destructive' })
     } else {
       toast({ title: t('approved_title'), description: t('approved_description') })
+      fetchInvoice()
+    }
+    setIsProcessing(false)
+  }
+
+  // #967: deferred booking: create the registration verifikat afterwards.
+  async function handleBook() {
+    setIsProcessing(true)
+    const res = await fetch(`/api/supplier-invoices/${params.id}/book`, { method: 'POST' })
+    const result = await res.json()
+    if (!res.ok) {
+      toast({ title: t('book_failed_title'), description: getErrorMessage(result, { context: 'supplier_invoice' }), variant: 'destructive' })
+    } else if (Array.isArray(result.warnings) && result.warnings.length > 0) {
+      // Booked, but a follow-up is needed (e.g. periodiseringar failed).
+      toast({ title: t('booked_title'), description: t('booked_with_warnings_description'), variant: 'destructive' })
+      fetchInvoice()
+    } else {
+      toast({ title: t('booked_title'), description: t('booked_description') })
       fetchInvoice()
     }
     setIsProcessing(false)
@@ -325,7 +341,11 @@ export default function SupplierInvoiceDetailPage() {
     } else {
       toast({
         title: result.status === 'paid' ? t('paid_title') : t('partial_payment_title'),
-        description: t('amount_registered_description', { amount: formatAmount(parseFloat(payAmount)) }),
+        // The paid amount is in the invoice's currency (the dialog's helper
+        // text says so): the toast must not relabel it as kr.
+        description: t('amount_registered_description', {
+          amount: formatCurrency(parseFloat(payAmount), invoice?.currency || 'SEK'),
+        }),
       })
       setIsPayDialogOpen(false)
       setDuplicateCandidates(null)
@@ -403,7 +423,7 @@ export default function SupplierInvoiceDetailPage() {
     return (
       <div className="space-y-6">
         <Skeleton className="h-8 w-48" />
-        <Card className="animate-pulse"><CardContent className="h-48" /></Card>
+        <Card><CardContent className="p-6"><Skeleton className="h-48 w-full" /></CardContent></Card>
       </div>
     )
   }
@@ -422,8 +442,17 @@ export default function SupplierInvoiceDetailPage() {
   const items = (invoice.items || []) as SupplierInvoiceItem[]
   const payments = (invoice.payments || []) as SupplierInvoicePayment[]
 
+  // Display-only öresavrundning. The stored total/booked verifikat keep the
+  // exact öre; this only adjusts the rendered total. Supplier invoices never
+  // had rounding historically, so a null flag resolves to off (company arg
+  // false); only an explicit per-invoice `true` rounds the display.
+  const rounding = getDisplayTotal(
+    { total: invoice.total, currency: invoice.currency, ore_rounding: invoice.ore_rounding },
+    { ore_rounding: false },
+  )
+
   return (
-    <div className="space-y-6 max-w-4xl">
+    <div className="space-y-8 max-w-4xl">
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div className="flex items-center gap-3 sm:gap-4 min-w-0">
@@ -432,7 +461,7 @@ export default function SupplierInvoiceDetailPage() {
           </Button>
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2 sm:gap-3">
-              <h1 className="font-display text-2xl sm:text-3xl font-medium tracking-tight">
+              <h1 className="font-display text-2xl leading-8 tracking-tight">
                 {t('arrival_header', { number: invoice.arrival_number })}
               </h1>
               <Badge variant={statusVariants[invoice.status] || 'secondary'}>
@@ -462,16 +491,27 @@ export default function SupplierInvoiceDetailPage() {
             contextRef={`supplier_invoice:${invoice.id}`}
             size="default"
           />
-          {invoice.status === 'registered' && !invoice.is_credit_note && (
-            <>
-              <Button
-                onClick={handleApprove}
-                disabled={isProcessing || !canWrite}
-                title={!canWrite ? t('viewer_disabled_tooltip') : undefined}
-              >
-                {canWrite ? <CheckCircle className="mr-2 h-4 w-4" /> : <Lock className="mr-2 h-4 w-4" />}
-                {t('approve')}
-              </Button>
+          {/* Attest keys off approved_at, not the status: the overdue cron
+              flips unbooked invoices to 'overdue' just by aging, and gating on
+              'registered' alone left them with no way through attest (#1206). */}
+          {canApproveSupplierInvoice(invoice) && !invoice.is_credit_note && (
+            <Button
+              onClick={handleApprove}
+              disabled={isProcessing || !canWrite}
+              title={!canWrite ? t('viewer_disabled_tooltip') : undefined}
+            >
+              {canWrite ? <CheckCircle className="mr-2 h-4 w-4" /> : <Lock className="mr-2 h-4 w-4" />}
+              {t('approve')}
+            </Button>
+          )}
+          {/* Delete is allowed while nothing would be orphaned: no booking, no
+              payments (server re-checks). 'approved'/'overdue' are included
+              because the overdue cron flips unbooked invoices there and a
+              registered-only gate made them undeletable just by aging. */}
+          {['registered', 'approved', 'overdue'].includes(invoice.status) &&
+            !invoice.is_credit_note &&
+            !invoice.registration_journal_entry_id &&
+            payments.length === 0 && (
               <Button
                 variant="destructive"
                 size="icon"
@@ -482,8 +522,7 @@ export default function SupplierInvoiceDetailPage() {
               >
                 {canWrite ? <Trash2 className="h-4 w-4" /> : <Lock className="h-4 w-4" />}
               </Button>
-            </>
-          )}
+            )}
           {['approved', 'overdue', 'partially_paid'].includes(invoice.status) && (
             <>
               <Button
@@ -521,7 +560,7 @@ export default function SupplierInvoiceDetailPage() {
         </div>
       </div>
 
-      {/* Credit note banner — explain why this row has no edit/delete affordances and where to undo */}
+      {/* Credit note banner: explain why this row has no edit/delete affordances and where to undo */}
       {invoice.is_credit_note && (
         <div className="rounded-lg border bg-muted/40 p-4 flex gap-3 text-sm">
           <Info className="h-5 w-5 shrink-0 text-muted-foreground mt-0.5" />
@@ -571,7 +610,7 @@ export default function SupplierInvoiceDetailPage() {
             {invoice.delivery_date && (
               <div className="flex justify-between">
                 <span className="text-muted-foreground">{t('delivery_date_label')}</span>
-                <span>{invoice.delivery_date}</span>
+                <span className="tabular-nums">{formatDate(invoice.delivery_date)}</span>
               </div>
             )}
             {invoice.payment_reference && (
@@ -595,23 +634,29 @@ export default function SupplierInvoiceDetailPage() {
           <CardContent className="space-y-2 text-sm">
             <div className="flex justify-between">
               <span className="text-muted-foreground">{t('net_excl_vat')}</span>
-              <span className="font-mono">{formatAmount(invoice.subtotal)} {invoice.currency}</span>
+              <span className="tabular-nums">{formatCurrency(invoice.subtotal, invoice.currency)}</span>
             </div>
             <div className="flex justify-between">
               <span className="text-muted-foreground">{t('vat_label')}</span>
-              <span className="font-mono">{formatAmount(invoice.vat_amount)} {invoice.currency}</span>
+              <span className="tabular-nums">{formatCurrency(invoice.vat_amount, invoice.currency)}</span>
             </div>
-            <div className="flex justify-between font-bold text-base pt-2 border-t">
+            {rounding.applies && (
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">{t('ore_rounding')}</span>
+                <span className="tabular-nums">{formatCurrency(rounding.roundingDelta, invoice.currency)}</span>
+              </div>
+            )}
+            <div className="flex justify-between font-semibold text-base pt-2 border-t">
               <span>{t('total_label')}</span>
-              <span className="font-mono">{formatAmount(invoice.total)} {invoice.currency}</span>
+              <span className="tabular-nums">{formatCurrency(rounding.displayed, invoice.currency)}</span>
             </div>
             <div className="flex justify-between pt-2">
               <span className="text-muted-foreground">{t('paid_label')}</span>
-              <span className="font-mono text-success">{formatAmount(invoice.paid_amount)} {invoice.currency}</span>
+              <span className="tabular-nums text-success">{formatCurrency(invoice.paid_amount, invoice.currency)}</span>
             </div>
             <div className="flex justify-between font-semibold">
               <span>{t('remaining_label')}</span>
-              <span className="font-mono">{formatAmount(invoice.remaining_amount)} {invoice.currency}</span>
+              <span className="tabular-nums">{formatCurrency(invoice.remaining_amount, invoice.currency)}</span>
             </div>
           </CardContent>
         </Card>
@@ -676,11 +721,11 @@ export default function SupplierInvoiceDetailPage() {
                     </td>
                     <td className="py-2 text-right">{item.quantity}</td>
                     <td className="py-2">{item.unit}</td>
-                    <td className="py-2 text-right font-mono">{formatAmount(item.unit_price)}</td>
+                    <td className="py-2 text-right tabular-nums">{formatCurrency(item.unit_price, invoice.currency)}</td>
                     <td className="py-2"><AccountNumber number={item.account_number} /></td>
                     <td className="py-2 text-right">{Math.round(item.vat_rate * 100)}%</td>
-                    <td className="py-2 text-right font-mono">{formatAmount(item.line_total)}</td>
-                    <td className="py-2 text-right font-mono">{formatAmount(item.vat_amount)}</td>
+                    <td className="py-2 text-right tabular-nums">{formatCurrency(item.line_total, invoice.currency)}</td>
+                    <td className="py-2 text-right tabular-nums">{formatCurrency(item.vat_amount, invoice.currency)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -704,12 +749,12 @@ export default function SupplierInvoiceDetailPage() {
                   </p>
                 )}
                 <div className="flex items-center justify-between text-sm text-muted-foreground">
-                  <span>{item.quantity} {item.unit} × {formatAmount(item.unit_price)}</span>
-                  <span className="font-mono">{formatAmount(item.line_total)} kr</span>
+                  <span>{item.quantity} {item.unit} × {formatCurrency(item.unit_price, invoice.currency)}</span>
+                  <span className="tabular-nums">{formatCurrency(item.line_total, invoice.currency)}</span>
                 </div>
                 <div className="flex items-center justify-between text-xs text-muted-foreground">
                   <span><AccountNumber number={item.account_number} /> · {t('vat_inline', { rate: Math.round(item.vat_rate * 100) })}</span>
-                  <span className="font-mono">{t('vat_amount_inline', { amount: formatAmount(item.vat_amount) })}</span>
+                  <span className="tabular-nums">{t('vat_amount_inline', { amount: formatCurrency(item.vat_amount, invoice.currency) })}</span>
                 </div>
               </div>
             ))}
@@ -739,7 +784,7 @@ export default function SupplierInvoiceDetailPage() {
                   {payments.map((p) => (
                     <tr key={p.id} className="border-b last:border-0">
                       <td className="py-2 tabular-nums">{formatDate(p.payment_date)}</td>
-                      <td className="py-2 text-right font-mono">{formatAmount(p.amount)} {p.currency}</td>
+                      <td className="py-2 text-right tabular-nums">{formatCurrency(p.amount, p.currency)}</td>
                       <td className="py-2">
                         {p.journal_entry_id ? (
                           <Link href={`/bookkeeping/${p.journal_entry_id}`} className="text-primary hover:underline font-mono text-xs">
@@ -759,7 +804,7 @@ export default function SupplierInvoiceDetailPage() {
                 <div key={p.id} className="border rounded-lg p-3 space-y-1">
                   <div className="flex items-center justify-between text-sm">
                     <span className="tabular-nums">{formatDate(p.payment_date)}</span>
-                    <span className="font-mono font-medium">{formatAmount(p.amount)} {p.currency}</span>
+                    <span className="font-mono font-medium">{formatCurrency(p.amount, p.currency)}</span>
                   </div>
                   <div className="flex items-center justify-between text-xs text-muted-foreground">
                     {p.journal_entry_id ? (
@@ -771,6 +816,26 @@ export default function SupplierInvoiceDetailPage() {
                   </div>
                 </div>
               ))}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {invoice.document_id && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-lg">{t('document_title')}</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Paperclip className="h-4 w-4 shrink-0" />
+                <span>{t('document_attached')}</span>
+              </div>
+              <DocumentViewButton
+                documentId={invoice.document_id}
+                label={t('view_document')}
+              />
             </div>
           </CardContent>
         </Card>
@@ -791,6 +856,23 @@ export default function SupplierInvoiceDetailPage() {
               >
                 {invoice.registration_journal_entry_id.substring(0, 8)}...
               </Link>
+            </div>
+          ) : companySettings?.accounting_method === 'accrual' &&
+            !invoice.is_credit_note &&
+            ['registered', 'approved', 'overdue'].includes(invoice.status) ? (
+            // #967: registered-without-booking (deferred booking). Ekonomi
+            // books the registration verifikat from here.
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-muted-foreground">{t('not_booked_yet')}</span>
+              <Button
+                size="sm"
+                onClick={handleBook}
+                disabled={isProcessing || !canWrite}
+                title={!canWrite ? t('viewer_disabled_tooltip') : undefined}
+              >
+                {canWrite ? <CheckCircle className="mr-2 h-4 w-4" /> : <Lock className="mr-2 h-4 w-4" />}
+                {t('book_action')}
+              </Button>
             </div>
           ) : (
             <p className="text-muted-foreground">{t('no_registration_voucher')}</p>
@@ -828,6 +910,9 @@ export default function SupplierInvoiceDetailPage() {
         open={isPayDialogOpen}
         onOpenChange={(open) => {
           setIsPayDialogOpen(open)
+          if (open && companySettings?.last_supplier_payment_account) {
+            setPaymentAccount(companySettings.last_supplier_payment_account)
+          }
           if (!open) setPayTab('new')
         }}
       >
@@ -868,17 +953,21 @@ export default function SupplierInvoiceDetailPage() {
                 </div>
                 <div className="space-y-2">
                   <Label htmlFor="payment-account">Betalkonto</Label>
-                  <AccountCombobox
-                    value={paymentAccount}
-                    accounts={accounts}
-                    onChange={setPaymentAccount}
-                  />
+                  {areAccountsLoading ? (
+                    <Skeleton className="h-10 w-full" />
+                  ) : (
+                    <AccountCombobox
+                      value={paymentAccount}
+                      accounts={accounts}
+                      onChange={setPaymentAccount}
+                    />
+                  )}
                   <p className="text-xs text-muted-foreground">
                     T.ex. 1930 bankkonto, 1940 övrigt bankkonto, 2018 egna uttag (EF), 2893 ägarlån (AB).
                   </p>
                 </div>
 
-                {/* Bokföringspreview — visar exakt vad som kommer postas.
+                {/* Bokföringspreview: visar exakt vad som kommer postas.
                     Redigerbar via "Redigera"-knappen så användaren kan välja
                     andra konton eller flytta belopp mellan debet/kredit. */}
                 {(markPaidPreview || markPaidPreviewFailed) && (
@@ -1080,7 +1169,7 @@ export default function SupplierInvoiceDetailPage() {
                     </div>
                   </div>
                   <div className="tabular-nums font-medium">
-                    {formatAmount(Math.abs(c.amount))} {invoice.currency}
+                    {formatCurrency(Math.abs(c.amount), invoice.currency)}
                   </div>
                   <Button
                     variant="outline"

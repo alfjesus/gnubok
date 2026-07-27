@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { NextResponse } from 'next/server'
 import {
   createMockRequest,
   parseJsonResponse,
@@ -7,9 +8,12 @@ import {
 import { eventBus } from '@/lib/events/bus'
 
 const { supabase: mockSupabase, enqueue, reset } = createQueuedMockSupabase()
-vi.mock('@/lib/supabase/server', () => ({
-  createClient: () => Promise.resolve(mockSupabase),
+
+const requireAuthMock = vi.fn()
+vi.mock('@/lib/auth/require-auth', () => ({
+  requireAuth: (...args: unknown[]) => requireAuthMock(...args),
 }))
+
 vi.mock('@/lib/init', () => ({ ensureInitialized: vi.fn() }))
 
 vi.mock('@/lib/company/context', () => ({
@@ -17,8 +21,9 @@ vi.mock('@/lib/company/context', () => ({
   getActiveCompanyId: vi.fn().mockResolvedValue('company-1'),
 }))
 
+const requireWriteMock = vi.fn()
 vi.mock('@/lib/auth/require-write', () => ({
-  requireWritePermission: vi.fn().mockResolvedValue({ ok: true }),
+  requireWritePermission: (...args: unknown[]) => requireWriteMock(...args),
 }))
 
 const mockCommit = vi.fn()
@@ -56,11 +61,16 @@ describe('POST /api/pending-operations/bulk-commit', () => {
     vi.clearAllMocks()
     eventBus.clear()
     reset()
-    mockSupabase.auth.getUser.mockResolvedValue({ data: { user: mockUser } })
+    requireAuthMock.mockResolvedValue({ user: mockUser, supabase: mockSupabase, error: null })
+    requireWriteMock.mockResolvedValue({ ok: true })
   })
 
   it('returns 401 when not authenticated', async () => {
-    mockSupabase.auth.getUser.mockResolvedValue({ data: { user: null } })
+    requireAuthMock.mockResolvedValue({
+      user: null,
+      supabase: mockSupabase,
+      error: NextResponse.json({ error: 'Unauthorized' }, { status: 401 }),
+    })
 
     const request = createMockRequest('/api/pending-operations/bulk-commit', {
       method: 'POST',
@@ -71,6 +81,22 @@ describe('POST /api/pending-operations/bulk-commit', () => {
 
     expect(status).toBe(401)
     expect(body).toEqual({ error: 'Unauthorized' })
+  })
+
+  it('returns 403 for a viewer without write permission', async () => {
+    requireWriteMock.mockResolvedValue({
+      ok: false,
+      response: NextResponse.json({ error: 'Forbidden' }, { status: 403 }),
+    })
+
+    const request = createMockRequest('/api/pending-operations/bulk-commit', {
+      method: 'POST',
+      body: { ids: [VALID_ID_1] },
+    })
+    const response = await POST(request)
+    const { status } = await parseJsonResponse(response)
+
+    expect(status).toBe(403)
   })
 
   it('returns 400 when ids array is empty', async () => {
@@ -124,7 +150,8 @@ describe('POST /api/pending-operations/bulk-commit', () => {
     const { status, body } = await parseJsonResponse<{ error: string }>(response)
 
     expect(status).toBe(500)
-    expect(body.error).toBe('db connection lost')
+    // Raw Supabase messages never reach the response field (issue #337).
+    expect(body.error).toBe('Åtgärderna kunde inte hämtas. Försök igen.')
   })
 
   it('reports per-item not-found as failed without calling commit', async () => {
@@ -144,7 +171,7 @@ describe('POST /api/pending-operations/bulk-commit', () => {
 
     expect(status).toBe(200)
     expect(body.data.results).toEqual([
-      { id: VALID_ID_1, status: 'failed', error: 'Operation not found' },
+      { id: VALID_ID_1, status: 'failed', error: 'Åtgärden kunde inte hittas.' },
     ])
     expect(body.data.summary).toEqual({
       total: 1,
@@ -178,11 +205,11 @@ describe('POST /api/pending-operations/bulk-commit', () => {
 
     expect(status).toBe(200)
     expect(body.data.results).toEqual([
-      { id: VALID_ID_1, status: 'skipped', error: 'Already committed' },
+      { id: VALID_ID_1, status: 'skipped', error: 'Redan hanterad (godkänd)' },
       {
         id: VALID_ID_2,
         status: 'skipped',
-        error: 'Hög risk — kräver individuellt godkännande',
+        error: 'Hög risk: kräver individuellt godkännande',
       },
     ])
     expect(body.data.summary).toEqual({
@@ -270,8 +297,9 @@ describe('POST /api/pending-operations/bulk-commit', () => {
     }>(response)
 
     expect(status).toBe(200)
+    // English executor message → Swedish HTTP-409 fallback (issue #337).
     expect(body.data.results).toEqual([
-      { id: VALID_ID_1, status: 'rejected', error: 'Resource already deleted' },
+      { id: VALID_ID_1, status: 'rejected', error: 'En konflikt uppstod. Ladda om sidan och försök igen.' },
     ])
     expect(body.data.summary).toEqual({
       total: 1,
@@ -315,12 +343,14 @@ describe('POST /api/pending-operations/bulk-commit', () => {
     }>(response)
 
     expect(status).toBe(200)
+    // English executor strings map to the status-appropriate Swedish
+    // fallbacks; skip/not-found strings are now Swedish at the source (#337).
     expect(body.data.results).toEqual([
       { id: VALID_ID_1, status: 'committed' },
-      { id: VALID_ID_2, status: 'failed', error: 'boom' },
-      { id: VALID_ID_3, status: 'skipped', error: 'Already rejected' },
-      { id: VALID_ID_4, status: 'rejected', error: 'gone' },
-      { id: VALID_ID_5, status: 'failed', error: 'Operation not found' },
+      { id: VALID_ID_2, status: 'failed', error: 'Ett oväntat serverfel uppstod. Försök igen senare.' },
+      { id: VALID_ID_3, status: 'skipped', error: 'Redan hanterad (avvisad)' },
+      { id: VALID_ID_4, status: 'rejected', error: 'Resursen kunde inte hittas.' },
+      { id: VALID_ID_5, status: 'failed', error: 'Åtgärden kunde inte hittas.' },
     ])
     expect(body.data.summary).toEqual({
       total: 5,

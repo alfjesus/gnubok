@@ -3,11 +3,14 @@
 import { useEffect } from 'react'
 import { useSearchParams, useRouter } from 'next/navigation'
 import { useTranslations } from 'next-intl'
+import { PageHeader } from '@/components/ui/page-header'
 import { SettingsShell } from '@/components/settings/SettingsShell'
+import { ActiveCompanyBadge } from '@/components/settings/ActiveCompanyBadge'
 
 const TAB_TO_ROUTE: Record<string, string> = {
   company: '/settings/company',
   invoicing: '/settings/invoicing',
+  payments: '/import?mode=stripe',
   bookkeeping: '/settings/bookkeeping',
   tax: '/settings/tax',
   team: '/settings/team',
@@ -34,7 +37,7 @@ export default function SettingsLayout({ children }: { children: React.ReactNode
 
   return (
     <div className="space-y-8">
-      <h1 className="font-display text-2xl tracking-tight md:text-3xl">{t('aria_label')}</h1>
+      <PageHeader title={t('aria_label')} action={<ActiveCompanyBadge />} />
       <SettingsShell variant="page">{children}</SettingsShell>
     </div>
   )

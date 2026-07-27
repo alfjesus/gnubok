@@ -2,13 +2,17 @@ import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
 import { z } from 'zod'
 import { ensureInitialized } from '@/lib/init'
+import { requireAuth } from '@/lib/auth/require-auth'
 import { getActiveCompanyId } from '@/lib/company/context'
 import { getIntent } from '@/lib/agent/intents/registry'
 import { checkAgentRateLimit, agentRateLimitResponseBody } from '@/lib/rate-limits/agent'
 import { runChatTurn, friendlyModelError } from '@/lib/agent/chat/run-turn'
 import { guardSandbox } from '@/lib/sandbox/guard'
+import { requireCapability } from '@/lib/entitlements/has-capability'
+import { CAPABILITY } from '@/lib/entitlements/keys'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
-// Make sure extensions are loaded — the chat loop dispatches against the
+// Make sure extensions are loaded: the chat loop dispatches against the
 // agent tool registry which is populated by the mcp-server extension at load.
 ensureInitialized()
 
@@ -60,17 +64,16 @@ const BodySchema = z.object({
 // POST /api/agent/invoke
 //
 // Streams NDJSON events from the chat loop. Each line is a JSON object whose
-// `kind` identifies the event type — see lib/agent/chat/run-turn.ts StreamEvent.
+// `kind` identifies the event type: see lib/agent/chat/run-turn.ts StreamEvent.
 //
 // Auth: the user must be a member of the resolved company.
 //
 // Plan ref: dev_docs/specialized-agent-plan.md §9 (chat loop).
 export async function POST(request: Request) {
-  const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
-  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  const { user, supabase, error } = await requireAuth()
+  if (error) return error
 
-  // Generous per-user rate limit — bounds runaway Bedrock spend (loop-firing
+  // Generous per-user rate limit: bounds runaway Bedrock spend (loop-firing
   // sessions). Fails open on infra error.
   const rate = await checkAgentRateLimit(supabase, user.id)
   if (!rate.ok) {
@@ -85,7 +88,7 @@ export async function POST(request: Request) {
     body = BodySchema.parse(await request.json())
   } catch (err) {
     return NextResponse.json(
-      { error: err instanceof Error ? err.message : 'Invalid body' },
+      { error: err instanceof Error ? getUserErrorMessage(err) : 'Invalid body' },
       { status: 400 },
     )
   }
@@ -106,17 +109,57 @@ export async function POST(request: Request) {
     .maybeSingle()
   if (!membership) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
 
-  // No Anthropic Bedrock calls in the sandbox — the demo runs entirely on
+  // No Anthropic Bedrock calls in the sandbox: the demo runs entirely on
   // seed data and the assistant is gated to a "look, don't touch" preview.
   const blocked = await guardSandbox(supabase, companyId)
   if (blocked) return blocked
 
-  // onboarding.intake completion signal — once the user has actually
+  const capBlocked = await requireCapability(supabase, companyId, CAPABILITY.ai)
+  if (capBlocked) return capBlocked
+
+  // Resolve the conversation BEFORE any side effect below (the onboarding
+  // intake stamp): a request that is about to be rejected must not write.
+  let conversationId = body.conversation_id ?? null
+  if (conversationId) {
+    // A resumed conversation id comes straight from the client, so ownership
+    // has to be proven here. RLS on agent_conversations/agent_messages is
+    // COMPANY-scoped (migration 20260517204000), not user-scoped, so RLS alone
+    // would happily load a colleague's thread into the prompt and append this
+    // user's turns to it. The conversations list route filters on user_id for
+    // exactly this reason; the same rule applies to the turn itself.
+    //
+    // The company check matters too: a user who belongs to several companies
+    // must not resume a thread from company B while the turn runs with company
+    // A's ledger, tools and staged operations.
+    const { data: conv } = await supabase
+      .from('agent_conversations')
+      .select('id, user_id, company_id, intent_id')
+      .eq('id', conversationId)
+      .maybeSingle()
+
+    if (!conv || conv.user_id !== user.id || conv.company_id !== companyId) {
+      // Same response for "doesn't exist" and "isn't yours": a 403 here would
+      // confirm that someone else's conversation id is real.
+      return NextResponse.json({ error: 'Konversationen hittades inte.' }, { status: 404 })
+    }
+
+    // The intent decides the tool loadout and the system prompt. Letting a
+    // resumed thread switch intent mid-conversation would swap the tool
+    // whitelist under history the model has already been shown.
+    if (conv.intent_id !== body.intent_id) {
+      return NextResponse.json(
+        { error: 'Konversationen hör till ett annat sammanhang.' },
+        { status: 400 },
+      )
+    }
+  }
+
+  // onboarding.intake completion signal: once the user has actually
   // engaged (typed a real reply, not the auto-fired greeting prompt that
   // mounts the chat), stamp intake_completed_at on the profile so re-entry
   // logic and opportunistic follow-up logic in other intents can tell the
   // intake happened. Idempotent: the IS NULL guard ensures we never
-  // overwrite the first engagement timestamp. Best-effort — failure here
+  // overwrite the first engagement timestamp. Best-effort: failure here
   // doesn't break the chat; the next user turn retries.
   if (
     body.intent_id === 'onboarding.intake' &&
@@ -131,7 +174,7 @@ export async function POST(request: Request) {
         .eq('company_id', companyId)
         .is('intake_completed_at', null)
     } catch {
-      // ignored — see comment above
+      // ignored: see comment above
     }
   }
 
@@ -143,8 +186,7 @@ export async function POST(request: Request) {
   const companyName = company?.name ?? ''
   const firstName = profile?.full_name?.split(' ')[0] ?? null
 
-  // Resolve / create the conversation row.
-  let conversationId = body.conversation_id ?? null
+  // Create the conversation row when this is a fresh thread.
   if (!conversationId) {
     const { data: newConv, error: convErr } = await supabase
       .from('agent_conversations')
@@ -159,7 +201,7 @@ export async function POST(request: Request) {
       .single()
     if (convErr || !newConv) {
       return NextResponse.json(
-        { error: convErr?.message ?? 'Failed to create conversation' },
+        { error: getUserErrorMessage(convErr) ?? 'Failed to create conversation' },
         { status: 500 },
       )
     }
@@ -177,6 +219,9 @@ export async function POST(request: Request) {
   // client can also explicitly request a hidden turn (rejection correction)
   // even when it DID supply a user_message.
   let userMessageHidden = body.user_message_hidden === true
+  // Set on a first turn, where the prompt template needs it anyway; handed to
+  // runChatTurn so the system prompt reuses it instead of re-reading.
+  let preloadedProfileSummary: string | null | undefined
   if (!effectiveUserMessage) {
     try {
       const captured = await intent.capture(body.intent_args ?? {}, {
@@ -184,20 +229,24 @@ export async function POST(request: Request) {
         userId: user.id,
         companyId,
       })
-      const profileSummary = await loadProfileSummary(supabase, companyId)
-      const memory = await loadRankedMemory(supabase, companyId, 30)
+      const [profileSummary, memory] = await Promise.all([
+        loadProfileSummary(supabase, companyId),
+        loadRankedMemory(supabase, companyId, 30),
+      ])
       effectiveUserMessage = intent.promptTemplate({
         captured,
         profileSummary,
         activeMemory: memory,
       })
+      // Hand it to the turn so it doesn't re-read it for the system prompt.
+      preloadedProfileSummary = profileSummary
       userMessageHidden = true
     } catch (err) {
       return NextResponse.json(
         {
           error:
             err instanceof Error
-              ? `Capture failed: ${err.message}`
+              ? `Capture failed: ${getUserErrorMessage(err)}`
               : 'Capture failed',
         },
         { status: 500 },
@@ -205,7 +254,7 @@ export async function POST(request: Request) {
     }
   }
 
-  // Stream — NDJSON events from the chat loop.
+  // Stream: NDJSON events from the chat loop.
   const encoder = new TextEncoder()
   // Conversation id is set above; capture into a non-null local for the
   // streaming closure's first emission.
@@ -237,6 +286,7 @@ export async function POST(request: Request) {
           userMessage: effectiveUserMessage,
           userMessageHidden,
           persist: true,
+          preloadedProfileSummary,
           emit: (event) => emit(event),
         })
       } catch (err) {

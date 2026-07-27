@@ -29,9 +29,36 @@ export interface ProposedDisposition {
   /** Calculator-specific breakdown the UI can render in an "Visa beräkning"
    *  panel. Free-form so each calculator can show its own details. */
   computation?: Record<string, unknown>
-  /** True if this proposal cannot be skipped — e.g. periodiseringsfond from
+  /** True if this proposal cannot be skipped: e.g. periodiseringsfond from
    *  tax year N-6 that must be reversed. UI disables the skip control. */
   required?: boolean
+}
+
+export type TaxAdjustmentType = 'non_deductible_expense' | 'non_taxable_income'
+export type TaxAdjustmentSource = 'detected' | 'manual'
+
+export interface TaxAdjustmentItem {
+  sourceKey: string
+  source: TaxAdjustmentSource
+  adjustmentType: TaxAdjustmentType
+  description: string
+  accountNumber: string | null
+  amount: number
+  included: boolean
+}
+
+export interface TaxAdjustmentSnapshot {
+  items: TaxAdjustmentItem[]
+  nonDeductibleExpenses: number
+  nonTaxableIncome: number
+}
+
+export interface CompletedDisposition {
+  kind: DispositionKind
+  label: string
+  amount: number
+  status: 'booked' | 'needs_correction'
+  warnings: string[]
 }
 
 /**
@@ -52,4 +79,6 @@ export interface DispositionsProposal {
   /** Result before any new dispositions, from the income statement (positive = profit). */
   netResultBefore: number
   proposals: ProposedDisposition[]
+  taxAdjustments?: TaxAdjustmentSnapshot
+  completedDispositions?: CompletedDisposition[]
 }

@@ -23,7 +23,7 @@ export async function getClient(): Promise<PoolClient> {
 
 // Run `fn` inside a role/JWT context that auth.uid() / user_company_ids() will
 // observe. Uses SET LOCAL inside a transaction so the role reverts on commit
-// or rollback. Always rolls back so the test's writes do not persist — tests
+// or rollback. Always rolls back so the test's writes do not persist: tests
 // that need to seed data must do that on the superuser connection first.
 export async function withUserContext<T>(
   userId: string,
@@ -34,7 +34,7 @@ export async function withUserContext<T>(
     await client.query('BEGIN')
     // Set JWT claims BEFORE switching role: non-superuser set_config on a
     // namespaced GUC is fine, but keeping order explicit avoids surprises.
-    // Set both the whole-claims object and the individual `sub` claim —
+    // Set both the whole-claims object and the individual `sub` claim:
     // different versions of Supabase's auth.uid() read one or the other.
     await client.query(`SELECT set_config('request.jwt.claims', $1, true)`, [
       JSON.stringify({ sub: userId, role: 'authenticated' }),
@@ -42,7 +42,7 @@ export async function withUserContext<T>(
     await client.query(`SELECT set_config('request.jwt.claim.sub', $1, true)`, [userId])
     await client.query(`SET LOCAL ROLE authenticated`)
     // Fail loudly and early if the JWT context did not land the way we
-    // expect — otherwise RLS policies return empty and the real test
+    // expect: otherwise RLS policies return empty and the real test
     // failure points at an unrelated assertion.
     const authCheck = await client.query<{ uid: string | null }>(
       `SELECT auth.uid()::text AS uid`,
@@ -55,6 +55,60 @@ export async function withUserContext<T>(
     }
     const result = await fn(client)
     await client.query('ROLLBACK')
+    return result
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw err
+  } finally {
+    client.release()
+  }
+}
+
+// Run `fn` with service-role claims and the service_role DB role: the same
+// presentation PostgREST gives a createServiceClient() call (auth.uid() NULL,
+// auth.role() = 'service_role'). Unlike withUserContext this COMMITS on
+// success: the SIE bulk-delete suites assert persisted effects over the plain
+// pool afterwards. SET LOCAL scopes the claims and role to the transaction,
+// so the pooled connection is clean again after COMMIT/ROLLBACK either way.
+//
+// BOTH claim GUC styles are set, for the same reason withUserContext sets
+// both `request.jwt.claims` and `request.jwt.claim.sub`: the CI image
+// (supabase/postgres:15.8.1.060) ships the LEGACY auth shim, where
+// auth.role() reads ONLY `request.jwt.claim.role` (init-scripts/
+// 00000000000001-auth-schema.sql; no in-image migration redefines it), while
+// hosted Supabase runs the newer coalesce definition that also reads the
+// `request.jwt.claims` JSON. Setting only the JSON works against hosted-style
+// shims and silently leaves auth.role() NULL in CI, which is exactly the
+// failure mode that broke the service-actor suites. Functions that parse
+// `request.jwt.claims` themselves (the gl-lines guard shape) get the JSON.
+export async function runAsServiceRole<T>(
+  fn: (client: PoolClient) => Promise<T>,
+): Promise<T> {
+  const client = await getClient()
+  try {
+    await client.query('BEGIN')
+    await client.query(
+      `SELECT set_config('request.jwt.claims', '{"role":"service_role"}', true)`,
+    )
+    await client.query(
+      `SELECT set_config('request.jwt.claim.role', 'service_role', true)`,
+    )
+    await client.query('SET LOCAL ROLE service_role')
+    // Fail loudly if the simulation did not land: otherwise every
+    // service-gated RPC raises 42501 and the real test failure points at an
+    // unrelated assertion (same rationale as the withUserContext check).
+    const check = await client.query<{ role: string | null; uid: string | null }>(
+      `SELECT auth.role()::text AS role, auth.uid()::text AS uid`,
+    )
+    if (check.rows[0]?.role !== 'service_role' || check.rows[0]?.uid !== null) {
+      throw new Error(
+        `runAsServiceRole: auth.role() resolved to ${check.rows[0]?.role ?? 'NULL'} ` +
+          `and auth.uid() to ${check.rows[0]?.uid ?? 'NULL'}; expected service_role/NULL. ` +
+          'Check which GUCs this harness auth shim reads.',
+      )
+    }
+    const result = await fn(client)
+    await client.query('COMMIT')
     return result
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {})

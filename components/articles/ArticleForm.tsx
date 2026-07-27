@@ -6,16 +6,30 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
 import { useTranslations } from 'next-intl'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { Textarea } from '@/components/ui/textarea'
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import {
+  SettingsGroup,
+  SettingsInput,
+  SettingsRow,
+  SettingsSeg,
+  SettingsSelect,
+  SettingsTextarea,
+} from '@/components/settings/SettingsRows'
 import { ChevronDown, Loader2, Lock } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import { cn, formatCurrency } from '@/lib/utils'
 import { useCanWrite } from '@/lib/hooks/use-can-write'
+import { useCompany } from '@/contexts/CompanyContext'
+import { createClient } from '@/lib/supabase/client'
 import AccountCombobox from '@/components/bookkeeping/AccountCombobox'
 import { AddAccountDialog } from '@/components/bookkeeping/AddAccountDialog'
 import type { BASAccount, CreateArticleInput } from '@/types'
+import { INVOICE_POSTING_ACCOUNT_REGEX } from '@/lib/invoices/posting-account'
+
+// A row from the currencies reference table (lib migration
+// 20260630110000_currencies_reference_table.sql).
+interface CurrencyOption {
+  code: string
+  name: string
+}
 
 // Unit list mirrors the invoice line editor (app/(dashboard)/invoices/new/page.tsx).
 const UNITS = ['st', 'tim', 'dag', 'månad', 'km', 'kg'] as const
@@ -24,33 +38,60 @@ const UNITS = ['st', 'tim', 'dag', 'månad', 'km', 'kg'] as const
 // lib/api/schemas.ts (25 | 12 | 6 | 0).
 const VAT_RATES = [25, 12, 6, 0] as const
 
+/** Money is rounded to öre with arithmetic, never toFixed (CLAUDE.md rule 6). */
+function round2(value: number): number {
+  return Math.round(value * 100) / 100
+}
+
+// SettingsInput is a bare input, so it does not carry the wheel guard that
+// components/ui/input.tsx applies to type="number". Without it, scrolling the
+// page with the cursor over a focused price field silently edits the amount.
+function blurOnWheel(e: React.WheelEvent<HTMLInputElement>) {
+  e.currentTarget.blur()
+}
+
 interface ArticleFormProps {
   onSubmit: (data: CreateArticleInput) => Promise<void>
   isLoading: boolean
   initialData?: Partial<CreateArticleInput>
+  /** Closes the host dialog. When omitted the cancel button is not rendered. */
+  onCancel?: () => void
 }
 
 export default function ArticleForm({
   onSubmit,
   isLoading,
   initialData,
+  onCancel,
 }: ArticleFormProps) {
   const { canWrite } = useCanWrite()
+  const { company } = useCompany()
+  const supabase = createClient()
   const t = useTranslations('form_article')
-  // Active class-3 (revenue) accounts for the combobox. The combobox accepts
-  // unknown 4-digit numbers optimistically — the API answers with
+  const tCommon = useTranslations('common')
+  // Active class 1-3 posting accounts for the combobox. The combobox accepts
+  // unknown 4-digit numbers optimistically: the API answers with
   // ACCOUNTS_NOT_IN_CHART for activatable BAS accounts, and the host page's
   // ActivateAccountsDialog flow takes over (same UX as the journal entry form).
-  const [revenueAccounts, setRevenueAccounts] = useState<BASAccount[]>([])
+  const [postingAccounts, setPostingAccounts] = useState<BASAccount[]>([])
   // Inline account creation: what the user typed in the combobox when they hit
-  // "Skapa konto" — non-null opens AddAccountDialog prefilled with it.
+  // "Skapa konto": non-null opens AddAccountDialog prefilled with it.
   const [createAccountPrefill, setCreateAccountPrefill] = useState<string | null>(null)
+  // Momsregistrerad? A non-VAT-registered company never charges moms, so the
+  // VAT field is hidden and the rate forced to 0: mirrors the invoice editor.
+  const [vatRegistered, setVatRegistered] = useState(true)
+  // Supported currencies, fetched from the currencies reference table rather
+  // than hard-coded. Falls back to the article's own currency (or SEK) if the
+  // fetch fails so the Select is never empty.
+  const [currencies, setCurrencies] = useState<CurrencyOption[]>([])
 
   async function fetchRevenueAccounts() {
     try {
-      const res = await fetch('/api/bookkeeping/accounts?class=3')
+      const res = await fetch('/api/bookkeeping/accounts')
       const body = await res.json()
-      setRevenueAccounts((body?.data as BASAccount[]) || [])
+      const accounts = ((body?.data as BASAccount[]) || [])
+        .filter((account) => account.account_class >= 1 && account.account_class <= 3)
+      setPostingAccounts(accounts)
     } catch {
       // Non-fatal: the combobox degrades to free 4-digit entry.
     }
@@ -59,11 +100,51 @@ export default function ArticleForm({
   useEffect(() => {
     fetchRevenueAccounts()
   }, [])
-  // Open the advanced section by default when it already holds data, so an
-  // edit never hides a value the user previously set.
-  const [advancedOpen, setAdvancedOpen] = useState(
+
+  // Currency options come from the currencies reference table: one source of
+  // truth, no hard-coded list.
+  useEffect(() => {
+    let cancelled = false
+    supabase
+      .from('currencies')
+      .select('code, name')
+      .eq('active', true)
+      .order('sort_order', { ascending: true })
+      .then(({ data }) => {
+        if (!cancelled && data) setCurrencies(data as CurrencyOption[])
+      })
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    if (!company?.id) return
+    let cancelled = false
+    supabase
+      .from('company_settings')
+      .select('vat_registered')
+      .eq('company_id', company.id)
+      .single()
+      .then(({ data }) => {
+        if (!cancelled && typeof data?.vat_registered === 'boolean') {
+          setVatRegistered(data.vat_registered)
+        }
+      })
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [company?.id])
+
+  // Open "Fler fält" by default when it already holds data, so an edit never
+  // hides a value the user previously set. Currency and posting account are no
+  // longer in here: both are permanent rows.
+  const [moreOpen, setMoreOpen] = useState(
     Boolean(
-      initialData?.revenue_account ||
+      initialData?.article_number ||
+        initialData?.name_en ||
         initialData?.cost_price != null ||
         initialData?.ean ||
         initialData?.housework_type ||
@@ -75,13 +156,21 @@ export default function ArticleForm({
   const schema = useMemo(
     () =>
       z.object({
+        article_number: z.string().trim().max(64, t('number_too_long')).optional(),
         name: z.string().min(1, t('name_required')),
         name_en: z.string().optional(),
         type: z.enum(['vara', 'tjanst']),
         unit: z.string().min(1),
         price_excl_vat: z.number({ message: t('price_required') }).nonnegative(t('price_required')),
         vat_rate: z.union([z.literal(25), z.literal(12), z.literal(6), z.literal(0)]),
-        revenue_account: z.string().optional(),
+        // ISO 4217 alpha-3; the authoritative allow-list is the currencies
+        // table (the DB FK rejects unknown codes).
+        currency: z.string().regex(/^[A-Z]{3}$/),
+        revenue_account: z
+          .string()
+          .regex(INVOICE_POSTING_ACCOUNT_REGEX, t('posting_account_invalid'))
+          .or(z.literal(''))
+          .optional(),
         cost_price: z.number().nonnegative().optional(),
         ean: z.string().optional(),
         housework_type: z.string().optional(),
@@ -102,12 +191,14 @@ export default function ArticleForm({
   } = useForm<FormData>({
     resolver: zodResolver(schema),
     defaultValues: {
+      article_number: initialData?.article_number || '',
       name: initialData?.name || '',
       name_en: initialData?.name_en || '',
       type: initialData?.type || 'tjanst',
       unit: initialData?.unit || 'st',
       price_excl_vat: initialData?.price_excl_vat ?? 0,
       vat_rate: (initialData?.vat_rate as FormData['vat_rate']) ?? 25,
+      currency: initialData?.currency ?? 'SEK',
       revenue_account: initialData?.revenue_account || '',
       cost_price: initialData?.cost_price ?? undefined,
       ean: initialData?.ean || '',
@@ -117,15 +208,40 @@ export default function ArticleForm({
   })
 
   const type = watch('type')
+  const watchedName = watch('name')
+  const watchedUnit = watch('unit')
+  const watchedPrice = watch('price_excl_vat')
+  const watchedVat = watch('vat_rate')
+  const watchedCurrency = watch('currency')
+  const watchedAccount = watch('revenue_account')
+  const watchedNumber = watch('article_number')
+
+  // The summary strip: what this article becomes as a line on an invoice.
+  // Display only, so it never posts anything, but it is the reason currency is
+  // impossible to miss here.
+  const price = Number.isFinite(watchedPrice) ? Number(watchedPrice) : 0
+  const effectiveVat = vatRegistered ? Number(watchedVat) || 0 : 0
+  const vatAmount = round2((price * effectiveVat) / 100)
+  const totalInclVat = round2(price + vatAmount)
+  const currency = watchedCurrency || 'SEK'
+
+  // Keep the article's own currency selectable even before the fetch resolves
+  // or if it has since been deactivated.
+  const currencyCodes = useMemo(() => {
+    const codes = currencies.map((c) => c.code)
+    return codes.includes(currency) ? codes : [currency, ...codes]
+  }, [currencies, currency])
 
   const onFormSubmit = (data: FormData) => {
     onSubmit({
+      article_number: data.article_number?.trim() || null,
       name: data.name,
       name_en: data.name_en || null,
       type: data.type,
       unit: data.unit,
       price_excl_vat: data.price_excl_vat,
-      vat_rate: data.vat_rate,
+      vat_rate: vatRegistered ? data.vat_rate : 0,
+      currency: data.currency,
       revenue_account: data.revenue_account || null,
       cost_price: data.cost_price ?? null,
       ean: data.ean || null,
@@ -134,238 +250,309 @@ export default function ArticleForm({
     })
   }
 
+  const fieldError = (message?: string) =>
+    message ? <p className="basis-full text-xs text-destructive">{message}</p> : null
+
   return (
-    <form onSubmit={handleSubmit(onFormSubmit)} className="space-y-6">
-      {/* Type */}
-      <div className="space-y-2">
-        <Label>{t('type_label')}</Label>
-        <Controller
-          name="type"
-          control={control}
-          render={({ field }) => (
-            <Select value={field.value} onValueChange={(v) => { if (v) field.onChange(v) }}>
-              <SelectTrigger>
-                <SelectValue placeholder={t('type_placeholder')} />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="vara">{t('type_vara')}</SelectItem>
-                <SelectItem value="tjanst">{t('type_tjanst')}</SelectItem>
-              </SelectContent>
-            </Select>
-          )}
-        />
-      </div>
+    <form onSubmit={handleSubmit(onFormSubmit)}>
+      <SettingsGroup label={t('group_article')}>
+        <SettingsRow label={t('type_label')}>
+          <Controller
+            name="type"
+            control={control}
+            render={({ field }) => (
+              <SettingsSeg
+                value={field.value}
+                onChange={field.onChange}
+                aria-label={t('type_label')}
+                options={[
+                  { value: 'tjanst', label: t('type_tjanst') },
+                  { value: 'vara', label: t('type_vara') },
+                ]}
+              />
+            )}
+          />
+        </SettingsRow>
 
-      {/* Name */}
-      <div className="space-y-2">
-        <Label htmlFor="name">{t('name_label')}</Label>
-        <Input
-          id="name"
-          placeholder={t('name_placeholder')}
-          {...register('name')}
-        />
-        {errors.name && (
-          <p className="text-sm text-destructive">{errors.name.message}</p>
-        )}
-      </div>
+        <SettingsRow label={t('name_label')} htmlFor="article-name" align="baseline">
+          <SettingsInput
+            id="article-name"
+            placeholder={t('name_placeholder')}
+            {...register('name')}
+          />
+          {fieldError(errors.name?.message)}
+        </SettingsRow>
 
-      {/* English name */}
-      <div className="space-y-2">
-        <Label htmlFor="name_en">{t('name_en_label')}</Label>
-        <Input
-          id="name_en"
-          placeholder={t('name_en_placeholder')}
-          {...register('name_en')}
-        />
-        <p className="text-xs text-muted-foreground">{t('name_en_hint')}</p>
-      </div>
+        <SettingsRow label={t('price_label')} htmlFor="article-price" align="baseline">
+          <span className="flex items-center gap-2">
+            <SettingsInput
+              id="article-price"
+              type="number"
+              step="0.01"
+              min="0"
+              className="w-28 flex-none tabular-nums"
+              onWheel={blurOnWheel}
+              {...register('price_excl_vat', { valueAsNumber: true })}
+            />
+            <Controller
+              name="currency"
+              control={control}
+              render={({ field }) => (
+                <SettingsSelect
+                  aria-label={t('currency_label')}
+                  className="text-muted-foreground"
+                  value={field.value}
+                  onChange={(e) => field.onChange(e.target.value)}
+                >
+                  {currencyCodes.map((code) => (
+                    <option key={code} value={code}>
+                      {code}
+                    </option>
+                  ))}
+                </SettingsSelect>
+              )}
+            />
+          </span>
+          {fieldError(errors.price_excl_vat?.message)}
+        </SettingsRow>
 
-      {/* Unit + price + VAT */}
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-        <div className="space-y-2">
-          <Label>{t('unit_label')}</Label>
+        {/* Enhet closes the group when the company charges no moms, so the
+            group never ends on a dangling hairline. */}
+        <SettingsRow label={t('unit_label')} htmlFor="article-unit" borderless={!vatRegistered}>
           <Controller
             name="unit"
             control={control}
             render={({ field }) => (
-              <Select value={field.value} onValueChange={(v) => { if (v) field.onChange(v) }}>
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {UNITS.map((u) => (
-                    <SelectItem key={u} value={u}>{u}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              <SettingsSelect
+                id="article-unit"
+                value={field.value}
+                onChange={(e) => field.onChange(e.target.value)}
+              >
+                {UNITS.map((u) => (
+                  <option key={u} value={u}>
+                    {u}
+                  </option>
+                ))}
+              </SettingsSelect>
             )}
           />
-        </div>
-        <div className="space-y-2">
-          <Label htmlFor="price_excl_vat">{t('price_label')}</Label>
-          <Input
-            id="price_excl_vat"
-            type="number"
-            step="0.01"
-            min="0"
-            className="tabular-nums"
-            {...register('price_excl_vat', { valueAsNumber: true })}
-          />
-          {errors.price_excl_vat && (
-            <p className="text-sm text-destructive">{errors.price_excl_vat.message}</p>
-          )}
-        </div>
-        <div className="space-y-2">
-          <Label>{t('vat_rate_label')}</Label>
+        </SettingsRow>
+
+        {vatRegistered && (
+          <SettingsRow label={t('vat_rate_label')} htmlFor="article-vat" borderless>
+            <Controller
+              name="vat_rate"
+              control={control}
+              render={({ field }) => (
+                <SettingsSelect
+                  id="article-vat"
+                  value={String(field.value)}
+                  onChange={(e) => field.onChange(Number(e.target.value))}
+                >
+                  {VAT_RATES.map((rate) => (
+                    <option key={rate} value={String(rate)}>
+                      {rate} %
+                    </option>
+                  ))}
+                </SettingsSelect>
+              )}
+            />
+          </SettingsRow>
+        )}
+      </SettingsGroup>
+
+      <SettingsGroup label={t('group_accounting')}>
+        <SettingsRow
+          label={t('revenue_account_label')}
+          align="baseline"
+          borderless
+          help={t('revenue_account_hint')}
+        >
           <Controller
-            name="vat_rate"
+            name="revenue_account"
             control={control}
             render={({ field }) => (
-              <Select
-                value={String(field.value)}
-                onValueChange={(v) => { if (v) field.onChange(Number(v)) }}
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {VAT_RATES.map((rate) => (
-                    <SelectItem key={rate} value={String(rate)}>{rate} %</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              <AccountCombobox
+                flat
+                value={field.value || ''}
+                accounts={postingAccounts}
+                onChange={field.onChange}
+                onCreateAccount={(prefill) => setCreateAccountPrefill(prefill)}
+              />
             )}
           />
-        </div>
-      </div>
+          {fieldError(errors.revenue_account?.message)}
+        </SettingsRow>
+      </SettingsGroup>
 
-      {/* Advanced (collapsible) */}
-      <div className="pt-4 border-t">
-        <button
-          type="button"
-          onClick={() => setAdvancedOpen((o) => !o)}
-          className="flex items-center gap-1.5 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors"
-          aria-expanded={advancedOpen}
-        >
-          <ChevronDown
-            className={cn('h-4 w-4 transition-transform duration-200', advancedOpen && 'rotate-180')}
-          />
-          {t('advanced_section')}
-        </button>
+      {moreOpen && (
+        <SettingsGroup label={t('more_fields')}>
+          <SettingsRow
+            label={t('number_label')}
+            htmlFor="article-number"
+            align="baseline"
+            help={t('number_hint')}
+          >
+            <SettingsInput id="article-number" className="tabular-nums" {...register('article_number')} />
+            {fieldError(errors.article_number?.message)}
+          </SettingsRow>
 
-        {advancedOpen && (
-          <div className="space-y-4 pt-4">
-            {/* Revenue account */}
-            <div className="space-y-2">
-              <Label>{t('revenue_account_label')}</Label>
+          <SettingsRow
+            label={t('name_en_label')}
+            htmlFor="article-name-en"
+            align="baseline"
+            help={t('name_en_hint')}
+          >
+            <SettingsInput
+              id="article-name-en"
+              placeholder={t('name_en_placeholder')}
+              {...register('name_en')}
+            />
+          </SettingsRow>
+
+          <SettingsRow
+            label={t('cost_price_label')}
+            htmlFor="article-cost"
+            align="baseline"
+            help={t('cost_price_hint')}
+          >
+            <SettingsInput
+              id="article-cost"
+              type="number"
+              step="0.01"
+              min="0"
+              className="w-28 flex-none tabular-nums"
+              onWheel={blurOnWheel}
+              {...register('cost_price', {
+                setValueAs: (v) => (v === '' || v == null ? undefined : Number(v)),
+              })}
+            />
+          </SettingsRow>
+
+          <SettingsRow label={t('ean_label')} htmlFor="article-ean" align="baseline">
+            <SettingsInput
+              id="article-ean"
+              placeholder={t('ean_placeholder')}
+              className="tabular-nums"
+              {...register('ean')}
+            />
+          </SettingsRow>
+
+          {type === 'tjanst' && (
+            <SettingsRow
+              label={t('housework_label')}
+              htmlFor="article-housework"
+              help={t('housework_hint')}
+            >
               <Controller
-                name="revenue_account"
+                name="housework_type"
                 control={control}
                 render={({ field }) => (
-                  <AccountCombobox
+                  <SettingsSelect
+                    id="article-housework"
                     value={field.value || ''}
-                    accounts={revenueAccounts}
-                    onChange={field.onChange}
-                    onCreateAccount={(prefill) => setCreateAccountPrefill(prefill)}
-                  />
+                    onChange={(e) => field.onChange(e.target.value)}
+                  >
+                    <option value="">{t('housework_none')}</option>
+                    <option value="ROT">{t('housework_rot')}</option>
+                    <option value="RUT">{t('housework_rut')}</option>
+                  </SettingsSelect>
                 )}
               />
-              <p className="text-xs text-muted-foreground">{t('revenue_account_hint')}</p>
-            </div>
+            </SettingsRow>
+          )}
 
-            {/* Cost price */}
-            <div className="space-y-2">
-              <Label htmlFor="cost_price">{t('cost_price_label')}</Label>
-              <Input
-                id="cost_price"
-                type="number"
-                step="0.01"
-                min="0"
-                className="tabular-nums"
-                {...register('cost_price', {
-                  setValueAs: (v) => (v === '' || v == null ? undefined : Number(v)),
-                })}
-              />
-              <p className="text-xs text-muted-foreground">{t('cost_price_hint')}</p>
-            </div>
+          <SettingsRow label={t('notes_label')} htmlFor="article-notes" align="baseline" borderless>
+            <SettingsTextarea
+              id="article-notes"
+              rows={2}
+              placeholder={t('notes_placeholder')}
+              {...register('notes')}
+            />
+          </SettingsRow>
+        </SettingsGroup>
+      )}
 
-            {/* EAN */}
-            <div className="space-y-2">
-              <Label htmlFor="ean">{t('ean_label')}</Label>
-              <Input
-                id="ean"
-                placeholder={t('ean_placeholder')}
-                className="tabular-nums"
-                {...register('ean')}
-              />
-            </div>
-
-            {/* Housework type (tjänst only) */}
-            {type === 'tjanst' && (
-              <div className="space-y-2">
-                <Label>{t('housework_label')}</Label>
-                <Controller
-                  name="housework_type"
-                  control={control}
-                  render={({ field }) => (
-                    <Select
-                      value={field.value || 'none'}
-                      onValueChange={(v) => field.onChange(v === 'none' ? '' : v)}
-                    >
-                      <SelectTrigger>
-                        <SelectValue placeholder={t('housework_placeholder')} />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="none">{t('housework_none')}</SelectItem>
-                        <SelectItem value="ROT">{t('housework_rot')}</SelectItem>
-                        <SelectItem value="RUT">{t('housework_rut')}</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  )}
-                />
-                <p className="text-xs text-muted-foreground">{t('housework_hint')}</p>
-              </div>
-            )}
-
-            {/* Notes */}
-            <div className="space-y-2">
-              <Label htmlFor="notes">{t('notes_label')}</Label>
-              <Textarea
-                id="notes"
-                placeholder={t('notes_placeholder')}
-                {...register('notes')}
-              />
-            </div>
-          </div>
-        )}
+      <div className="px-1 pt-6">
+        <button
+          type="button"
+          onClick={() => setMoreOpen((open) => !open)}
+          className="inline-flex items-center gap-2 text-[11px] font-medium uppercase tracking-wider text-muted-foreground transition-colors duration-150 hover:text-foreground"
+          aria-expanded={moreOpen}
+        >
+          <ChevronDown
+            className={cn('h-3.5 w-3.5 transition-transform duration-200', moreOpen && 'rotate-180')}
+            aria-hidden="true"
+          />
+          {t('more_fields')}
+        </button>
       </div>
 
-      {/* Submit */}
-      <div className="flex justify-end gap-2">
-        <Button
-          type="submit"
-          disabled={isLoading || !canWrite}
-          title={!canWrite ? t('viewer_disabled_tooltip') : undefined}
-        >
-          {isLoading ? (
-            <>
-              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              {t('submit_saving')}
-            </>
-          ) : !canWrite ? (
-            <>
-              <Lock className="mr-2 h-4 w-4" />
-              {t('submit_save')}
-            </>
-          ) : (
-            t('submit_save')
+      {/* The line this article becomes. Full-bleed against the dialog's p-6. */}
+      <div className="-mx-6 mt-6 flex flex-wrap items-baseline gap-x-3 gap-y-1 border-t border-border bg-muted/60 px-6 py-3 text-xs text-muted-foreground">
+        <span className="max-w-[46%] break-words font-display text-[15px] leading-snug text-foreground">
+          {watchedName || t('summary_unnamed')}
+        </span>
+        <span aria-hidden="true" className="opacity-50">·</span>
+        <span className="tabular-nums">1 {watchedUnit}</span>
+        <span aria-hidden="true" className="opacity-50">·</span>
+        <span className="tabular-nums text-foreground">{formatCurrency(price, currency)}</span>
+        {effectiveVat > 0 && (
+          <>
+            <span>{t('summary_plus_vat')}</span>
+            <span className="tabular-nums text-foreground">{formatCurrency(vatAmount, currency)}</span>
+          </>
+        )}
+        {watchedAccount ? (
+          <>
+            <span aria-hidden="true" className="opacity-50">·</span>
+            <span className="tabular-nums">
+              {t('summary_booked_on')} {watchedAccount}
+            </span>
+          </>
+        ) : null}
+        <span className="ml-auto font-display text-[17px] tabular-nums text-foreground">
+          {formatCurrency(totalInclVat, currency)}
+        </span>
+      </div>
+
+      <div className="-mx-6 -mb-6 flex flex-wrap items-center gap-3 px-6 pb-6 pt-4">
+        {!watchedNumber && (
+          <p className="max-w-[30ch] text-xs leading-relaxed text-muted-foreground">
+            {t('number_hint')}
+          </p>
+        )}
+        <div className="ml-auto flex items-center gap-2">
+          {onCancel && (
+            <Button type="button" variant="ghost" onClick={onCancel}>
+              {tCommon('cancel')}
+            </Button>
           )}
-        </Button>
+          <Button
+            type="submit"
+            disabled={isLoading || !canWrite}
+            title={!canWrite ? t('viewer_disabled_tooltip') : undefined}
+          >
+            {isLoading ? (
+              <>
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                {t('submit_saving')}
+              </>
+            ) : !canWrite ? (
+              <>
+                <Lock className="mr-2 h-4 w-4" />
+                {t('submit_save')}
+              </>
+            ) : (
+              t('submit_save')
+            )}
+          </Button>
+        </div>
       </div>
 
       {/* Inline custom-account creation (renders in a portal, outside the form).
           After create: refresh the chart and select the new number as the
-          article's revenue account — mirrors the journal entry form. */}
+          article's posting account: mirrors the journal entry form. */}
       <AddAccountDialog
         open={createAccountPrefill != null}
         onOpenChange={(next) => {

@@ -1,17 +1,21 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
+import { fetchAllRows } from '@/lib/supabase/fetch-all'
 import { cookies } from 'next/headers'
+import type { EntityType } from '@/types'
 
 const COMPANY_COOKIE = 'gnubok-company-id'
 
 /**
  * Thrown by setActiveCompany so callers can tell a permissions problem
  * ('not_member') apart from a failed/unverified database write
- * ('persist_failed') and surface the right message to the user.
+ * ('persist_failed'), and by getActiveCompanyId when a resolution query
+ * fails ('resolution_failed': the active company is unknown right now,
+ * which is NOT the same as the user having no companies).
  */
 export class CompanyContextError extends Error {
   constructor(
     message: string,
-    readonly code: 'not_member' | 'persist_failed'
+    readonly code: 'not_member' | 'persist_failed' | 'resolution_failed'
   ) {
     super(message)
     this.name = 'CompanyContextError'
@@ -30,23 +34,107 @@ export class CompanyContextError extends Error {
  * Having Next.js and RLS both read from `user_preferences` keeps them
  * perfectly in sync.
  *
- * Returns null if the user has no non-archived companies.
+ * RPC-first: tries `resolve_active_company()` (one round trip, semantically
+ * identical to the query path and to `current_active_company_id()`), falling
+ * back to the original query path when the function is not deployed
+ * (PGRST202), the caller lacks EXECUTE (42501: service-role clients), or the
+ * RPC returns zero rows (NULL auth.uid(), also service-role clients).
+ *
+ * Returns null only when the user positively has no non-archived companies.
+ * Throws CompanyContextError('resolution_failed') when a query fails: a
+ * transient failure must never read as "no companies", because callers
+ * redirect that state to the onboarding wizard (issue #1053).
  */
 export async function getActiveCompanyId(
   supabase: SupabaseClient,
   userId: string
 ): Promise<string | null> {
-  // 1. user_preferences — authoritative
-  const { data: prefs } = await supabase
-    .from('user_preferences')
-    .select('active_company_id')
-    .eq('user_id', userId)
-    .maybeSingle()
+  const { data, error } = await supabase.rpc('resolve_active_company')
+
+  if (error) {
+    // PGRST202: function not in the schema cache (self-hosted instance not
+    // migrated yet, or a deploy racing the branch merge).
+    // 42501: EXECUTE is granted to `authenticated` only, so a service-role
+    // client is refused. These fallbacks are LOAD-BEARING, not defensive:
+    // app/api/mcp-oauth/token/route.ts and app/api/events/route.ts (API-key
+    // branch) call requireCompanyId with createServiceClientNoCookies(), and
+    // must silently resolve via the query path or the OAuth token flow breaks.
+    if (error.code === 'PGRST202' || error.code === '42501') {
+      return getActiveCompanyIdViaQueries(supabase, userId)
+    }
+    throw new CompanyContextError(
+      `Active company resolution failed: ${error.message}`,
+      'resolution_failed'
+    )
+  }
+
+  const row = (Array.isArray(data) ? data[0] : data) as
+    | { company_id: string | null; locale: string | null; used_fallback: boolean }
+    | undefined
+    | null
+
+  if (!row) {
+    // Zero rows = NULL auth.uid() inside the RPC, i.e. a service-role client
+    // (same call sites as the 42501 branch above). The query path filters by
+    // the explicit userId param and still resolves correctly.
+    return getActiveCompanyIdViaQueries(supabase, userId)
+  }
+
+  return row.company_id ?? null
+}
+
+/**
+ * Query-path resolution: the pre-RPC implementation, kept verbatim as the
+ * fallback for getActiveCompanyId (see the fallback conditions there).
+ */
+async function getActiveCompanyIdViaQueries(
+  supabase: SupabaseClient,
+  userId: string
+): Promise<string | null> {
+  // user_preferences (authoritative) + first membership, fetched in parallel:
+  // the fallback query result doubles as validation when the preferred
+  // company happens to be the first membership, which is the common
+  // single-company case. Most requests pay one round trip instead of two
+  // sequential ones. This runs on every withRouteContext API request and
+  // every dashboard layout render, so the sequential version was pure
+  // wall-clock cost. Mirrors resolveCompanyForMiddleware, minus the
+  // write-back (read paths shouldn't write).
+  const [prefsRes, firstRes] = await Promise.all([
+    supabase
+      .from('user_preferences')
+      .select('active_company_id')
+      .eq('user_id', userId)
+      .maybeSingle(),
+    supabase
+      .from('company_members')
+      .select('company_id, companies!inner(archived_at)')
+      .eq('user_id', userId)
+      .is('companies.archived_at', null)
+      .order('created_at', { ascending: true })
+      .limit(1)
+      .maybeSingle(),
+  ])
+
+  const resolutionError = prefsRes.error ?? firstRes.error
+  if (resolutionError) {
+    throw new CompanyContextError(
+      `Active company resolution failed: ${resolutionError.message}`,
+      'resolution_failed'
+    )
+  }
+
+  const prefs = prefsRes.data
+  const firstCompany = firstRes.data
 
   if (prefs?.active_company_id) {
-    // Validate the preference still points to a non-archived company the
-    // user is a member of.
-    const { data: membership } = await supabase
+    if (firstCompany && prefs.active_company_id === firstCompany.company_id) {
+      return firstCompany.company_id
+    }
+
+    // Preference points at a different company than the first membership:
+    // validate it still resolves to a non-archived company the user is a
+    // member of before trusting it.
+    const { data: membership, error: membershipError } = await supabase
       .from('company_members')
       .select('company_id, companies!inner(archived_at)')
       .eq('company_id', prefs.active_company_id)
@@ -54,20 +142,83 @@ export async function getActiveCompanyId(
       .is('companies.archived_at', null)
       .maybeSingle()
 
+    // Falling back to the first membership on a FAILED validation would
+    // silently switch a multi-company user's active company: fail loudly.
+    if (membershipError) {
+      throw new CompanyContextError(
+        `Active company validation failed: ${membershipError.message}`,
+        'resolution_failed'
+      )
+    }
+
     if (membership) return membership.company_id
   }
 
-  // 2. Fallback: first non-archived membership by created_at
-  const { data: firstCompany } = await supabase
-    .from('company_members')
-    .select('company_id, companies!inner(archived_at)')
-    .eq('user_id', userId)
-    .is('companies.archived_at', null)
-    .order('created_at', { ascending: true })
-    .limit(1)
+  // Fallback: first non-archived membership by created_at (already fetched)
+  return firstCompany?.company_id ?? null
+}
+
+/**
+ * Resolve a company's effective entity type.
+ *
+ * `company_settings.entity_type` is the read-primary source (what the user
+ * edits in settings and what the sidebar reads), with the canonical
+ * `companies.entity_type` as the fallback: mirroring app/api/settings and the
+ * report engines. Returns null only if the company can't be found.
+ */
+export async function getCompanyEntityType(
+  supabase: SupabaseClient,
+  companyId: string
+): Promise<EntityType | null> {
+  const { data: settings } = await supabase
+    .from('company_settings')
+    .select('entity_type')
+    .eq('company_id', companyId)
     .maybeSingle()
 
-  return firstCompany?.company_id ?? null
+  if (settings?.entity_type) return settings.entity_type as EntityType
+
+  const { data: company } = await supabase
+    .from('companies')
+    .select('entity_type')
+    .eq('id', companyId)
+    .maybeSingle()
+
+  return (company?.entity_type as EntityType | undefined) ?? null
+}
+
+/**
+ * Resolve a company's current display name.
+ *
+ * `company_settings.company_name` is the read-primary source (what the user
+ * edits in Settings and what the invoice PDF renders), with the canonical
+ * `companies.name` as the fallback. `companies.name` is written once at
+ * onboarding (via create_company_with_owner) and never updated afterwards, so
+ * reading it directly shows a stale name after a rename (e.g. a lagerbolag
+ * renamed post-signup). Mirrors getCompanyEntityType and the invoice surfaces.
+ *
+ * Returns null only if the company can't be resolved from either table.
+ */
+export async function getCompanyDisplayName(
+  supabase: SupabaseClient,
+  companyId: string
+): Promise<string | null> {
+  const { data: settings } = await supabase
+    .from('company_settings')
+    .select('company_name')
+    .eq('company_id', companyId)
+    .maybeSingle()
+
+  // Truthiness (not != null) so an empty string falls through to companies.name.
+  if (settings?.company_name) return settings.company_name as string
+
+  const { data: company } = await supabase
+    .from('companies')
+    .select('name')
+    .eq('id', companyId)
+    .maybeSingle()
+
+  return (company?.name as string | undefined) ?? null
 }
 
 /**
@@ -77,26 +228,27 @@ export async function getUserCompanies(
   supabase: SupabaseClient,
   userId: string
 ) {
-  const { data, error } = await supabase
-    .from('company_members')
-    .select(`
-      company_id,
-      role,
-      joined_at,
-      companies:company_id (
+  return fetchAllRows(({ from, to }) =>
+    supabase
+      .from('company_members')
+      .select(`
         id,
-        name,
-        org_number,
-        entity_type,
-        archived_at,
-        created_at
-      )
-    `)
-    .eq('user_id', userId)
-    .order('joined_at', { ascending: true })
-
-  if (error) throw error
-  return data ?? []
+        company_id,
+        role,
+        joined_at,
+        companies:company_id (
+          id,
+          name,
+          org_number,
+          entity_type,
+          archived_at,
+          created_at
+        )
+      `)
+      .eq('user_id', userId)
+      .order('id', { ascending: true })
+      .range(from, to),
+  )
 }
 
 /**
@@ -123,7 +275,7 @@ export async function setActiveCompany(
     throw new CompanyContextError('User is not a member of this company', 'not_member')
   }
 
-  // Update user_preferences — this is the authoritative value RLS reads.
+  // Update user_preferences: this is the authoritative value RLS reads.
   // The write MUST be verified: an UPDATE filtered out by RLS affects zero
   // rows without raising an error, which previously made failed switches
   // look successful while middleware kept resolving the old company (#701).
@@ -151,7 +303,7 @@ export async function setActiveCompany(
     )
   }
 
-  // Refresh the cookie as a compat hint — only after the DB write is
+  // Refresh the cookie as a compat hint: only after the DB write is
   // confirmed, so the cookie can never diverge from user_preferences.
   const cookieStore = await cookies()
   cookieStore.set(COMPANY_COOKIE, companyId, {

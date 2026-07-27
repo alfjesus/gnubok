@@ -4,9 +4,17 @@ import { validateBody } from '@/lib/api/validate'
 import { BulkBookSchema } from '@/lib/api/schemas'
 import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
 import { applyTemplate } from '@/lib/bookkeeping/template-library'
+import { mergeDimensionBags } from '@/lib/bookkeeping/dimension-resolver'
+import {
+  applyDimensionRules,
+  assertMandatoryDimensions,
+  fetchActiveDimensionRules,
+} from '@/lib/bookkeeping/dimension-rules'
+import { bookkeepingErrorResponse } from '@/lib/bookkeeping/errors'
 import { eventBus } from '@/lib/events/bus'
 import { ensureInitialized } from '@/lib/init'
 import type { BookingTemplateLibraryLine, Transaction } from '@/types'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 ensureInitialized()
 
@@ -34,6 +42,9 @@ interface ComputedLine {
   currency: string
   line_description?: string
   sort_order?: number
+  // Dimensions PR7: bag persisted by the RPC onto journal_entry_lines
+  // (with cost_center/project mirrors derived server-side).
+  dimensions?: Record<string, string>
 }
 
 function round2(n: number): number {
@@ -46,10 +57,10 @@ function round2(n: number): number {
  * Bulk-book N bank transactions on the same date into one combined
  * verifikat (samlingsverifikation per BFL 5 kap 6§). Two flows:
  *
- *  1. Link to existing voucher — { tx_ids, existing_journal_entry_id }.
+ *  1. Link to existing voucher: { tx_ids, existing_journal_entry_id }.
  *     No new JE; the RPC just inserts N transaction_voucher_links rows.
  *
- *  2. Create new from template — { tx_ids, template_id, mode,
+ *  2. Create new from template: { tx_ids, template_id, mode,
  *     entry_description }. The route fetches the template, expands it
  *     per the chosen mode, and passes the resulting balanced lines to
  *     the RPC. The RPC then commits the verifikat atomically.
@@ -71,6 +82,66 @@ export const POST = withRouteContext(
 
     const opLog = log.child({ txCount: body.tx_ids.length })
 
+    // Fetch the selected txs ONCE, up front, for every path. The template
+    // branch needs the amounts to expand the template; all three branches
+    // need the currencies for the homogeneity gate below.
+    const { data: txs, error: txError } = await supabase
+      .from('transactions')
+      .select('id, amount, currency, description, date')
+      .in('id', body.tx_ids)
+      .eq('company_id', companyId)
+
+    if (txError || !txs || txs.length === 0) {
+      return errorResponseFromCode('BULK_BOOK_TXS_NOT_FOUND', opLog, { requestId })
+    }
+    if (txs.length !== body.tx_ids.length) {
+      return errorResponseFromCode('BULK_BOOK_TXS_NOT_FOUND', opLog, {
+        requestId,
+        details: { expected: body.tx_ids.length, found: txs.length },
+      })
+    }
+
+    const txTyped = txs as Pick<Transaction, 'id' | 'amount' | 'currency' | 'description' | 'date'>[]
+
+    // Currency homogeneity, enforced BEFORE the branch split so it covers
+    // all three paths (template, manual_lines, existing_journal_entry_id).
+    // BFL 4 kap 6 § requires the bokföring to be presented in one and the
+    // same redovisningsvaluta. A samlingsverifikation mixing e.g. SEK and
+    // EUR has no representable single belopp: summing the raw amounts adds
+    // 100 EUR to 100 SEK as if they were one unit, and the verifikat would
+    // then state an amount matching no affärshändelse (BFL 5 kap 7 §
+    // "belopp"). Nothing the caller can pass makes that correct without
+    // per-tx FX rates, so this refuses instead of warning. Mirrors the MCP
+    // twin (gnubok_bulk_book_transactions), which guards the same three
+    // paths; cross-currency batches belong in the FX-aware batch-allocate
+    // flow (kursdifferens on 7960/3960).
+    // NULL currency is legacy for the column default 'SEK' (the codebase
+    // reads it that way everywhere), so it is normalized before comparison:
+    // a NULL/SEK selection is not a currency mix and must stay bookable.
+    const currencies = new Set(txTyped.map((t) => t.currency ?? 'SEK'))
+    if (currencies.size > 1) {
+      return errorResponseFromCode('BULK_BOOK_MIXED_CURRENCY', opLog, {
+        requestId,
+        details: { currencies: Array.from(currencies).sort() },
+      })
+    }
+    const currency = txTyped[0]!.currency ?? 'SEK'
+
+    // A HOMOGENEOUS foreign batch is refused too: the RPC writes the line
+    // amounts into journal_entry_lines.debit_amount/credit_amount, which are
+    // ALWAYS kronor, and neither the route nor the RPC carries an exchange
+    // rate here. Two EUR transactions of 100 + 200 would produce a verifikat
+    // whose 300 is read as kronor by balansräkning, momsdeklaration and SIE
+    // export. Foreign-currency transactions are booked individually through
+    // the FX-aware flows, which resolve a rate and book the kursdifferens.
+    // The RPC enforces the same refusal for callers that bypass this route.
+    if (currency !== 'SEK') {
+      return errorResponseFromCode('BULK_BOOK_FOREIGN_CURRENCY', opLog, {
+        requestId,
+        details: { currency },
+      })
+    }
+
     // Three paths now (PR #608):
     //   1. existing_journal_entry_id → null new_entry, RPC links txs to JE.
     //   2. template_id → route expands template per mode, builds lines.
@@ -81,7 +152,7 @@ export const POST = withRouteContext(
       // Manual mode. The Zod schema validated the 4-digit format; the
       // RPC's balance + bank-leg + negative-amount + both-sides-nonzero
       // guards still run downstream. What's missing is verifying the
-      // account_numbers exist in this company's chart_of_accounts —
+      // account_numbers exist in this company's chart_of_accounts:
       // without it a typo or adversarial caller could post to a BAS
       // account that doesn't exist, corrupting the hauptbok and
       // breaking SIE export. Single roundtrip allowlist check.
@@ -98,7 +169,7 @@ export const POST = withRouteContext(
         opLog.error('chart_of_accounts lookup failed', accountsError)
         return errorResponseFromCode('BULK_BOOK_RPC_FAILED', opLog, {
           requestId,
-          details: { message: accountsError.message },
+          details: { message: getUserErrorMessage(accountsError) },
         })
       }
       const validSet = new Set(
@@ -120,6 +191,8 @@ export const POST = withRouteContext(
           currency: l.currency,
           line_description: l.line_description,
           sort_order: i,
+          // Dimensions PR7: per-line bag wins over the header default.
+          dimensions: mergeDimensionBags(body.default_dimensions, l.dimensions),
         })),
       }
     } else if (body.template_id && body.mode && body.entry_description) {
@@ -143,40 +216,9 @@ export const POST = withRouteContext(
 
       const templateLines = (template.lines ?? []) as BookingTemplateLibraryLine[]
 
-      // Need each tx's amount + currency to expand per mode. The RPC also
-      // re-validates (date, direction, not-already-booked) but we need the
-      // amount sum to drive the template expansion.
-      const { data: txs, error: txError } = await supabase
-        .from('transactions')
-        .select('id, amount, currency, description, date')
-        .in('id', body.tx_ids)
-        .eq('company_id', companyId)
-
-      if (txError || !txs || txs.length === 0) {
-        return errorResponseFromCode('BULK_BOOK_TXS_NOT_FOUND', opLog, { requestId })
-      }
-      if (txs.length !== body.tx_ids.length) {
-        return errorResponseFromCode('BULK_BOOK_TXS_NOT_FOUND', opLog, {
-          requestId,
-          details: { expected: body.tx_ids.length, found: txs.length },
-        })
-      }
-
-      const txTyped = txs as Pick<Transaction, 'id' | 'amount' | 'currency' | 'description' | 'date'>[]
-
-      // Same-currency invariant for v1. Mixed-currency batches would need
-      // FX conversion per tx; out of scope. Use the dedicated
-      // BULK_BOOK_MIXED_CURRENCY code so the toast doesn't blame direction
-      // (PR #606 review fix).
-      const currencies = new Set(txTyped.map((t) => t.currency))
-      if (currencies.size > 1) {
-        return errorResponseFromCode('BULK_BOOK_MIXED_CURRENCY', opLog, {
-          requestId,
-          details: { currencies: Array.from(currencies) },
-        })
-      }
-      const currency = txTyped[0]!.currency
-
+      // The tx rows (amount + currency) were fetched and currency-gated
+      // above; the RPC still re-validates date, direction, and
+      // not-already-booked.
       const txAbsAmounts = txTyped.map((t) => Math.abs(t.amount))
       const totalAbs = round2(txAbsAmounts.reduce((s, a) => s + a, 0))
 
@@ -199,10 +241,12 @@ export const POST = withRouteContext(
             currency,
             line_description: formLine.line_description || undefined,
             sort_order: sortOrder++,
+            // Dimensions PR7: header default applies to all template lines.
+            dimensions: body.default_dimensions,
           })
         }
       } else {
-        // one_line_per_tx — apply template per tx, prefix description with
+        // one_line_per_tx: apply template per tx, prefix description with
         // a short tx reference so the verifikat preserves per-row audit
         // detail (BFL 5 kap 7§ motpart identification).
         for (const tx of txTyped) {
@@ -218,9 +262,11 @@ export const POST = withRouteContext(
               credit_amount: round2(credit),
               currency,
               line_description: txTag
-                ? `${formLine.line_description ?? ''} – ${txTag}`.trim()
+                ? `${formLine.line_description ?? ''}: ${txTag}`.trim()
                 : formLine.line_description || undefined,
               sort_order: sortOrder++,
+              // Dimensions PR7: header default applies to all template lines.
+              dimensions: body.default_dimensions,
             })
           }
         }
@@ -229,6 +275,28 @@ export const POST = withRouteContext(
       newEntryPayload = {
         description: body.entry_description,
         lines,
+      }
+    }
+
+    // Account dimension rules (dimensions PR10): the bulk-book RPC bypasses
+    // the TS engine, so the policy layer runs here — defaults/fixed applied
+    // to the computed lines, then 'required' asserted. Zero rules (the
+    // default) or a failed fetch changes nothing (fail-open, same posture as
+    // the engine).
+    if (newEntryPayload) {
+      const rules = await fetchActiveDimensionRules(supabase, companyId!)
+      if (rules === null) {
+        opLog.warn('dimension rule fetch failed — policy skipped (fail-open)')
+      }
+      if (rules && rules.length > 0) {
+        newEntryPayload.lines = applyDimensionRules(newEntryPayload.lines, rules)
+        try {
+          assertMandatoryDimensions(newEntryPayload.lines, rules)
+        } catch (err) {
+          const mapped = bookkeepingErrorResponse(err)
+          if (mapped) return mapped
+          throw err
+        }
       }
     }
 
@@ -245,7 +313,7 @@ export const POST = withRouteContext(
       opLog.error('bulk_book_transactions RPC error', error)
       return errorResponseFromCode('BULK_BOOK_RPC_FAILED', opLog, {
         requestId,
-        details: { message: error.message },
+        details: { message: getUserErrorMessage(error) },
       })
     }
 

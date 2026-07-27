@@ -16,9 +16,16 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { RetentionNotice } from '@/components/ui/retention-notice'
+import {
+  SettingsDangerZone,
+  SettingsRow,
+  SettingsRowEnd,
+  SettingsRowNote,
+} from '@/components/settings/SettingsRows'
 import { Loader2 } from 'lucide-react'
 import { useToast } from '@/components/ui/use-toast'
 import { getBranding } from '@/lib/branding/service'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 const branding = getBranding()
 
@@ -35,6 +42,7 @@ const branding = getBranding()
  */
 export function CompanyDangerZone() {
   const t = useTranslations('settings_company')
+  const tRetention = useTranslations('retention_notice')
   const router = useRouter()
   const { toast } = useToast()
   const { company, role } = useCompany()
@@ -72,7 +80,7 @@ export function CompanyDangerZone() {
     } catch (err) {
       toast({
         title: t('danger_delete_failed_title'),
-        description: err instanceof Error ? err.message : t('danger_try_again'),
+        description: err instanceof Error ? getUserErrorMessage(err) : t('danger_try_again'),
         variant: 'destructive',
       })
       setIsDeleting(false)
@@ -81,23 +89,26 @@ export function CompanyDangerZone() {
 
   return (
     <>
-      <section className="space-y-4 border-t border-border/8 pt-8">
-        <h2 className="text-sm font-medium uppercase tracking-wider text-destructive/80">
-          {t('danger_heading')}
-        </h2>
-
-        <RetentionNotice variant="company" />
-
-        <div className="flex justify-end">
-          <Button
-            variant="destructive"
-            className="w-full sm:w-auto"
-            onClick={() => setShowDialog(true)}
-          >
-            {t('danger_button')}
-          </Button>
-        </div>
-      </section>
+      <SettingsDangerZone label={t('danger_heading')}>
+        <SettingsRow
+          label={t('danger_button')}
+          borderless
+          // The full BFL retention copy (incl. the backup link) lives behind
+          // the "?": the visible row stays one quiet line.
+          help={<RetentionNotice variant="company" className="border-0 bg-transparent p-0" />}
+        >
+          <SettingsRowNote>{tRetention('company_title')}</SettingsRowNote>
+          <SettingsRowEnd>
+            <button
+              type="button"
+              onClick={() => setShowDialog(true)}
+              className="text-sm font-medium text-destructive underline underline-offset-2 transition-colors duration-150 hover:text-destructive/80"
+            >
+              {t('danger_button')}
+            </button>
+          </SettingsRowEnd>
+        </SettingsRow>
+      </SettingsDangerZone>
 
       <Dialog
         open={showDialog}

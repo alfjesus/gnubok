@@ -1,10 +1,11 @@
 'use client'
 
-import { useState, useEffect } from 'react'
-import { useTranslations } from 'next-intl'
+import { useState, useEffect, useId } from 'react'
+import { useLocale, useTranslations } from 'next-intl'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { createClient } from '@/lib/supabase/client'
+import { AttnLine } from '@/components/ui/attn-line'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -19,47 +20,88 @@ import {
 import { RetentionNotice } from '@/components/ui/retention-notice'
 import { ExternalLink, Loader2 } from 'lucide-react'
 import { SupportLink } from '@/components/ui/support-link'
-
-interface Blocker {
-  id: string
-  name: string
-}
+import { getErrorMessage as getUserErrorMessage, type ErrorLocale } from '@/lib/errors/get-error-message'
+import {
+  canDeleteAccount,
+  type OwnedCompanyBlocker,
+} from '@/components/settings/account-deletion'
+import {
+  SettingsDangerZone,
+  SettingsRow,
+  SettingsRowEnd,
+  SettingsRowNote,
+} from '@/components/settings/SettingsRows'
 
 export function AccountDangerZone() {
   const t = useTranslations('settings_account_danger')
+  const tRetention = useTranslations('retention_notice')
+  const errorLocale = useLocale() as ErrorLocale
   const router = useRouter()
   const [email, setEmail] = useState<string | null>(null)
-  const [blockers, setBlockers] = useState<Blocker[]>([])
-  const [blockersLoading, setBlockersLoading] = useState(true)
+  // null = the blocker list is not known: still loading, or the read failed
+  // (loadError). "Cannot read the blockers" must mean "cannot permit
+  // deletion", never "no blockers": canDeleteAccount() only unlocks the
+  // button for a confirmed empty list.
+  const [blockers, setBlockers] = useState<OwnedCompanyBlocker[] | null>(null)
+  // detail === null: transient, so the line carries a retry. A detail sentence
+  // means the user has to act (an expired session) and a retry cannot help.
+  const [loadError, setLoadError] = useState<{ detail: string | null } | null>(null)
+  const [reloadKey, setReloadKey] = useState(0)
   const [showDialog, setShowDialog] = useState(false)
   const [confirmText, setConfirmText] = useState('')
   const [isDeleting, setIsDeleting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const errorId = useId()
 
   useEffect(() => {
     let cancelled = false
 
     async function load() {
+      setLoadError(null)
       const supabase = createClient()
       const { data: { user } } = await supabase.auth.getUser()
       if (!cancelled) setEmail(user?.email ?? null)
 
       try {
         const res = await fetch('/api/company?owned=true&archived=false')
-        if (res.ok) {
-          const body = await res.json()
-          if (!cancelled) setBlockers(body.data ?? [])
+        if (!res.ok) {
+          // Not-JSON bodies (an HTML error page, an empty 502) leave null, and
+          // getErrorMessage falls back to the status map.
+          const body = await res.json().catch(() => null)
+          if (cancelled) return
+          const sessionGone = res.status === 401 || res.status === 403
+          setBlockers(null)
+          setLoadError({
+            detail: sessionGone
+              ? getUserErrorMessage(body, { statusCode: res.status, locale: errorLocale })
+              : null,
+          })
+          return
         }
-      } finally {
-        if (!cancelled) setBlockersLoading(false)
+        // A 200 whose body will not parse throws into the catch below; a 200
+        // whose data is not a list is a failed read too. Neither may become a
+        // fabricated "no blockers".
+        const body = await res.json()
+        if (cancelled) return
+        if (Array.isArray(body?.data)) {
+          setBlockers(body.data)
+        } else {
+          setBlockers(null)
+          setLoadError({ detail: null })
+        }
+      } catch {
+        if (!cancelled) {
+          setBlockers(null)
+          setLoadError({ detail: null })
+        }
       }
     }
 
-    load()
+    void load()
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [reloadKey, errorLocale])
 
   async function handleDelete() {
     if (!email) return
@@ -76,10 +118,22 @@ export function AccountDangerZone() {
       })
 
       if (response.status === 409) {
-        const body = await response.json()
-        // Precondition tripped mid-flow — refresh the list and show inline.
-        setBlockers(body.blockers ?? [])
-        setError(body.error || t('delete_failed_blockers'))
+        const body = await response.json().catch(() => null)
+        // Precondition tripped mid-flow: refresh the list and show inline. A
+        // 409 without a readable list still means blockers exist, so drop to
+        // unknown (button stays locked) and re-read the authoritative list
+        // instead of fabricating an empty one.
+        if (Array.isArray(body?.blockers)) {
+          setBlockers(body.blockers)
+        } else {
+          setBlockers(null)
+          setReloadKey((k) => k + 1)
+        }
+        setError(
+          typeof body?.error === 'string' && body.error
+            ? body.error
+            : t('delete_failed_blockers'),
+        )
         setIsDeleting(false)
         setShowDialog(false)
         return
@@ -92,71 +146,89 @@ export function AccountDangerZone() {
 
       router.push('/login')
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('delete_failed_default'))
+      setError(err instanceof Error ? getUserErrorMessage(err) : t('delete_failed_default'))
       setIsDeleting(false)
     }
   }
 
-  const hasBlockers = blockers.length > 0
-  const canDelete = !hasBlockers && !blockersLoading
+  const canDelete = canDeleteAccount(blockers)
 
   return (
     <>
-      <section className="space-y-4 border-t border-border/8 pt-8">
-        <h2 className="text-sm font-medium uppercase tracking-wider text-destructive/80">
-          {t('heading')}
-        </h2>
+      <SettingsDangerZone label={t('heading')}>
+        {/* Owned companies block deletion: functional state, kept visible as
+            rows (only the first row carries the label and the why-help). */}
+        {blockers !== null &&
+          blockers.map((b, i) => (
+            <SettingsRow
+              key={b.id}
+              label={i === 0 ? t('blockers_title') : ''}
+              help={i === 0 ? t('blockers_description') : undefined}
+            >
+              <span className="text-sm">{b.name}</span>
+              <SettingsRowEnd>
+                <Button variant="outline" size="sm" asChild>
+                  <Link href="/settings/company">{t('blockers_manage')}</Link>
+                </Button>
+              </SettingsRowEnd>
+            </SettingsRow>
+          ))}
 
-        {hasBlockers && (
-          <div className="rounded-lg border border-border/60 bg-muted/30 p-4 space-y-3">
-            <p className="text-sm font-medium">{t('blockers_title')}</p>
-            <p className="text-sm text-muted-foreground">
-              {t('blockers_description')}
-            </p>
-            <ul className="space-y-2">
-              {blockers.map((b) => (
-                <li
-                  key={b.id}
-                  className="flex items-center justify-between rounded-md border border-border/40 bg-background px-3 py-2"
-                >
-                  <span className="text-sm font-medium">{b.name}</span>
-                  <Button variant="ghost" size="sm" asChild>
-                    <Link href="/settings/company">{t('blockers_manage')}</Link>
-                  </Button>
-                </li>
-              ))}
-            </ul>
+        <SettingsRow
+          label={t('delete_button')}
+          borderless
+          // The full anonymization/BFL retention copy (incl. the backup link)
+          // lives behind the "?": the visible row stays one quiet line.
+          help={<RetentionNotice variant="account" className="border-0 bg-transparent p-0" />}
+        >
+          <SettingsRowNote>{tRetention('account_title')}</SettingsRowNote>
+          {/* Live region always mounted so the failure is announced when it
+              appears, not merely inserted. */}
+          <div id={errorId} role="status" aria-live="polite" className="min-w-0">
+            {loadError && (
+              <AttnLine
+                action={
+                  loadError.detail
+                    ? undefined
+                    : { label: t('blockers_load_retry'), onClick: () => setReloadKey((k) => k + 1) }
+                }
+              >
+                {loadError.detail
+                  ? `${t('blockers_load_failed')} ${loadError.detail}`
+                  : t('blockers_load_failed')}
+              </AttnLine>
+            )}
           </div>
-        )}
-
-        <RetentionNotice variant="account" />
-
-        <p className="text-sm text-muted-foreground">
-          {t('support_question')}{' '}
-          <SupportLink variant="inline" subject={t('support_subject')} />
-        </p>
+          <SettingsRowEnd>
+            <Button variant="outline" size="sm" asChild>
+              <Link href="/reports?type=sie">
+                <ExternalLink className="mr-2 h-3.5 w-3.5" />
+                {t('export_sie')}
+              </Link>
+            </Button>
+            <button
+              type="button"
+              onClick={() => setShowDialog(true)}
+              disabled={!canDelete}
+              aria-describedby={loadError ? errorId : undefined}
+              className="text-sm font-medium text-destructive underline underline-offset-2 transition-colors duration-150 hover:text-destructive/80 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {t('delete_button')}
+            </button>
+          </SettingsRowEnd>
+        </SettingsRow>
 
         {error && !showDialog && (
-          <p className="text-sm text-destructive">{error}</p>
+          <p className="px-1 text-sm text-destructive">{error}</p>
         )}
 
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <Button variant="outline" className="w-full sm:w-auto" asChild>
-            <Link href="/reports?type=sie">
-              <ExternalLink className="mr-2 h-4 w-4" />
-              {t('export_sie')}
-            </Link>
-          </Button>
-          <Button
-            variant="destructive"
-            className="w-full sm:w-auto"
-            onClick={() => setShowDialog(true)}
-            disabled={!canDelete}
-          >
-            {t('delete_button')}
-          </Button>
-        </div>
-      </section>
+        <p className="px-1 pt-3">
+          <SettingsRowNote>
+            {t('support_question')}{' '}
+            <SupportLink variant="inline" subject={t('support_subject')} />
+          </SettingsRowNote>
+        </p>
+      </SettingsDangerZone>
 
       <Dialog
         open={showDialog}

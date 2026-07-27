@@ -1,5 +1,6 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { fetchAllRows } from '@/lib/supabase/fetch-all'
+import { fetchEntryLines, type EntryLinesQuery } from '@/lib/bookkeeping/entry-lines'
 import { getOpeningBalances } from './opening-balances'
 import type { TrialBalanceRow } from '@/types'
 
@@ -15,10 +16,20 @@ import type { TrialBalanceRow } from '@/types'
  * period. The function rolls the IB forward from `period_start` to
  * `fromDate − 1` (so "opening" reflects the state at `fromDate`) and limits
  * period activity to `[fromDate, toDate]`. Defaults equal `period_start` and
- * `period_end` — identical to the no-options behaviour.
+ * `period_end`: identical to the no-options behaviour.
  *
- * Uses joined queries with pagination to handle any number of entries.
- * Avoids the broken .in(entryIds) pattern that silently truncated at 1000 rows.
+ * When `dimensions` is passed (map of SIE dim number → object code, e.g.
+ * `{"6":"P001"}`, AND across keys), both line queries filter with jsonb
+ * containment (`dimensions @> …`, served by idx_jel_dimensions_gin). The
+ * result is then a PARTIAL view: opening balances from year-end closing are
+ * company-wide, so callers must only use the filter for P&L-style reports
+ * (classes 3-8) where IB is immaterial: never for balance/statutory reports.
+ * The catalog whitelist + statutory-guard test pin this.
+ *
+ * Uses the shared two-step entry-lines fetch (lib/bookkeeping/entry-lines.ts):
+ * entries first, then lines chunked by entry id, both paginated, so any
+ * number of entries is handled without the pathological journal_entries!inner
+ * embed plan (see entry-lines.ts for the full story).
  */
 export async function generateTrialBalance(
   supabase: SupabaseClient,
@@ -26,8 +37,10 @@ export async function generateTrialBalance(
   fiscalPeriodId: string,
   options?: {
     excludeYearEndClosing?: boolean
+    excludeFinalClosingEntry?: boolean
     fromDate?: string
     toDate?: string
+    dimensions?: Record<string, string>
   }
 ): Promise<{
   rows: TrialBalanceRow[]
@@ -36,121 +49,231 @@ export async function generateTrialBalance(
   isBalanced: boolean
 }> {
 
-  // Fetch period for opening balance computation
-  const { data: period } = await supabase
-    .from('fiscal_periods')
-    .select('period_start, period_end, opening_balance_entry_id')
-    .eq('id', fiscalPeriodId)
-    .eq('company_id', companyId)
-    .single()
+  const dimensionFilter =
+    options?.dimensions && Object.keys(options.dimensions).length > 0
+      ? options.dimensions
+      : undefined
+  const excludeAllYearEndEntries = options?.excludeYearEndClosing
 
-  // ── Opening balances (IB) at period_start ──────────────────────
-  const { balances: openingBalances, obEntryId } = await getOpeningBalances(
-    supabase, companyId, period
-  )
+  // Wave 1: the period row (for opening balance computation), the reversed
+  // year-end entry ids (only needed for excludeYearEndClosing), and the
+  // chart of accounts are mutually independent, so they share one parallel
+  // round trip instead of three sequential ones. The accounts list is now
+  // also fetched for reports that turn out empty or fail the closed-period
+  // guard below; that occasional extra read-only query is the price of a
+  // short critical path, and the returned data is unchanged.
+  const [periodResult, yearEndIdRows, accounts] = await Promise.all([
+    supabase
+      .from('fiscal_periods')
+      .select('period_start, period_end, opening_balance_entry_id, closing_entry_id, is_closed')
+      .eq('id', fiscalPeriodId)
+      .eq('company_id', companyId)
+      .single(),
+    excludeAllYearEndEntries
+      ? fetchAllRows<{ id: string }>(({ from, to }) =>
+          supabase
+            .from('journal_entries')
+            .select('id')
+            .eq('company_id', companyId)
+            .eq('source_type', 'year_end')
+            .eq('status', 'reversed')
+            .order('id', { ascending: true })
+            .range(from, to)
+        )
+      : Promise.resolve([] as Array<{ id: string }>),
+    // Account names for row labelling.
+    fetchAllRows<{
+      account_number: string
+      account_name: string
+      account_class: number
+    }>(({ from, to }) =>
+      supabase
+        .from('chart_of_accounts')
+        .select('account_number, account_name, account_class')
+        .eq('company_id', companyId)
+        .order('account_number', { ascending: true })
+        .range(from, to)
+    ),
+  ])
+  const { data: period } = periodResult
 
-  // ── Roll IB forward from period_start up to fromDate ───────────
+  // Existing operational reports intentionally exclude every year_end entry.
+  // Statutory annual reports must exclude only the linked final closing entry:
+  // tax, depreciation, and appropriations also use source_type year_end. A
+  // closed period without the link is ambiguous, so fail instead of silently
+  // understating the statutory report.
+  if (
+    options?.excludeFinalClosingEntry
+    && period?.is_closed === true
+    && !period.closing_entry_id
+  ) {
+    throw new Error(
+      'Closed fiscal period is missing closing_entry_id; statutory pre-closing balances cannot be generated safely',
+    )
+  }
+  const yearEndEntryIds: string[] = yearEndIdRows.map((r) => r.id)
+  const excludeYearEndChain = (query: EntryLinesQuery): EntryLinesQuery => {
+    let q = query.neq('source_type', 'year_end')
+    if (yearEndEntryIds.length > 0) {
+      const idList = `(${yearEndEntryIds.join(',')})`
+      q = q.or(`reverses_id.is.null,reverses_id.not.in.${idList}`)
+      q = q.or(`correction_of_id.is.null,correction_of_id.not.in.${idList}`)
+    }
+    return q
+  }
+
+  const closingEntryId = options?.excludeFinalClosingEntry
+    ? period?.closing_entry_id ?? null
+    : null
+  // The base query already admits only posted and reversed entries. Exclude a
+  // posted final closing entry, but retain a reversed one together with its
+  // storno so the two continue to net to zero. Draft entries never enter the
+  // base query.
+  const excludeClosingEntry = (query: EntryLinesQuery): EntryLinesQuery =>
+    closingEntryId
+      ? query.or(`id.neq.${closingEntryId},status.neq.posted`)
+      : query
+
+  // getOpeningBalances always reports the period's opening_balance_entry_id
+  // back as obEntryId (see lib/reports/opening-balances.ts), so the id is
+  // known before that fetch resolves and the line queries below can run in
+  // the same round trip as the opening-balance read.
+  const obEntryId = period?.opening_balance_entry_id ?? null
+
   // When the caller requests a sub-range starting after period_start, the
   // "opening" of that window must include all activity since the period
-  // started. We additively fold those lines into openingBalances so the
-  // downstream IB/period split stays correct without changing call sites.
-  if (
-    options?.fromDate &&
-    period?.period_start &&
-    options.fromDate > period.period_start
-  ) {
-    const priorLines = await fetchAllRows<{
+  // started (rolled forward below).
+  const rollForwardWindow =
+    options?.fromDate && period?.period_start && options.fromDate > period.period_start
+      ? { periodStart: period.period_start, fromDate: options.fromDate }
+      : null
+
+  // Wave 2: opening balances (IB) at period_start, the IB roll-forward
+  // slice, and the period lines are independent reads. The array order
+  // [OB, roll-forward, lines] keeps each table's queries in the same order
+  // the sequential version issued them.
+  const [obResult, priorLines, lines] = await Promise.all([
+    // ── Opening balances (IB) at period_start ──────────────────────
+    getOpeningBalances(supabase, companyId, period),
+    // ── Roll IB forward from period_start up to fromDate ───────────
+    rollForwardWindow
+      ? fetchEntryLines<{
+          id: string
+          account_number: string
+          debit_amount: number
+          credit_amount: number
+        }>({
+          supabase,
+          lineColumns: 'id, account_number, debit_amount, credit_amount',
+          filterEntries: (q: EntryLinesQuery) => {
+            let query = q
+              .eq('company_id', companyId)
+              .eq('fiscal_period_id', fiscalPeriodId)
+              .in('status', ['posted', 'reversed'])
+              .gte('entry_date', rollForwardWindow.periodStart)
+              .lt('entry_date', rollForwardWindow.fromDate)
+
+            if (obEntryId) {
+              query = query.neq('id', obEntryId)
+            }
+
+            if (excludeAllYearEndEntries) {
+              query = excludeYearEndChain(query)
+            }
+            if (options?.excludeFinalClosingEntry) {
+              query = excludeClosingEntry(query)
+            }
+
+            return query
+          },
+          filterLines: dimensionFilter
+            ? // jsonb containment (@>): served by idx_jel_dimensions_gin.
+              (q: EntryLinesQuery) => q.contains('dimensions', dimensionFilter)
+            : undefined,
+        })
+      : Promise.resolve(
+          [] as Array<{
+            id: string
+            account_number: string
+            debit_amount: number
+            credit_amount: number
+          }>
+        ),
+    // ── Period lines (excluding opening balance entry) ─────────────
+    // If year-end closing set an OB entry, exclude it from period lines so
+    // its values aren't double-counted (they're already captured as IB).
+    // Race condition note: if year-end closing runs concurrently and sets
+    // obEntryId between the period query and this query, the OB entry could
+    // be missed from both IB and period. The window is sub-second and the
+    // consequence is a single stale report: acceptable.
+    fetchEntryLines<{
+      id: string
       account_number: string
       debit_amount: number
       credit_amount: number
-    }>(({ from, to }) => {
-      let query = supabase
-        .from('journal_entry_lines')
-        .select('account_number, debit_amount, credit_amount, journal_entries!inner(company_id, fiscal_period_id, status, source_type, entry_date)')
-        .eq('journal_entries.company_id', companyId)
-        .eq('journal_entries.fiscal_period_id', fiscalPeriodId)
-        .in('journal_entries.status', ['posted', 'reversed'])
-        .gte('journal_entries.entry_date', period.period_start)
-        .lt('journal_entries.entry_date', options.fromDate)
+    }>({
+      supabase,
+      lineColumns: 'id, account_number, debit_amount, credit_amount',
+      filterEntries: (q: EntryLinesQuery) => {
+        let query = q
+          .eq('company_id', companyId)
+          .eq('fiscal_period_id', fiscalPeriodId)
+          .in('status', ['posted', 'reversed'])
 
-      if (obEntryId) {
-        query = query.neq('journal_entry_id', obEntryId)
-      }
+        // Date filters are only applied when the caller explicitly asks. The
+        // period itself is already enforced via fiscal_period_id, so adding
+        // redundant entry_date bounds for the default case would just
+        // increase query complexity (and break older mocks that don't stub gte
+        // /lte). The fiscal_period_id constraint plus a CHECK on entry_date in
+        // the engine keep activity inside the period.
+        if (options?.fromDate) {
+          query = query.gte('entry_date', options.fromDate)
+        }
+        if (options?.toDate) {
+          query = query.lte('entry_date', options.toDate)
+        }
 
-      if (options?.excludeYearEndClosing) {
-        query = query.neq('journal_entries.source_type', 'year_end')
-      }
+        if (obEntryId) {
+          query = query.neq('id', obEntryId)
+        }
 
-      return query.range(from, to)
-    })
+        if (excludeAllYearEndEntries) {
+          query = excludeYearEndChain(query)
+        }
+        if (options?.excludeFinalClosingEntry) {
+          query = excludeClosingEntry(query)
+        }
 
-    for (const line of priorLines) {
-      const existing = openingBalances.get(line.account_number) || { debit: 0, credit: 0 }
-      existing.debit += Number(line.debit_amount) || 0
-      existing.credit += Number(line.credit_amount) || 0
-      openingBalances.set(line.account_number, existing)
-    }
+        return query
+      },
+      filterLines: dimensionFilter
+        ? // jsonb containment (@>): served by idx_jel_dimensions_gin.
+          (q: EntryLinesQuery) => q.contains('dimensions', dimensionFilter)
+        : undefined,
+    }),
+  ])
+
+  // A dimension-filtered view cannot use company-wide opening balances (the
+  // OB entry and the prior-period RPC are not dimension-aware). Drop them so
+  // every reported amount is dimension-scoped activity: correct for the P&L
+  // reports the filter is whitelisted for, and never fabricates balances if
+  // misapplied. obEntryId is still needed to exclude the OB entry from lines.
+  const openingBalances = dimensionFilter
+    ? new Map<string, { debit: number; credit: number }>()
+    : obResult.balances
+
+  // Additively fold the roll-forward lines into openingBalances so the
+  // downstream IB/period split stays correct without changing call sites.
+  for (const line of priorLines) {
+    const existing = openingBalances.get(line.account_number) || { debit: 0, credit: 0 }
+    existing.debit += Number(line.debit_amount) || 0
+    existing.credit += Number(line.credit_amount) || 0
+    openingBalances.set(line.account_number, existing)
   }
-
-  // ── Period lines (excluding opening balance entry) ─────────────
-  // If year-end closing set an OB entry, exclude it from period lines so
-  // its values aren't double-counted (they're already captured as IB).
-  // Race condition note: if year-end closing runs concurrently and sets
-  // obEntryId between the period query and this query, the OB entry could
-  // be missed from both IB and period. The window is sub-second and the
-  // consequence is a single stale report — acceptable.
-  const lines = await fetchAllRows<{
-    account_number: string
-    debit_amount: number
-    credit_amount: number
-  }>(({ from, to }) => {
-    let query = supabase
-      .from('journal_entry_lines')
-      .select('account_number, debit_amount, credit_amount, journal_entries!inner(company_id, fiscal_period_id, status, source_type, entry_date)')
-      .eq('journal_entries.company_id', companyId)
-      .eq('journal_entries.fiscal_period_id', fiscalPeriodId)
-      .in('journal_entries.status', ['posted', 'reversed'])
-
-    // Date filters are only applied when the caller explicitly asks. The
-    // period itself is already enforced via the fiscal_period_id join, so
-    // adding redundant entry_date bounds for the default case would just
-    // increase query complexity (and break older mocks that don't stub gte
-    // /lte). The fiscal_period_id constraint plus a CHECK on entry_date in
-    // the engine keep activity inside the period.
-    if (options?.fromDate) {
-      query = query.gte('journal_entries.entry_date', options.fromDate)
-    }
-    if (options?.toDate) {
-      query = query.lte('journal_entries.entry_date', options.toDate)
-    }
-
-    if (obEntryId) {
-      query = query.neq('journal_entry_id', obEntryId)
-    }
-
-    if (options?.excludeYearEndClosing) {
-      query = query.neq('journal_entries.source_type', 'year_end')
-    }
-
-    return query.range(from, to)
-  })
 
   if (lines.length === 0 && openingBalances.size === 0) {
     return { rows: [], totalDebit: 0, totalCredit: 0, isBalanced: true }
   }
-
-  // Get account names
-  const accounts = await fetchAllRows<{
-    account_number: string
-    account_name: string
-    account_class: number
-  }>(({ from, to }) =>
-    supabase
-      .from('chart_of_accounts')
-      .select('account_number, account_name, account_class')
-      .eq('company_id', companyId)
-      .range(from, to)
-  )
 
   const accountMap = new Map<string, { name: string; class: number }>()
   for (const acc of accounts) {

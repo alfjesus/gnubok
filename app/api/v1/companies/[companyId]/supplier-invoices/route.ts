@@ -1,14 +1,14 @@
 /**
- * /api/v1/companies/{companyId}/supplier-invoices — list + register endpoints.
+ * /api/v1/companies/{companyId}/supplier-invoices: list + register endpoints.
  *
- * GET   — list with filters (status, supplier_id, currency, invoice_date range).
- *         Cursor pagination on (invoice_date DESC, id DESC).
- * POST  — register a new supplier invoice. Idempotent (mandatory Idempotency-Key).
+ * GET   : list with filters (status, supplier_id, currency, invoice_date range).
+ *         Cursor pagination on (created_at DESC, id ASC).
+ * POST  : register a new supplier invoice. Idempotent (mandatory Idempotency-Key).
  *         Dry-runnable.
  *
  * Lifecycle: a fresh SI is created in `registered` status. Under
  * faktureringsmetoden the registration JE (Debit expense + Debit 2641 / Credit
- * 2440) is posted in the same call — failure aborts and the SI row is rolled
+ * 2440) is posted in the same call: failure aborts and the SI row is rolled
  * back to avoid orphaning a half-baked AP balance.
  *
  * Under kontantmetoden no JE is posted at registration; recognition is
@@ -29,11 +29,15 @@ import {
   encodeDefaultCursor,
   parsePaginationParams,
 } from '@/lib/api/v1/pagination'
-import { registerEndpoint } from '@/lib/api/v1/registry'
+import { registerEndpoint, listEnvelope, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
 import { v1ErrorResponse, v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
 import { checkPeriodLock } from '@/lib/api/v1/check-period-lock'
 import { CreateSupplierInvoiceSchema } from '@/lib/api/schemas'
+import {
+  resolveSupplierInvoiceExchangeRate,
+  supplierInvoiceSekAmounts,
+} from '@/lib/currency/supplier-invoice-rate'
 import { createSupplierInvoiceRegistrationEntry } from '@/lib/bookkeeping/supplier-invoice-entries'
 import { reverseEntry } from '@/lib/bookkeeping/engine'
 import { isBookkeepingError } from '@/lib/bookkeeping/errors'
@@ -71,9 +75,7 @@ const SupplierInvoiceSummary = z.object({
   created_at: z.string(),
 })
 
-const SupplierInvoicesListResponse = z.object({
-  supplier_invoices: z.array(SupplierInvoiceSummary),
-})
+const SupplierInvoicesListResponse = listEnvelope(SupplierInvoiceSummary)
 
 // Explicit projection.
 const SI_SUMMARY_COLUMNS =
@@ -87,15 +89,17 @@ registerEndpoint({
   path: '/api/v1/companies/:companyId/supplier-invoices',
   summary: 'List supplier invoices for a company.',
   description:
-    'Returns supplier invoices in most-recent-first order. Filters: status, supplier_id, currency, date_from / date_to (filter by invoice_date).',
+    'Cursor-paginated supplier-invoice list ordered by created_at DESC, id ASC (newest-registered first; the `invoice_date` column is the seller\'s invoice date and is filterable via ?date_from / ?date_to but is not the sort key). Filters: status, supplier_id, currency, date_from / date_to (filter by invoice_date).',
   useWhen:
     'You need to enumerate registered supplier invoices for an AP dashboard, a payment run, or a leverantörsreskontra reconciliation.',
   doNotUseFor:
-    'Fetching a single supplier invoice — use GET /supplier-invoices/{id}. Listing customer invoices (different resource).',
+    'Fetching a single supplier invoice: use GET /supplier-invoices/{id}. Listing customer invoices (different resource).',
   pitfalls: [
     'Credit notes (is_credit_note=true) appear in the same list as the originals; filter by status=credited or check the flag to separate.',
     'remaining_amount is the unpaid portion; a partially_paid SI has remaining_amount > 0.',
-    'arrival_number is internal book-keeping, not the seller\'s invoice number — use supplier_invoice_number for matching to received documents.',
+    'arrival_number is internal book-keeping, not the seller\'s invoice number: use supplier_invoice_number for matching to received documents.',
+    'Ordering is by created_at (registration time), not invoice_date. A late-registered invoice appears where it was registered: filter on ?date_from / ?date_to when you care about the seller\'s invoice date.',
+    'Cursor pagination: pass ?cursor=<next_cursor> from the previous response. A stale or tampered cursor is ignored and the first page is returned again.',
   ],
   example: {
     response: {
@@ -165,12 +169,21 @@ export const GET = withApiV1<{ params: Promise<{ companyId: string }> }>(
     }
     const filters = filtersResult.data
 
+    // Sort by (created_at DESC, id ASC). created_at is the stable cursor
+    // anchor: it's a real timestamp (passes ISO-8601 validation in
+    // decodeDefaultCursor), NOT NULL, and total-orderable once id breaks
+    // ties. Sorting by `invoice_date` directly broke the cursor: a Postgres
+    // `date` serializes as YYYY-MM-DD, the decoder rejected it, the keyset
+    // predicate was never applied, and every "next page" silently returned
+    // page 1 forever while still advertising a fresh next_cursor.
+    // invoice_date is still on every row and ?date_from / ?date_to filter
+    // on it. Same anchor as the transactions list.
     let query = ctx.supabase
       .from('supplier_invoices')
       .select(`${SI_SUMMARY_COLUMNS}, supplier:suppliers(${SUPPLIER_NAME_ONLY_COLUMNS})`)
       .eq('company_id', ctx.companyId!)
-      .order('invoice_date', { ascending: false })
-      .order('id', { ascending: false })
+      .order('created_at', { ascending: false })
+      .order('id', { ascending: true })
       .limit(limit + 1)
 
     if (filters.status) query = query.eq('status', filters.status)
@@ -180,9 +193,10 @@ export const GET = withApiV1<{ params: Promise<{ companyId: string }> }>(
     if (filters.date_to) query = query.lte('invoice_date', filters.date_to)
 
     if (decoded) {
-      // Keyset on (invoice_date DESC, id DESC).
+      // Keyset on (created_at DESC, id ASC): created_at moves backward,
+      // id breaks ties within the same timestamp.
       query = query.or(
-        `invoice_date.lt.${decoded.ts},and(invoice_date.eq.${decoded.ts},id.lt.${decoded.id})`,
+        `created_at.lt.${decoded.ts},and(created_at.eq.${decoded.ts},id.gt.${decoded.id})`,
       )
     }
 
@@ -246,7 +260,7 @@ export const GET = withApiV1<{ params: Promise<{ companyId: string }> }>(
 
     const last = trimmed[trimmed.length - 1]
     const nextCursor = hasMore && last
-      ? encodeDefaultCursor({ id: last.id, created_at: last.invoice_date })
+      ? encodeDefaultCursor({ id: last.id, created_at: last.created_at })
       : null
 
     return paginated(supplier_invoices, {
@@ -257,14 +271,17 @@ export const GET = withApiV1<{ params: Promise<{ companyId: string }> }>(
 )
 
 // ──────────────────────────────────────────────────────────────────
-// POST — register supplier invoice
+// POST: register supplier invoice
 // ──────────────────────────────────────────────────────────────────
 
+// default_dimensions must stay in this projection: the inserted row is passed
+// straight to createSupplierInvoiceRegistrationEntry, which reads the bag off
+// the row — dropping the column here silently untags the registration JE.
 const SI_RESPONSE_COLUMNS =
-  'id, supplier_id, arrival_number, supplier_invoice_number, invoice_date, due_date, received_date, delivery_date, status, currency, exchange_rate, subtotal, subtotal_sek, vat_amount, vat_amount_sek, total, total_sek, vat_treatment, reverse_charge, payment_reference, paid_amount, remaining_amount, is_credit_note, credited_invoice_id, registration_journal_entry_id, payment_journal_entry_id, notes, created_at, updated_at'
+  'id, supplier_id, arrival_number, supplier_invoice_number, invoice_date, due_date, received_date, delivery_date, status, currency, exchange_rate, subtotal, subtotal_sek, vat_amount, vat_amount_sek, total, total_sek, vat_treatment, reverse_charge, payment_reference, paid_amount, remaining_amount, is_credit_note, credited_invoice_id, registration_journal_entry_id, payment_journal_entry_id, notes, default_dimensions, created_at, updated_at'
 
 const SI_ITEMS_RESPONSE_COLUMNS =
-  'id, sort_order, description, quantity, unit, unit_price, line_total, account_number, vat_code, vat_rate, vat_amount, reverse_charge_rate'
+  'id, sort_order, description, quantity, unit, unit_price, line_total, account_number, vat_code, vat_rate, vat_amount, reverse_charge_rate, dimensions'
 
 const SupplierInvoiceCreated = z.object({
   id: z.string().uuid(),
@@ -297,10 +314,13 @@ registerEndpoint({
     'Marking an existing SI as paid (use POST /:id/mark-paid). Issuing a credit note (use POST /:id/credit). Customer invoices (different resource).',
   pitfalls: [
     'Idempotency-Key is mandatory.',
-    'invoice_date must fall within an open fiscal period — a date covered by a locked period or the company-wide bookkeeping lock returns 400 PERIOD_LOCKED.',
+    'invoice_date must fall within an open fiscal period: a date covered by a locked period or the company-wide bookkeeping lock returns 400 PERIOD_LOCKED.',
     'Under faktureringsmetoden the registration JE is posted atomically with the SI row. JE failure aborts the whole call and no SI row is left behind (strict-mode).',
-    'supplier_id must reference an existing, non-archived supplier in the same company — 404 SUPPLIER_NOT_FOUND otherwise.',
+    'supplier_id must reference an existing, non-archived supplier in the same company: 404 SUPPLIER_NOT_FOUND otherwise.',
     'Duplicate (supplier_id, supplier_invoice_number) returns 409 SI_CREATE_DUPLICATE_INVOICE_NUMBER. Use the credit flow on the original instead of re-registering with a tweaked number.',
+    'Foreign currency: omit exchange_rate and the server fetches Riksbanken\'s rate for invoice_date (ML 8 kap 21-23 §). If no rate can be resolved the create is refused with 400 SI_FX_RATE_MISSING rather than stored unconverted: pass exchange_rate explicitly to proceed. A SEK invoice needs no rate and gets total_sek = total.',
+    'exchange_rate is SEK per 1 unit of the invoice currency and must satisfy 0 < rate < 100000, the same bounds the supplier_invoices CHECK enforces. Out-of-range values return 400 VALIDATION_ERROR; passing an invoice total where a rate belongs is the usual cause.',
+    'Project/cost-center tagging: pass default_dimensions ({"6":"P001"} = project, {"1":"KS01"} = kostnadsställe) for the whole invoice and/or items[].dimensions per line (per-line wins per key). The registration JE lines are tagged accordingly. When the company has the dimension registry enabled, unknown or archived codes are rejected with 400 DIMENSION_VALIDATION_FAILED — list valid codes via GET /dimensions.',
   ],
   example: {
     request: {
@@ -308,6 +328,7 @@ registerEndpoint({
       supplier_invoice_number: '2026-1234',
       invoice_date: '2026-05-10',
       due_date: '2026-06-09',
+      default_dimensions: { '6': 'P001' },
       items: [
         { description: 'Office supplies', amount: 1000, account_number: '5410', vat_rate: 0.25 },
       ],
@@ -331,7 +352,7 @@ registerEndpoint({
   reversible: true,
   dryRunSupported: true,
   request: { body: CreateSupplierInvoiceSchema },
-  response: { success: SupplierInvoiceCreated },
+  response: { success: dataEnvelope(SupplierInvoiceCreated) },
 })
 
 interface ComputedItem {
@@ -346,6 +367,7 @@ interface ComputedItem {
   vat_rate: number
   vat_amount: number
   reverse_charge_rate: number | null
+  dimensions: Record<string, string>
 }
 
 // Swedish VAT rates per ML 2 kap 1 § + Skatteverket's 2026 satser. Allow
@@ -390,6 +412,9 @@ function computeItemsAndTotals(input: z.infer<typeof CreateSupplierInvoiceSchema
       // line vat_rate is 0 (validated below); the engine self-assesses at this
       // rate, defaulting to 25% huvudregeln when null.
       reverse_charge_rate: item.reverse_charge_rate ?? null,
+      // Dimensions PR7: per-item bag, merged over the invoice's
+      // default_dimensions on the expense line at booking.
+      dimensions: item.dimensions ?? {},
     })
   }
   const subtotal = items.reduce((sum, i) => sum + i.line_total, 0)
@@ -481,16 +506,41 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string }> }>(
       })
     }
     const { items, subtotal, vatAmount, total } = totalsResult
-    const exchangeRate = body.exchange_rate ?? null
-    const subtotalSek = exchangeRate ? Math.round(subtotal * exchangeRate * 100) / 100 : null
-    const vatAmountSek = exchangeRate ? Math.round(vatAmount * exchangeRate * 100) / 100 : null
-    const totalSek = exchangeRate ? Math.round(total * exchangeRate * 100) / 100 : null
+
+    // Currency policy is shared with POST /api/supplier-invoices and the inbox
+    // convert route (lib/currency/supplier-invoice-rate.ts): a non-SEK invoice
+    // that arrives without a rate gets one fetched from Riksbanken for the
+    // invoice date, and if none can be had the create is refused rather than
+    // persisted with exchange_rate = NULL. Agents are the main caller here and
+    // the ones most likely to omit the field entirely; a NULL-rate row would
+    // only fail later, inside the booking path, with SI_FX_RATE_MISSING.
+    // Resolved before the arrival-number allocation and before the dry-run
+    // branch, so a dry run surfaces the same refusal a live commit would.
+    const fx = await resolveSupplierInvoiceExchangeRate(ctx.supabase, {
+      currency: body.currency,
+      invoiceDate: body.invoice_date,
+      suppliedRate: body.exchange_rate,
+    })
+    if (!fx.ok) {
+      return v1ErrorResponseFromCode('SI_FX_RATE_MISSING', ctx.log, {
+        requestId: ctx.requestId,
+        details: { currency: fx.currency, invoice_date: fx.invoiceDate },
+      })
+    }
+    const exchangeRate = fx.rate.exchangeRate
+    const exchangeRateDate = fx.rate.exchangeRateDate
+    // SEK resolves to rate 1, so total_sek === total instead of NULL.
+    const {
+      subtotal_sek: subtotalSek,
+      vat_amount_sek: vatAmountSek,
+      total_sek: totalSek,
+    } = supplierInvoiceSekAmounts(fx.rate, { subtotal, vatAmount, total })
 
     // Derive a sensible default for vat_treatment + reverse_charge from the
     // supplier_type. EU/non-EU suppliers default to reverse-charge unless the
     // caller explicitly overrides; Swedish suppliers default to standard 25%.
     // The engine looks at `invoice.reverse_charge` (boolean) for the actual
-    // booking choice — `vat_treatment` is recorded as metadata. Keeping the
+    // booking choice: `vat_treatment` is recorded as metadata. Keeping the
     // two in sync prevents momsdeklaration Ruta 30 / 48 misclassification on
     // EU-supplier rows that omit both fields.
     const foreignSupplier =
@@ -510,7 +560,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string }> }>(
 
     // Cross-field constraint for reverse-charge invoices: the Swedish supplier
     // does not charge VAT, the buyer self-assesses (ML 1 kap 2§ p.4b /
-    // 16 kap 6 § / 16 kap 13 §). All item vat_rates MUST be 0 — otherwise the
+    // 16 kap 6 § / 16 kap 13 §). All item vat_rates MUST be 0: otherwise the
     // engine will mis-book ingående moms in Ruta 30 / 48 (BAS 2614 / 2645 /
     // 2641). Reject up front rather than booking a phantom VAT line.
     if (reverseCharge) {
@@ -521,7 +571,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string }> }>(
           details: {
             field: `items[${offending}].vat_rate`,
             message:
-              'reverse_charge invoices must have vat_rate=0 on every line item — the buyer self-assesses VAT.',
+              'reverse_charge invoices must have vat_rate=0 on every line item: the buyer self-assesses VAT.',
             attempted_rate: items[offending].vat_rate,
             reverse_charge: true,
           },
@@ -529,7 +579,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string }> }>(
       }
     }
 
-    // Dry-run preview — no arrival_number is allocated (would burn a sequence
+    // Dry-run preview: no arrival_number is allocated (would burn a sequence
     // number on a non-commit).
     if (ctx.dryRun) {
       return dryRunPreview(
@@ -540,8 +590,9 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string }> }>(
           due_date: body.due_date,
           delivery_date: body.delivery_date ?? null,
           status: 'registered',
-          currency: body.currency ?? 'SEK',
+          currency: fx.rate.currency,
           exchange_rate: exchangeRate,
+          exchange_rate_date: exchangeRateDate,
           vat_treatment: vatTreatment,
           reverse_charge: reverseCharge,
           subtotal,
@@ -553,6 +604,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string }> }>(
           remaining_amount: total,
           is_credit_note: false,
           notes: body.notes ?? null,
+          default_dimensions: body.default_dimensions ?? {},
           items,
           // Indicate what the live commit would do; the actual JE row is not
           // staged in pending_operations because the SI write path is
@@ -588,8 +640,9 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string }> }>(
         due_date: body.due_date,
         delivery_date: body.delivery_date ?? null,
         status: 'registered',
-        currency: body.currency ?? 'SEK',
+        currency: fx.rate.currency,
         exchange_rate: exchangeRate,
+        exchange_rate_date: exchangeRateDate,
         vat_treatment: vatTreatment,
         reverse_charge: reverseCharge,
         payment_reference: body.payment_reference ?? null,
@@ -601,6 +654,8 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string }> }>(
         total_sek: totalSek,
         remaining_amount: total,
         notes: body.notes ?? null,
+        // Dimensions PR7: invoice-level bag; generators apply it to every line.
+        default_dimensions: body.default_dimensions ?? {},
       })
       .select(SI_RESPONSE_COLUMNS)
       .single()
@@ -637,7 +692,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string }> }>(
       .from('supplier_invoice_items')
       .insert(itemInserts)
     if (itemsErr) {
-      // items_insert fires before any engine call — no JE could exist.
+      // items_insert fires before any engine call: no JE could exist.
       await rollbackSupplierInvoice(ctx.supabase, invoiceId, ctx.companyId!, ctx.log, 'items_insert', false)
       return v1ErrorResponseFromCode('SI_CREATE_FAILED', ctx.log, {
         requestId: ctx.requestId,
@@ -645,7 +700,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string }> }>(
       })
     }
 
-    // Determine accounting method — registration JE is only posted under accrual.
+    // Determine accounting method: registration JE is only posted under accrual.
     const { data: settings } = await ctx.supabase
       .from('company_settings')
       .select('accounting_method')
@@ -678,7 +733,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string }> }>(
             // to preserve strict-mode atomicity (otherwise a subsequent GET
             // would show registration_journal_entry_id=null with a live JE on
             // the books). reverseEntry takes the entry id directly.
-            ctx.log.error('SI register: JE link update failed — stornoing JE and rolling back row', linkErr, {
+            ctx.log.error('SI register: JE link update failed, stornoing JE and rolling back row', linkErr, {
               invoiceId,
               companyId: ctx.companyId,
               userId: ctx.userId,
@@ -687,7 +742,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string }> }>(
             try {
               await reverseEntry(ctx.supabase, ctx.companyId!, ctx.userId, entry.id, body.invoice_date)
             } catch (revErr) {
-              ctx.log.error('JE storno failed after SI link-update error — manual reconciliation required', revErr as Error, {
+              ctx.log.error('JE storno failed after SI link-update error, manual reconciliation required', revErr as Error, {
                 invoiceId,
                 companyId: ctx.companyId,
                 userId: ctx.userId,
@@ -704,7 +759,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string }> }>(
           }
         } else {
           // Engine returned null (no open fiscal period). Strict-mode: roll back.
-          // Engine returned null before posting — no JE exists.
+          // Engine returned null before posting: no JE exists.
           await rollbackSupplierInvoice(ctx.supabase, invoiceId, ctx.companyId!, ctx.log, 'no_fiscal_period', false)
           return v1ErrorResponseFromCode('SI_CREATE_NO_FISCAL_PERIOD', ctx.log, {
             requestId: ctx.requestId,
@@ -712,7 +767,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string }> }>(
           })
         }
       } catch (err) {
-        // Engine threw — conservatively assume the JE may have committed
+        // Engine threw: conservatively assume the JE may have committed
         // before the throw (createJournalEntry is the atomic write inside
         // the engine; a throw after that point would still leave a posted
         // JE). Soft-mark to preserve any half-committed audit trail.
@@ -771,13 +826,13 @@ async function rollbackSupplierInvoice(
   // BFL 5 kap 5 § applies once a verifikation has been committed to the
   // books. A failed insert that never produced a JE (items_insert error,
   // engine returning null because no fiscal period covers the date) is a
-  // failed insertion, not a bokföringspost — a row with status='reversed'
+  // failed insertion, not a bokföringspost: a row with status='reversed'
   // and registration_journal_entry_id=null would be a dangling
   // räkenskapsinformation entry harder to audit than a clean removal.
   //
   // So: soft-mark `reversed` ONLY when a JE existed at the point of
   // failure. Pre-JE failures hard-delete (with explicit items wipe in case
-  // the items insert partially succeeded — which Postgres makes atomic for
+  // the items insert partially succeeded: which Postgres makes atomic for
   // a single INSERT, but the defense is cheap).
   if (!journalEntryPosted) {
     await supabase.from('supplier_invoice_items').delete().eq('supplier_invoice_id', invoiceId)
@@ -787,7 +842,7 @@ async function rollbackSupplierInvoice(
       .eq('id', invoiceId)
       .eq('company_id', companyId)
     if (parentErr) {
-      log.error('supplier-invoice hard-rollback failed — orphan row', parentErr, {
+      log.error('supplier-invoice hard-rollback failed, orphan row', parentErr, {
         invoiceId,
         companyId,
         rollbackReason: reason,
@@ -811,7 +866,7 @@ async function rollbackSupplierInvoice(
     .eq('id', invoiceId)
     .eq('company_id', companyId)
   if (updateErr) {
-    log.error('supplier-invoice soft-rollback failed — manual reconciliation required', updateErr, {
+    log.error('supplier-invoice soft-rollback failed, manual reconciliation required', updateErr, {
       invoiceId,
       companyId,
       rollbackReason: reason,

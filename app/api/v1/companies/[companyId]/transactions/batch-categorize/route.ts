@@ -2,7 +2,7 @@
  * POST /api/v1/companies/{companyId}/transactions/batch-categorize
  *
  * Apply a single categorization to up to 100 transactions in one call.
- * Partial-success semantics — per-item failure does not roll back items
+ * Partial-success semantics: per-item failure does not roll back items
  * that succeeded. Each item is processed through the same orchestration
  * as the single :categorize endpoint, so it can fail individually for any
  * of the same reasons (invalid template, invalid mapping, race, etc.).
@@ -12,7 +12,7 @@
 import { z } from 'zod'
 import { ok } from '@/lib/api/v1/response'
 import { dryRunPreview } from '@/lib/api/v1/dry-run'
-import { registerEndpoint } from '@/lib/api/v1/registry'
+import { registerEndpoint, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
 import { v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
 import { checkPeriodLock } from '@/lib/api/v1/check-period-lock'
@@ -25,9 +25,10 @@ import {
   validateTemplateForEntity,
 } from '@/lib/bookkeeping/booking-templates'
 import { createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
+import { recordVoucherGapExplanation } from '@/lib/bookkeeping/cancel-orphaned-entry'
 import { reverseEntry } from '@/lib/bookkeeping/engine'
 import { AccountsNotInChartError, isBookkeepingError } from '@/lib/bookkeeping/errors'
-import { collectMappingResultAccounts, findMissingActiveAccounts } from '@/lib/bookkeeping/account-validation'
+import { collectMappingResultAccounts, findUnresolvableAccounts } from '@/lib/bookkeeping/account-validation'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
 import { eventBus } from '@/lib/events'
 import type { Logger } from '@/lib/logger'
@@ -76,10 +77,10 @@ registerEndpoint({
   useWhen:
     'You have many transactions to categorize with the same logic (e.g. apply a booking template across a queue, mark a batch as private, override accounts on a series).',
   doNotUseFor:
-    'Categorizing transactions with mixed logic — make multiple :categorize calls. Auto-categorization via templates — handled inside `ingest` for matching rows, no separate endpoint needed.',
+    'Categorizing transactions with mixed logic: make multiple :categorize calls. Auto-categorization via templates: handled inside `ingest` for matching rows, no separate endpoint needed.',
   pitfalls: [
     'Max 100 items per call. Sequential processing.',
-    'Idempotency-Key covers the WHOLE batch — replays return the cached full response.',
+    'Idempotency-Key covers the WHOLE batch: replays return the cached full response.',
     'all_or_nothing: true returns 501 NOT_IMPLEMENTED. Today only partial-success batches exist.',
   ],
   example: {
@@ -102,7 +103,7 @@ registerEndpoint({
   reversible: true,
   dryRunSupported: true,
   request: { body: BatchRequest },
-  response: { success: BatchResponse },
+  response: { success: dataEnvelope(BatchResponse) },
 })
 
 interface Item {
@@ -204,8 +205,9 @@ async function categorizeOne(
   // engine throws AccountsNotInChartError mid-flight and the legacy
   // partial-success branch silently marks the row bokförd with no
   // verifikation. Validate in both dry-run and live paths so previews
-  // surface the same actionable error.
-  const missingAccounts = await findMissingActiveAccounts(
+  // surface the same actionable error. Standard BAS accounts merely absent
+  // from the chart pass: the engine seeds them on demand.
+  const missingAccounts = await findUnresolvableAccounts(
     supabase,
     companyId,
     collectMappingResultAccounts(mappingResult),
@@ -268,7 +270,7 @@ async function categorizeOne(
     }
   }
 
-  // Period-lock pre-check — same rationale as the single :categorize route.
+  // Period-lock pre-check: same rationale as the single :categorize route.
   // A locked period surfaces as PERIOD_LOCKED on the per-item error rather
   // than a generic INTERNAL_ERROR from the trigger exception.
   const periodLock = await checkPeriodLock(supabase, companyId, transaction.date)
@@ -308,7 +310,7 @@ async function categorizeOne(
     // AccountsNotInChartError means an account was deactivated between our
     // pre-validation and the engine call (rare race). Return the per-item
     // failure WITHOUT the transaction update below so the row stays in
-    // "Att bokföra" — partial-success on a missing-account error would
+    // "Att bokföra": partial-success on a missing-account error would
     // mark it bokförd with no verifikation.
     if (err instanceof AccountsNotInChartError) {
       return {
@@ -345,11 +347,11 @@ async function categorizeOne(
       ok: false,
       request_index: index,
       transaction_id: transactionId,
-      error: { code: 'INTERNAL_ERROR', message: updateErr.message },
+      error: { code: 'INTERNAL_ERROR', message: getErrorMessage(updateErr) },
     }
   }
   if ((!updated || updated.length === 0) && journalEntryId) {
-    // CAS race — storno the orphan (BFL 5 kap 5 §). Direct status flip
+    // CAS race: storno the orphan (BFL 5 kap 5 §). Direct statusflip
     // would be blocked by enforce_journal_entry_immutability since the
     // engine writes the JE as posted. Same fix as the single :categorize
     // route. Storno keeps the verifikationsnummer series unbroken.
@@ -366,23 +368,26 @@ async function categorizeOne(
           .from('journal_entries')
           .select('fiscal_period_id, voucher_series, voucher_number')
           .eq('id', journalEntryId)
+          .eq('company_id', companyId)
           .single()
         if (orphan && orphan.voucher_series) {
           // Same rationale as the single :categorize route: skip the gap row
           // when no series exists rather than filing under a fallback series
-          // that an audit query won't find.
-          await supabase.from('voucher_gap_explanations').insert({
-            company_id: companyId,
-            fiscal_period_id: orphan.fiscal_period_id,
-            voucher_series: orphan.voucher_series,
-            gap_number: orphan.voucher_number,
+          // that an audit query won't find. The insert itself lives in the
+          // shared helper, which owns the real voucher_gap_explanations
+          // column set (gap_start/gap_end/user_id) and logs failures loudly.
+          await recordVoucherGapExplanation(supabase, {
+            companyId,
+            userId,
+            fiscalPeriodId: orphan.fiscal_period_id,
+            voucherSeries: orphan.voucher_series,
+            voucherNumber: orphan.voucher_number,
             explanation:
               'CAS-race orphan; automatisk storno misslyckades. Manuell reconciliation krävs.',
-            created_by: userId,
           })
         }
       } catch (gapErr) {
-        log.error('batch-categorize: failed to log voucher_gap_explanations', gapErr as Error, {
+        log.error('batch-categorize: failed to look up the orphan for its gap explanation', gapErr as Error, {
           request_index: index,
           orphanJournalEntryId: journalEntryId,
         })

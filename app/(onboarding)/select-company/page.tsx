@@ -1,5 +1,10 @@
+import { cookies } from 'next/headers'
 import { redirect } from 'next/navigation'
 import { createClient, createServiceClient } from '@/lib/supabase/server'
+import {
+  acceptPendingInviteByToken,
+  hasPendingInviteForEmail,
+} from '@/lib/company/pending-invites'
 import type { EnrichmentCompanyRole } from '@/lib/company-lookup/types'
 import BankIdCompanyPicker, {
   type MemberCompany,
@@ -18,21 +23,58 @@ export default async function SelectCompanyPage() {
     redirect('/login')
   }
 
-  // Existing Accounted memberships.
-  const { data: memberships } = await supabase
-    .from('company_members')
-    .select(`
-      role,
-      company:company_id (
-        id,
-        name,
-        org_number,
-        entity_type,
-        archived_at
-      )
-    `)
-    .eq('user_id', user.id)
-    .order('joined_at', { ascending: true })
+  // Invite recovery, same as /onboarding: BankID users land here, so a missed
+  // invite acceptance (e.g. a register flow that dropped the cookie handling)
+  // gets retried before the picker funnels the invitee into creating a company.
+  const inviteToken = (await cookies()).get('gnubok-invite-token')?.value
+  if (inviteToken && (await acceptPendingInviteByToken(user, inviteToken))) {
+    redirect('/')
+  }
+
+  // All lookups key only on user.id/email, one parallel batch instead of
+  // serial round-trips on the post-BankID-login landing page.
+  const [
+    // Existing Accounted memberships.
+    { data: memberships },
+    { data: teamMembership },
+    // Greeting name.
+    { data: profile },
+    // BankID enrichment (CompanyRoles from Bolagsverket via TIC). Stored
+    // user-keyed in `bankid_enrichment` because it lands before company
+    // selection, see fetchAndStoreEnrichment in the tic extension.
+    { data: enrichmentRow },
+    // Pending invitation for this email with no cookie to accept it from:
+    // rendered as a "check your invite email" hint in the picker.
+    hasPendingInvite,
+  ] = await Promise.all([
+    supabase
+      .from('company_members')
+      .select(`
+        role,
+        company:company_id (
+          id,
+          name,
+          org_number,
+          entity_type,
+          archived_at
+        )
+      `)
+      .eq('user_id', user.id)
+      .order('joined_at', { ascending: true }),
+    supabase
+      .from('team_members')
+      .select('team_id')
+      .eq('user_id', user.id)
+      .limit(1)
+      .maybeSingle(),
+    supabase.from('profiles').select('full_name').eq('id', user.id).single(),
+    supabase
+      .from('bankid_enrichment')
+      .select('company_roles, created_at, updated_at')
+      .eq('user_id', user.id)
+      .maybeSingle(),
+    user.email ? hasPendingInviteForEmail(user.email) : Promise.resolve(false),
+  ])
 
   type CompanyRow = {
     id: string
@@ -68,13 +110,6 @@ export default async function SelectCompanyPage() {
   )
 
   // Ensure the user has a team (same pattern as /onboarding).
-  const { data: teamMembership } = await supabase
-    .from('team_members')
-    .select('team_id')
-    .eq('user_id', user.id)
-    .limit(1)
-    .maybeSingle()
-
   let teamId = teamMembership?.team_id
   if (!teamId) {
     const { data: ensured } = await supabase.rpc('ensure_user_team')
@@ -84,22 +119,7 @@ export default async function SelectCompanyPage() {
     redirect('/login')
   }
 
-  // Greeting name.
-  const { data: profile } = await supabase
-    .from('profiles')
-    .select('full_name')
-    .eq('id', user.id)
-    .single()
   const firstName = profile?.full_name?.split(' ')[0] ?? null
-
-  // BankID enrichment (CompanyRoles from Bolagsverket via TIC). Stored
-  // user-keyed in `bankid_enrichment` because it lands before company
-  // selection — see fetchAndStoreEnrichment in the tic extension.
-  const { data: enrichmentRow } = await supabase
-    .from('bankid_enrichment')
-    .select('company_roles, created_at, updated_at')
-    .eq('user_id', user.id)
-    .maybeSingle()
 
   const enrichmentValue = enrichmentRow
     ? { companyRoles: enrichmentRow.company_roles as EnrichmentCompanyRole[] }
@@ -115,7 +135,7 @@ export default async function SelectCompanyPage() {
   //   1. BankIdCompanyPicker calls TIC /lookup before provisioning and
   //      short-circuits with a toast when isCeased=true.
   //   2. createCompanyFromTicRole refuses to provision when lookup.isCeased.
-  // Both guards are required — don't remove one without removing both.
+  // Both guards are required: don't remove one without removing both.
   //
   // Loose `== null` on purpose: TIC payloads have been observed returning
   // `undefined` for open-ended positions, which `=== null` would miss.
@@ -123,7 +143,7 @@ export default async function SelectCompanyPage() {
     (r) => r.positionEnd == null,
   )
 
-  // Drop TIC roles that already appear in the user's Accounted memberships —
+  // Drop TIC roles that already appear in the user's Accounted memberships:
   // those render via the "Your Accounted companies" section above instead.
   const rolesNotAlreadyMine = activeRoles.filter(
     (r) => !memberOrgNumbers.has(r.companyRegistrationNumber.replace(/[\s-]/g, '')),
@@ -131,7 +151,7 @@ export default async function SelectCompanyPage() {
 
   // Cross-reference remaining TIC org numbers against the global companies
   // table to detect "exists in Accounted, user not a member" cases. Use the
-  // service client — RLS filters out companies the user isn't a member of,
+  // service client: RLS filters out companies the user isn't a member of,
   // which is exactly the data we need. Scoped to the specific org numbers.
   let externallyOwnedOrgs = new Set<string>()
   if (rolesNotAlreadyMine.length > 0) {
@@ -169,6 +189,7 @@ export default async function SelectCompanyPage() {
       memberCompanies={memberCompanies}
       ticCompanies={ticCompanies}
       enrichmentStale={enrichmentStale}
+      hasPendingInvite={hasPendingInvite}
     />
   )
 }

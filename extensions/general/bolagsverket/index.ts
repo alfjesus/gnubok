@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { z } from 'zod'
+import { validateSwedishPersonalNumber } from '@/lib/extensions/validation'
 import type { Extension, ExtensionContext } from '@/lib/extensions/types'
 import { createServiceClientNoCookies } from '@/lib/auth/api-keys'
 import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
@@ -20,18 +21,18 @@ import {
 import type { BolagsverketEnvironment, HandelseMeddelande } from './types'
 
 /**
- * Bolagsverket integration — digital inlämning av årsredovisning.
+ * Bolagsverket integration: digital inlämning av årsredovisning.
  *
- * Generates iXBRL in core (lib/bokslut/ixbrl — works without this extension),
+ * Generates iXBRL in core (lib/bokslut/ixbrl: works without this extension),
  * and adds the Bolagsverket leg: grunduppgifter prefill, kontrollera,
  * inlämning till eget utrymme, händelseprenumerationer + webhook receiver.
  *
  * Requires an avtal with Bolagsverket and an Expisoft/Steria
  * organisationscertifikat for acceptans/produktion (ANSLUTNINGSANVISNING
- * §5–6). The static test environment (BOLAGSVERKET_ENV=test) runs without a
+ * §5-6). The static test environment (BOLAGSVERKET_ENV=test) runs without a
  * certificate but needs a firewall opening (orgnr 1234567890/1234567891).
  *
- * Environment variables (certificate material is ENV-ONLY — see clientFor):
+ * Environment variables (certificate material is ENV-ONLY: see clientFor):
  * - BOLAGSVERKET_ENV          test | accept | prod (default test). Also acts
  *                             as the CEILING for the per-company `environment`
  *                             setting: members may select an environment at or
@@ -46,7 +47,7 @@ import type { BolagsverketEnvironment, HandelseMeddelande } from './types'
  * and file manually with the downloaded .xhtml.
  */
 
-/** Roles allowed to file/poll — the dispatcher itself only authenticates. */
+/** Roles allowed to file/poll: the dispatcher itself only authenticates. */
 const WRITE_ROLES = new Set(['owner', 'admin', 'member'])
 
 const ENV_ORDER: Record<BolagsverketEnvironment, number> = { test: 0, accept: 1, prod: 2 }
@@ -63,13 +64,17 @@ function environmentCeiling(): BolagsverketEnvironment {
   return isBolagsverketEnvironment(raw) ? raw : 'test'
 }
 
+function filingReleaseEnabled(): boolean {
+  return process.env.BOLAGSVERKET_FILING_ENABLED === 'true'
+}
+
 /**
  * Resolve the effective Bolagsverket environment for a company.
  *
  * The generic extension settings endpoint
  * (app/api/extensions/[sector]/[slug]/settings) PATCHes ONE JSON blob into
- * extension_data under extension_id 'general/bolagsverket', key 'settings' —
- * not per-key rows under this extension's dispatcher id — so read that row
+ * extension_data under extension_id 'general/bolagsverket', key 'settings':
+ * not per-key rows under this extension's dispatcher id: so read that row
  * directly rather than via ctx.settings.
  *
  * Validation: the value must be one of test|accept|prod and must not exceed
@@ -77,13 +82,16 @@ function environmentCeiling(): BolagsverketEnvironment {
  * able to point a hosted tenant at prod and ride the platform certificate).
  */
 async function resolveEnvironment(ctx: ExtensionContext): Promise<BolagsverketEnvironment> {
-  const { data } = await ctx.supabase
+  const { data, error } = await ctx.supabase
     .from('extension_data')
     .select('value')
     .eq('company_id', ctx.companyId)
     .eq('extension_id', 'general/bolagsverket')
     .eq('key', 'settings')
     .maybeSingle()
+  if (error) {
+    throw new Error(`Failed to resolve Bolagsverket environment: ${error.message}`)
+  }
   const configured = (data?.value as { environment?: unknown } | null)?.environment
   const ceiling = environmentCeiling()
   if (configured === undefined || configured === null || configured === '') {
@@ -110,7 +118,7 @@ async function resolveEnvironment(ctx: ExtensionContext): Promise<BolagsverketEn
  * Build a client for the company's resolved environment.
  *
  * SECURITY: certificate material is ENV-ONLY (BOLAGSVERKET_CLIENT_CERT/_KEY/
- * _CA). It must NEVER be read from extension settings — extension_data rows
+ * _CA). It must NEVER be read from extension settings: extension_data rows
  * are readable by every company member through the extension_data SELECT RLS
  * policy, which would hand the mTLS private key to any viewer.
  */
@@ -120,11 +128,12 @@ async function clientFor(ctx: ExtensionContext): Promise<BolagsverketClient> {
 }
 
 async function companyOrgnr(ctx: ExtensionContext): Promise<string> {
-  const { data } = await ctx.supabase
+  const { data, error } = await ctx.supabase
     .from('company_settings')
     .select('org_number')
     .eq('company_id', ctx.companyId)
     .maybeSingle()
+  if (error) throw new Error(`Kunde inte läsa organisationsnummer: ${error.message}`)
   const orgNumber = (data as { org_number?: string } | null)?.org_number
   if (!orgNumber) throw new Error('Organisationsnummer saknas i företagsinställningarna.')
   return normalizeOrgnr(orgNumber)
@@ -133,7 +142,7 @@ async function companyOrgnr(ctx: ExtensionContext): Promise<string> {
 /**
  * Defense-in-depth RBAC for write endpoints. The extension dispatcher only
  * authenticates and resolves a company; it does NOT check the member's role.
- * Filing an årsredovisning is a write operation — viewer members are blocked.
+ * Filing an årsredovisning is a write operation: viewer members are blocked.
  * Mirrors requireAgiWriteRole in the skatteverket extension.
  *
  * Returns null on success, a 403/500 NextResponse on failure.
@@ -186,18 +195,34 @@ function apiErrorResponse(err: unknown, ctx: ExtensionContext): NextResponse {
 const noContextResponse = () =>
   NextResponse.json({ error: { code: 'NO_CONTEXT', message: 'Saknar kontext' } }, { status: 500 })
 
+const PersonnummerSchema = z
+  .string()
+  .regex(/^\d{12}$/, 'Personnummer ska normaliseras till 12 siffror')
+  .refine((value) => validateSwedishPersonalNumber(value) === null, 'Ogiltigt personnummer')
+  .refine((value) => {
+    const year = Number(value.slice(0, 4))
+    const month = Number(value.slice(4, 6))
+    const day = Number(value.slice(6, 8))
+    const date = new Date(Date.UTC(year, month - 1, day))
+    return (
+      date.getUTCFullYear() === year &&
+      date.getUTCMonth() === month - 1 &&
+      date.getUTCDate() === day
+    )
+  }, 'Ogiltigt födelsedatum')
+
 const SubmitSchema = z.object({
   fiscal_period_id: z.string().uuid(),
-  avsandare_pnr: z.string().regex(/^\d{10,12}$/, 'Personnummer anges med 10–12 siffror'),
+  annual_report_version_id: z.string().uuid(),
+  avsandare_pnr: PersonnummerSchema,
   undertecknare: z.object({
-    pnr: z.string().regex(/^\d{10,12}$/, 'Personnummer anges med 10–12 siffror'),
+    pnr: PersonnummerSchema,
     fornamn: z.string().min(1).max(100),
     efternamn: z.string().min(1).max(100),
     roll: z.string().min(1).max(100),
     epost: z.string().email(),
   }),
   kvittens_epost: z.array(z.string().email()).max(5).optional(),
-  utdelning: z.number().min(0).optional(),
   accepted_avtalstext_andrad: z.string().optional(),
   ignore_warnings: z.boolean().optional(),
 })
@@ -208,7 +233,7 @@ const PollSchema = z.object({
 
 export const bolagsverketExtension: Extension = {
   id: 'bolagsverket',
-  name: 'Bolagsverket — digital årsredovisning',
+  name: 'Bolagsverket: digital årsredovisning',
   version: '1.0.0',
   settingsPanel: { label: 'Bolagsverket', path: '/settings/extensions' },
   apiRoutes: [
@@ -226,6 +251,7 @@ export const bolagsverketExtension: Extension = {
               environment_ceiling: environmentCeiling(),
               // Certificate material is env-only; settings can never carry it.
               has_certificate: Boolean(config.clientCertPem && config.clientKeyPem),
+              filing_enabled: filingReleaseEnabled(),
             },
           })
         } catch (err) {
@@ -273,7 +299,7 @@ export const bolagsverketExtension: Extension = {
         let query = ctx.supabase
           .from('arsredovisning_submissions')
           .select(
-            'id, fiscal_period_id, handling_typ, taxonomy_version, entry_point, environment, status, undertecknare_namn, undertecknare_epost, idnummer, sha256_checksumma, kontrollsumma, bolagsverket_url, kontrollera_utfall, error_message, uploaded_at, registered_at, created_at, updated_at',
+            'id, fiscal_period_id, annual_report_version_id, handling_typ, taxonomy_version, entry_point, environment, status, archive_status, undertecknare_namn, undertecknare_epost, sha256_checksumma, kontrollsumma, bolagsverket_url, kontrollera_utfall, error_message, uploaded_at, registered_at, created_at, updated_at',
           )
           .eq('company_id', ctx.companyId)
           .order('created_at', { ascending: false })
@@ -294,6 +320,11 @@ export const bolagsverketExtension: Extension = {
       path: '/submissions',
       handler: async (request, ctx) => {
         if (!ctx) return noContextResponse()
+        if (!filingReleaseEnabled()) {
+          return errorResponseFromCode('BOLAGSVERKET_NOT_RELEASED', ctx.log, {
+            requestId: ctx.requestId,
+          })
+        }
         const forbidden = await requireWriteRole(ctx)
         if (forbidden) return forbidden
         let parsed: z.infer<typeof SubmitSchema>
@@ -308,7 +339,7 @@ export const bolagsverketExtension: Extension = {
             details: { message },
           })
         }
-        // The webhook subscription registers this URL with Bolagsverket — a
+        // The webhook subscription registers this URL with Bolagsverket: a
         // missing/relative base would register a broken endpoint externally.
         const appUrl = process.env.NEXT_PUBLIC_APP_URL ?? ''
         if (!/^https?:\/\//.test(appUrl)) {
@@ -326,14 +357,21 @@ export const bolagsverketExtension: Extension = {
               companyId: ctx.companyId,
               userId: ctx.userId,
               fiscalPeriodId: parsed.fiscal_period_id,
+              annualReportVersionId: parsed.annual_report_version_id,
               avsandarePnr: parsed.avsandare_pnr,
               undertecknare: parsed.undertecknare,
               kvittensEpost: parsed.kvittens_epost,
-              proposedDividend: parsed.utdelning,
               acceptedAvtalstextAndrad: parsed.accepted_avtalstext_andrad,
               ignoreWarnings: parsed.ignore_warnings,
             },
           )
+          // Bolagsverket marks idnummer as a technical correlation value that
+          // must not be shown to end users. Keep it in the server-side filing
+          // record for webhook matching, but omit it from browser responses.
+          if (result.outcome === 'uploaded' || result.outcome === 'state_unknown') {
+            const { idnummer: _idnummer, ...publicResult } = result
+            return NextResponse.json({ data: publicResult })
+          }
           return NextResponse.json({ data: result })
         } catch (err) {
           ctx.log.error('bolagsverket submission failed', err)

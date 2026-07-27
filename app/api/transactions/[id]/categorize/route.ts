@@ -5,7 +5,11 @@ import { ensureInitialized } from '@/lib/init'
 import { buildMappingResultFromCategory } from '@/lib/bookkeeping/category-mapping'
 import { getTemplateById, buildMappingResultFromTemplate, validateTemplateForEntity } from '@/lib/bookkeeping/booking-templates'
 import { createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
+import { cancelOrphanedPaymentEntry } from '@/lib/bookkeeping/cancel-orphaned-entry'
+import { detectBookingDuplicate } from '@/lib/transactions/booking-duplicate-detection'
+import { appendProcessingHistory } from '@/lib/processing-history/append'
 import { saveUserMappingRule, applySettlementAccount } from '@/lib/bookkeeping/mapping-engine'
+import { resolveSettlementAccount } from '@/lib/bookkeeping/settlement-account'
 import { upsertCounterpartyTemplate, buildMappingResultFromCounterpartyTemplate } from '@/lib/bookkeeping/counterparty-templates'
 import { withRouteContext } from '@/lib/api/with-route-context'
 import { errorResponse, errorResponseFromCode } from '@/lib/errors/get-structured-error'
@@ -15,8 +19,16 @@ import {
   escapeLikePattern,
   normalizeOcrReference,
 } from '@/lib/invoices/duplicate-payment-guard'
-import { AccountsNotInChartError, accountsNotInChartResponse, isBookkeepingError } from '@/lib/bookkeeping/errors'
-import { collectMappingResultAccounts, findMissingActiveAccounts } from '@/lib/bookkeeping/account-validation'
+import {
+  invoiceAmountSek,
+  magnitudesWithinTolerance,
+  normalizeCurrencyCode,
+  planAmountSweeps,
+  type ComparableAmount,
+} from '@/lib/invoices/duplicate-guard-currency'
+import { resolveTransactionAmountSek } from '@/lib/transactions/booking-duplicate-detection'
+import { AccountsNotInChartError, accountsNotInChartResponse } from '@/lib/bookkeeping/errors'
+import { collectMappingResultAccounts, findUnresolvableAccounts } from '@/lib/bookkeeping/account-validation'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
 import type { Logger } from '@/lib/logger'
 import type { CategorizationTemplate } from '@/types'
@@ -144,6 +156,102 @@ export const POST = withRouteContext(
       })
     }
 
+    // Booking-time duplicate guard: this transaction is about to become a NEW
+    // verifikat. If another transaction on the same date+amount+account is
+    // already booked, booking this one double-counts one real affärshändelse
+    // (felaktig bokföring per BFL). Warn; the user confirms with force=true
+    // bound to the reviewed sibling. Mirrors the match-invoice soft-duplicate
+    // guard. Runs before any categorization work so the user resolves it first.
+    try {
+      const candidate = await detectBookingDuplicate(supabase, companyId, {
+        id,
+        date: transaction.date,
+        amount: transaction.amount,
+        // `amount` is denominated in `currency`; the ledger legs the guard
+        // compares it against are always SEK. Selected above via select('*').
+        currency: transaction.currency ?? null,
+        amount_sek: transaction.amount_sek ?? null,
+        exchange_rate: transaction.exchange_rate ?? null,
+        cash_account_id: transaction.cash_account_id ?? null,
+      })
+      if (!body.force) {
+        if (candidate) {
+          return errorResponseFromCode('TRANSACTION_BOOK_POSSIBLE_DUPLICATE', txLog, {
+            requestId,
+            details: { candidate },
+          })
+        }
+      } else if (
+        // force=true is bound to the reviewed candidate. A sibling-transaction
+        // candidate carries a transaction_id; a ledger-only voucher candidate
+        // does not, so both are bound by journal_entry_id. Re-detect and refuse
+        // the bypass unless it still matches, so a guessed id can't wave it away.
+        !candidate ||
+        !(
+          (candidate.journal_entry_id && candidate.journal_entry_id === body.expected_duplicate_journal_entry_id) ||
+          (candidate.transaction_id && candidate.transaction_id === body.expected_duplicate_transaction_id)
+        )
+      ) {
+        return errorResponseFromCode('TRANSACTION_BOOK_FORCE_CANDIDATE_MISMATCH', txLog, {
+          requestId,
+          details: {
+            expected_duplicate_transaction_id: body.expected_duplicate_transaction_id ?? null,
+            expected_duplicate_journal_entry_id: body.expected_duplicate_journal_entry_id ?? null,
+            detected_transaction_id: candidate?.transaction_id ?? null,
+            detected_journal_entry_id: candidate?.journal_entry_id ?? null,
+          },
+        })
+      } else {
+        txLog.warn('booking-time duplicate guard bypassed', {
+          reason: 'force=true',
+          requestId,
+          dismissedTransactionId: candidate.transaction_id,
+        })
+        // Persist the dismissal to behandlingshistorik (BFNAR 2013:2 kap 8):         // booking over a DETECTED possible double-booking is a bookkeeping
+        // decision that needs a durable record. Best-effort; never blocks the
+        // booking.
+        try {
+          await appendProcessingHistory({
+            companyId,
+            correlationId: id,
+            aggregateType: 'BankTransaction',
+            aggregateId: id,
+            eventType: 'BankTransactionDuplicateDismissed',
+            payload: {
+              transaction_id: id,
+              dismissed_transaction_id: candidate.transaction_id,
+              dismissed_journal_entry_id: candidate.journal_entry_id,
+              // Null when the candidate's SEK value could not be established
+              // (a rateless foreign sibling); the foreign figures below then
+              // carry the durable record instead of a fabricated kr amount.
+              amount_ore: candidate.amount != null ? Math.round(candidate.amount * 100) : null,
+              dismissed_currency: candidate.currency,
+              dismissed_amount_in_currency: candidate.amount_in_currency,
+              entry_date: candidate.entry_date,
+              // Whether the user dismissed a confirmed same-amount twin or a
+              // candidate whose kr figure was never established (BFNAR 2013:2
+              // kap 8: the behandlingshistorik has to say which). Parity with
+              // the /book route's dismissal record.
+              amount_verified: candidate.amount_verified,
+              unverified_reason: candidate.unverified_reason,
+            },
+            actor: { type: 'user', id: user.id },
+            occurredAt: new Date(),
+          })
+        } catch (logErr) {
+          txLog.error('failed to append duplicate-dismissal behandlingshistorik', logErr as Error)
+        }
+      }
+    } catch (err) {
+      if (body.force) {
+        return errorResponseFromCode('TRANSACTION_BOOK_FORCE_CANDIDATE_MISMATCH', txLog, {
+          requestId,
+          details: { detection_failed: true },
+        })
+      }
+      txLog.warn('booking-time duplicate detection failed (continuing)', err as Error)
+    }
+
     const { data: settings } = await supabase
       .from('company_settings')
       .select('entity_type, fiscal_year_start_month')
@@ -230,28 +338,14 @@ export const POST = withRouteContext(
     // rather than the hardcoded 1930 in the templates. Without this, interest
     // or fees that landed on a savings/EUR account mis-book to 1930 and the
     // real bank line never reconciles. applySettlementAccount only rewrites a
-    // 1930 leg and is a no-op when the settlement account is 1930 — so legacy
+    // 1930 leg and is a no-op when the settlement account is 1930, so legacy
     // rows with no cash_account_id behave exactly as before.
-    let settlementAccount = '1930'
-    if (transaction.cash_account_id) {
-      const { data: txCashAccount, error: cashAccountError } = await supabase
-        .from('cash_accounts')
-        .select('ledger_account')
-        .eq('id', transaction.cash_account_id)
-        .eq('company_id', companyId)
-        .maybeSingle()
-      if (cashAccountError) {
-        // Don't fail the booking — fall back to 1930 — but surface the lookup
-        // failure so a silent mis-booking to the wrong bank leg stays auditable.
-        txLog.warn('settlement-account lookup failed; defaulting to 1930', {
-          cashAccountId: transaction.cash_account_id,
-          error: cashAccountError.message,
-        })
-      }
-      if (txCashAccount?.ledger_account) {
-        settlementAccount = txCashAccount.ledger_account as string
-      }
-    }
+    const settlementAccount = await resolveSettlementAccount(
+      supabase,
+      companyId!,
+      transaction.cash_account_id,
+      txLog,
+    )
     mappingResult = applySettlementAccount(mappingResult, settlementAccount)
 
     txLog.info('mapping resolved', {
@@ -305,13 +399,17 @@ export const POST = withRouteContext(
     // catch below silently marks the transaction as bokförd with no
     // verifikation. Catching it here means the row stays in "Att bokföra"
     // and the user gets a clear actionable message.
-    const missingAccounts = await findMissingActiveAccounts(
+    //
+    // Only truly unresolvable accounts block: a standard BAS account that is
+    // merely absent from the chart is seeded on demand by the engine, so the
+    // user can always book the row without registering accounts first.
+    const missingAccounts = await findUnresolvableAccounts(
       supabase,
       companyId,
       collectMappingResultAccounts(mappingResult),
     )
     if (missingAccounts.length > 0) {
-      txLog.warn('mapping references inactive/missing accounts', { missingAccounts })
+      txLog.warn('mapping references inactive/unknown accounts', { missingAccounts })
       return accountsNotInChartResponse(new AccountsNotInChartError(missingAccounts))
     }
 
@@ -330,11 +428,55 @@ export const POST = withRouteContext(
       })
     }
 
+    // Units for both invoice-suggestion prongs below. `transactions.amount` is
+    // denominated in `transactions.currency`, while `remaining_amount` on
+    // `supplier_invoices` / `invoices` is denominated in the INVOICE's
+    // currency. A plus-minus 2 % band built around a EUR bank row and applied
+    // to a kronor `remaining_amount` column is off by the whole exchange rate:
+    // it either matches nothing or points the user at an unrelated invoice.
+    // `planAmountSweeps` therefore issues one SQL sweep per currency (band and
+    // column in the same unit) and `magnitudesWithinTolerance` re-checks every
+    // returned row. A SEK transaction yields exactly one sweep with the band it
+    // had before, so a SEK-only company runs the identical single query.
+    const txReferenceAmount: ComparableAmount = {
+      amount: transaction.amount,
+      currency: normalizeCurrencyCode(transaction.currency),
+      sek: resolveTransactionAmountSek({
+        amount: transaction.amount,
+        currency: transaction.currency,
+        amount_sek: transaction.amount_sek,
+        exchange_rate: transaction.exchange_rate,
+      }),
+    }
+
+    /** A candidate invoice row as a comparable amount (pro-rates `total_sek`). */
+    const invoiceRowAmount = (row: {
+      remaining_amount: number | null
+      total?: number | null
+      currency: string | null
+      total_sek?: number | null
+      exchange_rate?: number | null
+    }): ComparableAmount => {
+      const remaining = row.remaining_amount ?? row.total ?? 0
+      const currency = normalizeCurrencyCode(row.currency)
+      return {
+        amount: Number(remaining),
+        currency,
+        sek: invoiceAmountSek({
+          amount: Number(remaining),
+          currency,
+          total: row.total,
+          totalSek: row.total_sek,
+          exchangeRate: row.exchange_rate,
+        }),
+      }
+    }
+
     // Prong B: intercept plain 244x categorization of supplier payments when
     // an open supplier invoice already covers this amount. Categorizing direct
     // to 244x leaves the invoice with status='approved' and lures the user
     // into a duplicate "Markera som betald" later. Credit must be a bank/cash
-    // account (1xxx) — 244x against a clearing account, equity, etc. isn't a
+    // account (1xxx): 244x against a clearing account, equity, etc. isn't a
     // supplier payment and the suggestion would misdirect the user.
     if (
       !body.confirm_no_match &&
@@ -343,9 +485,20 @@ export const POST = withRouteContext(
       /^244\d$/.test(mappingResult.debit_account) &&
       /^1\d{3}$/.test(mappingResult.credit_account)
     ) {
-      const txAmountAbs = Math.abs(transaction.amount)
-      const windowLow = Math.round(txAmountAbs * (1 - DUPLICATE_AMOUNT_TOLERANCE_PCT) * 100) / 100
-      const windowHigh = Math.round(txAmountAbs * (1 + DUPLICATE_AMOUNT_TOLERANCE_PCT) * 100) / 100
+      const { sweeps, crossCurrencyUnverifiable } = planAmountSweeps(
+        txReferenceAmount,
+        DUPLICATE_AMOUNT_TOLERANCE_PCT,
+      )
+      if (crossCurrencyUnverifiable) {
+        // A foreign bank row with neither amount_sek nor exchange_rate cannot
+        // be stated in kronor, so kronor invoices are excluded rather than
+        // compared raw. Logged: an unevaluated candidate set is not the same
+        // thing as "no open invoice matches".
+        txLog.warn('supplier-invoice suggestion: cross-currency candidates not evaluated', {
+          reason: 'transaction_missing_sek_value',
+          currency: txReferenceAmount.currency,
+        })
+      }
 
       let supplierIds: string[] = []
       if (transaction.merchant_name) {
@@ -371,20 +524,56 @@ export const POST = withRouteContext(
           .toISOString()
           .split('T')[0]
 
-        const { data: openInvoices } = await supabase
-          .from('supplier_invoices')
-          .select('id, supplier_invoice_number, invoice_date, remaining_amount, currency, supplier:suppliers(name)')
-          .eq('company_id', companyId)
-          .in('supplier_id', supplierIds)
-          .in('status', ['registered', 'approved', 'partially_paid', 'overdue'])
-          .gte('remaining_amount', windowLow)
-          .lte('remaining_amount', windowHigh)
-          .gte('invoice_date', invoiceDateLow)
-          .lte('invoice_date', invoiceDateHigh)
-          .order('invoice_date', { ascending: false })
-          .limit(5)
+        type SupplierCandidateRow = {
+          id: string
+          supplier_invoice_number: string | null
+          invoice_date: string
+          remaining_amount: number | null
+          total: number | null
+          currency: string | null
+          total_sek: number | null
+          exchange_rate: number | null
+          supplier: { name?: string } | null
+        }
 
-        if (openInvoices && openInvoices.length > 0) {
+        const sweepResults = await Promise.all(
+          sweeps.map((sweep) =>
+            supabase
+              .from('supplier_invoices')
+              .select(
+                'id, supplier_invoice_number, invoice_date, remaining_amount, total, currency, total_sek, exchange_rate, supplier:suppliers(name)',
+              )
+              .eq('company_id', companyId)
+              .in('supplier_id', supplierIds)
+              .in('status', ['registered', 'approved', 'partially_paid', 'overdue'])
+              .or(sweep.currencyFilter)
+              .gte('remaining_amount', sweep.low)
+              .lte('remaining_amount', sweep.high)
+              .gte('invoice_date', invoiceDateLow)
+              .lte('invoice_date', invoiceDateHigh)
+              .order('invoice_date', { ascending: false })
+              .limit(5),
+          ),
+        )
+
+        const byId = new Map<string, SupplierCandidateRow>()
+        for (const res of sweepResults) {
+          for (const row of (res.data ?? []) as unknown as SupplierCandidateRow[]) {
+            if (!byId.has(row.id)) byId.set(row.id, row)
+          }
+        }
+        const openInvoices = Array.from(byId.values())
+          .filter((inv) =>
+            magnitudesWithinTolerance(
+              txReferenceAmount,
+              invoiceRowAmount(inv),
+              DUPLICATE_AMOUNT_TOLERANCE_PCT,
+            ),
+          )
+          .sort((a, b) => (a.invoice_date < b.invoice_date ? 1 : a.invoice_date > b.invoice_date ? -1 : 0))
+          .slice(0, 5)
+
+        if (openInvoices.length > 0) {
           return errorResponseFromCode('TX_CATEGORIZE_SUGGEST_SI_MATCH', txLog, {
             requestId,
             details: {
@@ -405,7 +594,7 @@ export const POST = withRouteContext(
     // Prong B (customer side): intercept plain 151x categorization of an
     // inbound payment when an unpaid customer invoice already covers this
     // amount. Symmetric with the supplier-side intercept above. The debit
-    // must be a bank/cash account (^19\d{2}$, BAS class 19) — a 1xxx debit
+    // must be a bank/cash account (^19\d{2}$, BAS class 19): a 1xxx debit
     // outside class 19 isn't a payment receipt and the suggestion would
     // misdirect the user.
     if (
@@ -415,9 +604,16 @@ export const POST = withRouteContext(
       /^19\d{2}$/.test(mappingResult.debit_account) &&
       /^151\d$/.test(mappingResult.credit_account)
     ) {
-      const txAmount = transaction.amount
-      const windowLow = Math.round(txAmount * (1 - DUPLICATE_AMOUNT_TOLERANCE_PCT) * 100) / 100
-      const windowHigh = Math.round(txAmount * (1 + DUPLICATE_AMOUNT_TOLERANCE_PCT) * 100) / 100
+      const { sweeps, crossCurrencyUnverifiable } = planAmountSweeps(
+        txReferenceAmount,
+        DUPLICATE_AMOUNT_TOLERANCE_PCT,
+      )
+      if (crossCurrencyUnverifiable) {
+        txLog.warn('customer-invoice suggestion: cross-currency candidates not evaluated', {
+          reason: 'transaction_missing_sek_value',
+          currency: txReferenceAmount.currency,
+        })
+      }
 
       // Resolve candidate customer(s) by name. Inbound bank txs are typically
       // described by payer name in EITHER merchant_name OR description, so
@@ -441,7 +637,7 @@ export const POST = withRouteContext(
 
       // Date window anchored on `due_date`, NOT `invoice_date`. Customer
       // payments arrive close to (or after) the due date; for an invoice
-      // with 60–90 day terms, anchoring on invoice_date would push the
+      // with 60-90 day terms, anchoring on invoice_date would push the
       // expected payment outside a ±60-day window and the guard would miss
       // genuine matches. due_date is the better proxy for "around when the
       // payment is expected."
@@ -460,28 +656,47 @@ export const POST = withRouteContext(
         due_date: string | null
         remaining_amount: number | null
         total: number
-        currency: string
+        currency: string | null
+        total_sek: number | null
+        exchange_rate: number | null
         customer: { name?: string } | null
       }
+      const CANDIDATE_COLUMNS =
+        'id, invoice_number, invoice_date, due_date, remaining_amount, total, currency, total_sek, exchange_rate, customer:customers(name)'
       const openInvoiceCandidates: CandidateRow[] = []
+      /** Same-unit re-check: drops any row the SQL sweep let through. */
+      const comparable = (row: CandidateRow) =>
+        magnitudesWithinTolerance(
+          txReferenceAmount,
+          invoiceRowAmount(row),
+          DUPLICATE_AMOUNT_TOLERANCE_PCT,
+        )
 
       if (customerIds.length > 0) {
-        const { data: byCustomer } = await supabase
-          .from('invoices')
-          .select(
-            'id, invoice_number, invoice_date, due_date, remaining_amount, total, currency, customer:customers(name)',
-          )
-          .eq('company_id', companyId)
-          .in('customer_id', customerIds)
-          .in('status', ['sent', 'overdue', 'partially_paid'])
-          .gte('remaining_amount', windowLow)
-          .lte('remaining_amount', windowHigh)
-          .gte('due_date', dueDateLow)
-          .lte('due_date', dueDateHigh)
-          .order('due_date', { ascending: false })
-          .limit(5)
-        for (const row of (byCustomer ?? []) as unknown as CandidateRow[]) {
-          openInvoiceCandidates.push(row)
+        const sweepResults = await Promise.all(
+          sweeps.map((sweep) =>
+            supabase
+              .from('invoices')
+              .select(CANDIDATE_COLUMNS)
+              .eq('company_id', companyId)
+              .in('customer_id', customerIds)
+              .in('status', ['sent', 'overdue', 'partially_paid'])
+              .or(sweep.currencyFilter)
+              .gte('remaining_amount', sweep.low)
+              .lte('remaining_amount', sweep.high)
+              .gte('due_date', dueDateLow)
+              .lte('due_date', dueDateHigh)
+              .order('due_date', { ascending: false })
+              .limit(5),
+          ),
+        )
+        for (const res of sweepResults) {
+          for (const row of (res.data ?? []) as unknown as CandidateRow[]) {
+            if (!comparable(row)) continue
+            if (!openInvoiceCandidates.some((existing) => existing.id === row.id)) {
+              openInvoiceCandidates.push(row)
+            }
+          }
         }
       }
 
@@ -492,21 +707,26 @@ export const POST = withRouteContext(
       const txReference = (transaction as Transaction & { reference?: string | null }).reference
       const normalizedTxRef = normalizeOcrReference(txReference ?? null)
       if (normalizedTxRef) {
-        const { data: byRef } = await supabase
-          .from('invoices')
-          .select(
-            'id, invoice_number, invoice_date, due_date, remaining_amount, total, currency, customer:customers(name)',
-          )
-          .eq('company_id', companyId)
-          .in('status', ['sent', 'overdue', 'partially_paid'])
-          .gte('remaining_amount', windowLow)
-          .lte('remaining_amount', windowHigh)
-          .gte('due_date', dueDateLow)
-          .lte('due_date', dueDateHigh)
-          .order('due_date', { ascending: false })
-          .limit(20)
-        for (const row of (byRef ?? []) as unknown as CandidateRow[]) {
-          if (normalizeOcrReference(row.invoice_number) === normalizedTxRef) {
+        const refSweepResults = await Promise.all(
+          sweeps.map((sweep) =>
+            supabase
+              .from('invoices')
+              .select(CANDIDATE_COLUMNS)
+              .eq('company_id', companyId)
+              .in('status', ['sent', 'overdue', 'partially_paid'])
+              .or(sweep.currencyFilter)
+              .gte('remaining_amount', sweep.low)
+              .lte('remaining_amount', sweep.high)
+              .gte('due_date', dueDateLow)
+              .lte('due_date', dueDateHigh)
+              .order('due_date', { ascending: false })
+              .limit(20),
+          ),
+        )
+        for (const res of refSweepResults) {
+          for (const row of (res.data ?? []) as unknown as CandidateRow[]) {
+            if (normalizeOcrReference(row.invoice_number) !== normalizedTxRef) continue
+            if (!comparable(row)) continue
             if (!openInvoiceCandidates.some((existing) => existing.id === row.id)) {
               openInvoiceCandidates.unshift(row)
             }
@@ -560,24 +780,23 @@ export const POST = withRouteContext(
       txLog.error('failed to create transaction journal entry', err as Error)
       // AccountsNotInChartError means an account was deactivated between our
       // pre-validation and the engine call (rare race). Don't fall through to
-      // the partial-success path — that would mark the transaction bokförd
+      // the partial-success path: that would mark the transaction bokförd
       // with no verifikation and leave the user staring at an unclosable
       // dialog. Return a structured 400 so the row stays in "Att bokföra"
       // and the user can re-activate the account and retry.
       if (err instanceof AccountsNotInChartError) {
         return accountsNotInChartResponse(err)
       }
-      // Bookkeeping errors map to Swedish via the registry. Other errors get
-      // their raw message — the categorization is preserved either way so the
-      // user can still re-book the verifikation manually.
-      if (isBookkeepingError(err)) {
-        journalEntryError = getErrorMessage(err, { context: 'transaction' })
-      } else {
-        journalEntryError = err instanceof Error ? err.message : 'Unknown error'
-      }
+      // All errors map to Swedish via getErrorMessage: the raw message is
+      // already logged above and must never reach the user verbatim (issue
+      // #337). The categorization is preserved either way so the user can
+      // still re-book the verifikation manually.
+      journalEntryError = getErrorMessage(err, { context: 'transaction' })
     }
 
-    if (is_business && transaction.merchant_name) {
+    // direction_mismatch = a mirrored refund/repayment booking; learning it
+    // as a rule would store backwards accounts for the merchant.
+    if (is_business && transaction.merchant_name && !mappingResult.direction_mismatch) {
       try {
         await saveUserMappingRule(
           supabase,
@@ -595,8 +814,10 @@ export const POST = withRouteContext(
     }
 
     try {
+      // Templates are company-scoped since the multi-tenant refactor: passing
+      // user.id here broke learning entirely (FK/RLS reject the write).
       await upsertCounterpartyTemplate(
-        supabase, user.id, transaction as Transaction, mappingResult, 'user_approved',
+        supabase, companyId, transaction as Transaction, mappingResult, 'user_approved',
       )
     } catch (err) {
       txLog.warn('failed to upsert counterparty template (non-critical)', err as Error)
@@ -626,7 +847,7 @@ export const POST = withRouteContext(
       // receipt-on-verifikation (BFL 5 kap 6 §) is satisfied. The journal entry has
       // already been committed at this point, so we can't roll it back; instead
       // surface a warning in the response so the UI can prompt the user to retry
-      // the link. Supabase JS returns { error } rather than throwing — destructure
+      // the link. Supabase JS returns { error } rather than throwing: destructure
       // and surface it, never swallow silently.
       try {
         const { error: linkErr } = await supabase
@@ -671,7 +892,7 @@ export const POST = withRouteContext(
         // unmatched. Categorizing here puts the underlag on a verifikation,
         // which is the inbox's "booked" state. Without this the inbox keeps
         // offering "Matcha mot transaktion" for an underlag that's already on a
-        // posted entry — while the transactions view (which reads the
+        // posted entry, while the transactions view (which reads the
         // doc↔verifikat link) already shows it as attached. Mirrors the
         // backfill that /attach-document does for the manual paperclip path.
         await supabase
@@ -705,28 +926,16 @@ export const POST = withRouteContext(
 
     if ((!updateResult || updateResult.length === 0) && journalEntryId) {
       // CAS guard: another request set journal_entry_id between our read and
-      // write. Cancel the orphaned entry and document the voucher gap.
-      const { data: orphan } = await supabase
-        .from('journal_entries')
-        .select('fiscal_period_id, voucher_series, voucher_number')
-        .eq('id', journalEntryId)
-        .single()
-
-      await supabase
-        .from('journal_entries')
-        .update({ status: 'cancelled' })
-        .eq('id', journalEntryId)
-
-      if (orphan) {
-        await supabase.from('voucher_gap_explanations').insert({
-          company_id: companyId,
-          fiscal_period_id: orphan.fiscal_period_id,
-          voucher_series: orphan.voucher_series || 'A',
-          gap_number: orphan.voucher_number,
-          explanation: 'Automatiskt makulerad: dubblettbokning förhindrad av samtidighetsskydd',
-          created_by: user.id,
-        })
-      }
+      // write. Cancel the orphaned entry and document the voucher gap through
+      // the shared helper (BFNAR 2013:2), which owns the correct
+      // voucher_gap_explanations column set and logs failures loudly.
+      await cancelOrphanedPaymentEntry(
+        supabase,
+        companyId,
+        user.id,
+        journalEntryId,
+        'Automatiskt makulerad: dubblettbokning förhindrad av samtidighetsskydd',
+      )
 
       return errorResponseFromCode('TX_CATEGORIZE_RACE', txLog, { requestId })
     }
@@ -734,7 +943,7 @@ export const POST = withRouteContext(
     // Flag any inbox underlag already matched to this transaction as booked.
     // The block above only fires when the caller passes an explicit
     // inbox_item_id (booking straight from the inbox flow). Booking the same
-    // transaction from anywhere else — the /transactions list, quick review —
+    // transaction from anywhere else (the /transactions list, quick review)
     // would otherwise leave an attached underlag stuck as "Kopplad" in the
     // inbox forever. Here we resolve it by the link itself (matched_transaction
     // _id) so the inbox reflects the booking regardless of entry point. Mirrors
@@ -784,7 +993,7 @@ export const POST = withRouteContext(
 
     if (journalEntryError) {
       // Categorization stuck but the verifikation didn't make it through.
-      // Surface as a structured warning — the response below carries the
+      // Surface as a structured warning: the response below carries the
       // user-facing message in `journal_entry_error`.
       txLog.warn('partial outcome: journal entry creation failed', {
         reason: 'journal_entry_creation_failed',

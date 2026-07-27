@@ -12,8 +12,20 @@ import { Separator } from '@/components/ui/separator'
 import { useToast } from '@/components/ui/use-toast'
 import { formatCurrency, formatDate, cn } from '@/lib/utils'
 import { getVatTreatmentLabel } from '@/lib/invoices/vat-rules'
-import { invoiceDisplayNumber } from '@/lib/invoices/display'
+import { invoiceDisplayNumber, isTextLikeLine } from '@/lib/invoices/display'
 import { getDisplayTotal } from '@/lib/invoices/rounding'
+import { isEditableInvoiceDraft } from '@/lib/invoices/is-editable-draft'
+import { creditNoteNeedsJournalEntry } from '@/lib/invoices/issue-credit-note'
+import { getCreditNoteSendMode } from '@/lib/invoices/credit-note-send-mode'
+import { canCopyInvoice } from '@/lib/invoices/copy-invoice'
+import {
+  invoiceDocumentCaveat,
+  invoiceRerenderUrl,
+  resolveInvoicePdfSource,
+  type InvoicePdfRerenderReason,
+  type InvoicePdfSource,
+} from '@/lib/invoices/invoice-pdf-source'
+import { contentDispositionFilename } from '@/lib/api/content-disposition'
 import {
   Loader2,
   ArrowLeft,
@@ -21,6 +33,7 @@ import {
   CheckCircle,
   FileText,
   Download,
+  Eye,
   XCircle,
   Mail,
   ReceiptText,
@@ -31,10 +44,18 @@ import {
   Trash2,
   Lock,
   CalendarClock,
+  Pencil,
+  Copy,
 } from 'lucide-react'
 import { useCanWrite } from '@/lib/hooks/use-can-write'
+import { useCompany, useCapability } from '@/contexts/CompanyContext'
+import { CAPABILITY } from '@/lib/entitlements/keys'
 import PaymentBookingDialog from '@/components/invoices/PaymentBookingDialog'
 import SendInvoiceDialog from '@/components/invoices/SendInvoiceDialog'
+import {
+  InvoiceDeliveryHistory,
+  type InvoiceDeliveryView,
+} from '@/components/invoices/InvoiceDeliveryHistory'
 import CorrectionAffordance from '@/components/bookkeeping/CorrectionAffordance'
 import {
   Dialog,
@@ -45,6 +66,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import type { Invoice, InvoiceItem, Customer, InvoiceStatus, InvoiceReminder, InvoiceDocumentType } from '@/types'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 const statusVariantMap: Record<InvoiceStatus, 'default' | 'secondary' | 'success' | 'warning' | 'destructive'> = {
   draft: 'secondary',
@@ -56,7 +78,19 @@ const statusVariantMap: Record<InvoiceStatus, 'default' | 'secondary' | 'success
   credited: 'secondary',
 }
 
-// A line is periodiserad when both period dates are set — the revenue was
+// Why the downloaded file is not the invoice the customer received. One key
+// per reason: "no archived copy exists" and "the archive could not be reached"
+// are different facts and must not be told as the same story.
+const RERENDER_CAVEAT_KEYS: Record<
+  Exclude<InvoicePdfRerenderReason, 'not_sent_yet'>,
+  string
+> = {
+  sent_outside_accounted: 'pdf_rerender_reason_sent_outside',
+  no_archived_copy: 'pdf_rerender_reason_no_archive',
+  archive_unreachable: 'pdf_rerender_reason_archive_unreachable',
+}
+
+// A line is periodiserad when both period dates are set: the revenue was
 // parked on the 29xx interim account and dissolves monthly via accrual_schedules.
 const itemHasAccrual = (item: InvoiceItem): boolean =>
   !!(item.accrual_period_start && item.accrual_period_end)
@@ -66,7 +100,6 @@ const accrualMonth = (date: string): string => date.slice(0, 7)
 interface InvoiceWithRelations extends Invoice {
   customer: Customer
   items: InvoiceItem[]
-  sent_at?: string
   // Optional reference to the issuance verifikation. Populated by the
   // backend when the invoice flow auto-books an entry on send; absent on
   // older invoices and on companies where issuance is not auto-booked.
@@ -75,6 +108,8 @@ interface InvoiceWithRelations extends Invoice {
 
 export default function InvoiceDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { canWrite } = useCanWrite()
+  const { company, isSandbox } = useCompany()
+  const canEmail = useCapability(CAPABILITY.email_send)
   const { id } = use(params)
   const router = useRouter()
   const { toast } = useToast()
@@ -83,6 +118,19 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
 
   const [invoice, setInvoice] = useState<InvoiceWithRelations | null>(null)
   const [reminders, setReminders] = useState<InvoiceReminder[]>([])
+  const [deliveries, setDeliveries] = useState<InvoiceDeliveryView[]>([])
+  // An empty deliveries list means "nothing was ever sent through Accounted".
+  // A failed read also produces an empty list, and the two must never be
+  // conflated: the archived PDF the customer received is the räkenskapsunderlag
+  // (BFL 7 kap), and a freshly re-rendered one is a different document.
+  const [deliveriesUnreadable, setDeliveriesUnreadable] = useState(false)
+  // Set when the archived copy could not be produced, so the user is asked
+  // instead of being handed a substitute that looks like the original.
+  const [pdfArchiveIssue, setPdfArchiveIssue] = useState<'history' | 'document' | null>(null)
+  // Which action raised that question: the dialog's fallback must do what the
+  // user originally asked for (open in the browser vs save the file), not
+  // silently switch mechanism (#1190).
+  const [pdfIntent, setPdfIntent] = useState<'download' | 'preview'>('download')
   // Payment history backing the new Betalningsstatus card. Fetched alongside
   // the invoice itself so the card stays in sync with paid_amount /
   // remaining_amount on the invoice row.
@@ -114,6 +162,10 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
   const [nextNumberPreview, setNextNumberPreview] = useState<string | null>(null)
   const [oreRounding, setOreRounding] = useState<boolean>(true)
   const [vatRegistered, setVatRegistered] = useState<boolean>(true)
+  const [accountingMethod, setAccountingMethod] = useState<'accrual' | 'cash'>('accrual')
+  // #967: register/send without booking; ekonomi books in a separate step.
+  const [deferInvoiceBooking, setDeferInvoiceBooking] = useState(false)
+  const [reminderDays, setReminderDays] = useState<[number, number, number]>([15, 30, 45])
 
   const statusLabel = (status: InvoiceStatus): string => t(`status_${status}`)
   const reminderLevelLabel = (level: 1 | 2 | 3): string => t(`reminder_level_${level}`)
@@ -122,18 +174,80 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
     fetchInvoice()
   }, [id])
 
+  /**
+   * Read the delivery history, keeping "read failed" distinct from "nothing
+   * has been sent". Both used to arrive as `[]`, which is what let a network
+   * blip silently downgrade the invoice download from the archived PDF the
+   * customer received to a freshly re-rendered one.
+   */
+  async function loadDeliveries(): Promise<{
+    ok: boolean
+    deliveries: InvoiceDeliveryView[]
+  }> {
+    try {
+      const response = await fetch(`/api/invoices/${encodeURIComponent(id)}/deliveries`)
+      if (!response.ok) return { ok: false, deliveries: [] }
+      const payload = (await response.json()) as { data?: InvoiceDeliveryView[] }
+      if (!Array.isArray(payload.data)) return { ok: false, deliveries: [] }
+      return { ok: true, deliveries: payload.data }
+    } catch {
+      return { ok: false, deliveries: [] }
+    }
+  }
+
+  async function retryLoadDeliveries() {
+    const result = await loadDeliveries()
+    setDeliveries(result.deliveries)
+    setDeliveriesUnreadable(!result.ok)
+    return result
+  }
+
   async function fetchInvoice() {
     setIsLoading(true)
 
-    const { data, error } = await supabase
-      .from('invoices')
-      .select(`
-        *,
-        customer:customers(*),
-        items:invoice_items(*)
-      `)
-      .eq('id', id)
-      .single()
+    // Settings depend only on the active company, so start them with the main
+    // invoice batch instead of waiting for the invoice row first.
+    const settingsPromise = company?.id
+      ? supabase
+          .from('company_settings')
+          .select('ore_rounding, vat_registered, accounting_method, defer_invoice_booking, reminder_days_level_1, reminder_days_level_2, reminder_days_level_3')
+          .eq('company_id', company.id)
+          .maybeSingle()
+      : Promise.resolve(null)
+
+    const deliveriesPromise = loadDeliveries()
+
+    // Invoice, reminders, payments, and deliveries all key on the route id: one
+    // parallel batch. Only the follow-ups below need the invoice row.
+    const [{ data, error }, { data: reminderData }, { data: paymentData }, deliveryData] =
+      await Promise.all([
+        supabase
+          .from('invoices')
+          .select(`
+            *,
+            customer:customers(*),
+            items:invoice_items(*)
+          `)
+          .eq('id', id)
+          .single(),
+        supabase
+          .from('invoice_reminders')
+          .select('*')
+          .eq('invoice_id', id)
+          .order('sent_at', { ascending: false }),
+        // Payment history for the Betalningsstatus card. Joins the
+        // journal_entries row to get voucher_series + voucher_number so each
+        // payment row can link to its verifikat. Manual payments (no tx, no
+        // JE) still surface with the amount + date.
+        supabase
+          .from('invoice_payments')
+          .select(
+            'id, payment_date, amount, currency, journal_entry_id, journal_entries(voucher_series, voucher_number)',
+          )
+          .eq('invoice_id', id)
+          .order('payment_date', { ascending: true }),
+        deliveriesPromise,
+      ])
 
     if (error || !data) {
       toast({
@@ -151,45 +265,12 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
     }
 
     setInvoice(data as InvoiceWithRelations)
-
-    // Fetch the öresavrundning + VAT-registration settings so the detail view
-    // matches the PDF (pdf-template.tsx:792 hides org_number / personnummer
-    // for private customers, and :876 suppresses the moms row when the seller
-    // is not VAT-registered and the invoice carries no VAT).
-    if (data.company_id) {
-      const { data: settings } = await supabase
-        .from('company_settings')
-        .select('ore_rounding, vat_registered')
-        .eq('company_id', data.company_id)
-        .maybeSingle()
-      setOreRounding(settings?.ore_rounding ?? true)
-      if (typeof settings?.vat_registered === 'boolean') {
-        setVatRegistered(settings.vat_registered)
-      }
-    }
-
-    // Fetch reminders for this invoice
-    const { data: reminderData } = await supabase
-      .from('invoice_reminders')
-      .select('*')
-      .eq('invoice_id', id)
-      .order('sent_at', { ascending: false })
+    setDeliveries(deliveryData.deliveries)
+    setDeliveriesUnreadable(!deliveryData.ok)
 
     if (reminderData) {
       setReminders(reminderData as InvoiceReminder[])
     }
-
-    // Fetch payment history for the Betalningsstatus card. Joins the
-    // journal_entries row to get voucher_series + voucher_number so each
-    // payment row can link to its verifikat. Manual payments (no tx, no
-    // JE) still surface with the amount + date.
-    const { data: paymentData } = await supabase
-      .from('invoice_payments')
-      .select(
-        'id, payment_date, amount, currency, journal_entry_id, journal_entries(voucher_series, voucher_number)',
-      )
-      .eq('invoice_id', id)
-      .order('payment_date', { ascending: true })
 
     if (paymentData) {
       type PaymentRow = {
@@ -213,46 +294,94 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
       )
     }
 
-    // If this invoice is credited, find the credit note
-    if (data.status === 'credited') {
-      const { data: creditNoteData } = await supabase
-        .from('invoices')
-        .select('id, invoice_number')
-        .eq('credited_invoice_id', id)
-        .single()
-
-      if (creditNoteData) {
-        setCreditNote(creditNoteData as Invoice)
+    const settingsRes = await settingsPromise
+    if (settingsRes) {
+      const settings = settingsRes.data
+      setOreRounding(settings?.ore_rounding ?? true)
+      if (typeof settings?.vat_registered === 'boolean') {
+        setVatRegistered(settings.vat_registered)
       }
+      setAccountingMethod(settings?.accounting_method === 'cash' ? 'cash' : 'accrual')
+      setDeferInvoiceBooking(!!settings?.defer_invoice_booking)
+      setReminderDays([
+        settings?.reminder_days_level_1 ?? 15,
+        settings?.reminder_days_level_2 ?? 30,
+        settings?.reminder_days_level_3 ?? 45,
+      ])
     }
 
-    // If this is a credit note, fetch the original invoice
-    if (data.credited_invoice_id) {
-      const { data: originalData } = await supabase
-        .from('invoices')
-        .select('id, invoice_number')
-        .eq('id', data.credited_invoice_id)
-        .single()
-
-      if (originalData) {
-        setOriginalInvoice(originalData as Invoice)
-      }
-    }
-
-    // If this invoice was converted from a proforma, fetch it
-    if (data.converted_from_id) {
-      const { data: convertedData } = await supabase
-        .from('invoices')
-        .select('id, invoice_number')
-        .eq('id', data.converted_from_id)
-        .single()
-
-      if (convertedData) {
-        setConvertedFromInvoice(convertedData as Invoice)
-      }
-    }
-
+    // Related documents need the invoice row but do not gate the main detail
+    // view. Resolve them together after first paint and fill their links in.
     setIsLoading(false)
+    void Promise.all([
+        !data.credited_invoice_id &&
+        ['sent', 'paid', 'overdue', 'credited'].includes(data.status)
+          ? supabase
+              .from('invoices')
+              .select('id, invoice_number, status')
+              .eq('credited_invoice_id', id)
+              .neq('status', 'cancelled')
+              .maybeSingle()
+          : Promise.resolve(null),
+        data.credited_invoice_id
+          ? supabase
+              .from('invoices')
+              .select('id, invoice_number, status, journal_entry_id, paid_at, paid_amount, total')
+              .eq('id', data.credited_invoice_id)
+              .single()
+          : Promise.resolve(null),
+        data.converted_from_id
+          ? supabase
+              .from('invoices')
+              .select('id, invoice_number')
+              .eq('id', data.converted_from_id)
+              .single()
+          : Promise.resolve(null),
+      ]).then(([creditNoteRes, originalRes, convertedRes]) => {
+        setCreditNote(creditNoteRes?.data ? (creditNoteRes.data as Invoice) : null)
+        if (originalRes?.data) {
+          setOriginalInvoice(originalRes.data as Invoice)
+        }
+        if (convertedRes?.data) {
+          setConvertedFromInvoice(convertedRes.data as Invoice)
+        }
+      })
+  }
+
+  // #967: deferred booking: create the revenue verifikat afterwards.
+  async function handleBook() {
+    if (!invoice) return
+    setIsUpdating(true)
+    try {
+      const response = await fetch(`/api/invoices/${invoice.id}/book`, { method: 'POST' })
+      const data = await response.json()
+      if (!response.ok) {
+        // data.error is a structured object for this route; only strings are
+        // usable as a toast message.
+        const message =
+          typeof data.error === 'string'
+            ? data.error
+            : typeof data.error?.message === 'string'
+              ? data.error.message
+              : t('book_failed_fallback')
+        throw new Error(message)
+      }
+      if (Array.isArray(data.warnings) && data.warnings.length > 0) {
+        // Booked, but a follow-up is needed (e.g. periodiseringar failed).
+        toast({ title: t('booked_title'), description: t('booked_with_warnings_description'), variant: 'destructive' })
+      } else {
+        toast({ title: t('booked_title'), description: t('booked_description') })
+      }
+      fetchInvoice()
+    } catch (error) {
+      toast({
+        title: t('book_failed_title'),
+        description: error instanceof Error ? getUserErrorMessage(error) : t('fallback_try_again'),
+        variant: 'destructive',
+      })
+    } finally {
+      setIsUpdating(false)
+    }
   }
 
   async function updateStatus(status: InvoiceStatus) {
@@ -271,7 +400,7 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
           throw new Error(data.error || t('mark_sent_failed_fallback'))
         }
       } else if (status === 'cancelled') {
-        // Only drafts and proformas can be cancelled directly — sent/overdue/paid
+        // Only drafts and proformas can be cancelled directly: sent/overdue/paid
         // invoices have committed journal entries and require a credit note instead
         if (invoice.status !== 'draft') {
           const docType = ((invoice as Invoice & { document_type?: InvoiceDocumentType }).document_type || 'invoice') as InvoiceDocumentType
@@ -300,7 +429,7 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
     } catch (error) {
       toast({
         title: t('status_update_failed_title'),
-        description: error instanceof Error ? error.message : t('fallback_try_again'),
+        description: error instanceof Error ? getUserErrorMessage(error) : t('fallback_try_again'),
         variant: 'destructive',
       })
     }
@@ -337,7 +466,7 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
     } catch (error) {
       toast({
         title: t('convert_failed_title'),
-        description: error instanceof Error ? error.message : t('fallback_try_again'),
+        description: error instanceof Error ? getUserErrorMessage(error) : t('fallback_try_again'),
         variant: 'destructive',
       })
     }
@@ -345,15 +474,38 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
     setIsConverting(false)
   }
 
-  async function downloadPDF() {
+  /**
+   * Fetch and save one specific document, then say truthfully which one it was.
+   *
+   * The archived delivery is the invoice the customer actually received and is
+   * the räkenskapsunderlag kept for 7 years (BFL 7 kap). A re-render comes off
+   * today's invoice row, customer row, company settings and logo, so it is a
+   * different document whenever any of those moved. It may be served when it
+   * is the only thing that exists, but never under the plain "nedladdad" toast
+   * that reads as "here is what you sent".
+   */
+  async function runInvoiceDownload(source: InvoicePdfSource) {
     if (!invoice) return
+
+    if (source.kind === 'unavailable') {
+      setPdfIntent('download')
+      setPdfArchiveIssue('history')
+      return
+    }
 
     setIsDownloading(true)
 
     try {
-      const response = await fetch(`/api/invoices/${invoice.id}/pdf`)
+      const response = await fetch(source.url)
 
       if (!response.ok) {
+        // A missing archive is not a generation failure and must not offer a
+        // silent substitute: hand the choice back to the user.
+        if (source.kind === 'archived') {
+          setPdfIntent('download')
+          setPdfArchiveIssue('document')
+          return
+        }
         throw new Error(t('pdf_generate_failed'))
       }
 
@@ -361,27 +513,146 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
       const url = window.URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
-      a.download = `faktura-${invoice.invoice_number ?? `utkast-${invoice.id.slice(0, 8)}`}.pdf`
+      a.download = contentDispositionFilename(response.headers.get('Content-Disposition'))
+        ?? `faktura-${invoice.invoice_number ?? `utkast-${invoice.id.slice(0, 8)}`}.pdf`
       document.body.appendChild(a)
       a.click()
       window.URL.revokeObjectURL(url)
       document.body.removeChild(a)
 
-      toast({
-        title: t('pdf_downloaded_title'),
-        description: invoice.invoice_number
-          ? t('pdf_downloaded_with_number', { number: invoice.invoice_number })
-          : t('pdf_downloaded_draft'),
-      })
+      const caveat = invoiceDocumentCaveat(source)
+      if (caveat) {
+        toast({
+          title: t('pdf_rerender_downloaded_title'),
+          description: t(RERENDER_CAVEAT_KEYS[caveat]),
+        })
+      } else {
+        toast({
+          title: t('pdf_downloaded_title'),
+          description: invoice.invoice_number
+            ? t('pdf_downloaded_with_number', { number: invoice.invoice_number })
+            : t('pdf_downloaded_draft'),
+        })
+      }
     } catch (error) {
       toast({
         title: t('pdf_download_failed_title'),
-        description: error instanceof Error ? error.message : t('fallback_try_again'),
+        description: error instanceof Error ? getUserErrorMessage(error) : t('fallback_try_again'),
         variant: 'destructive',
       })
+    } finally {
+      setIsDownloading(false)
+    }
+  }
+
+  async function downloadPDF() {
+    if (!invoice) return
+    setPdfArchiveIssue(null)
+    await runInvoiceDownload(
+      resolveInvoicePdfSource({
+        invoiceId: invoice.id,
+        invoiceStatus: invoice.status,
+        deliveriesLoaded: !deliveriesUnreadable,
+        deliveries,
+      }),
+    )
+  }
+
+  /**
+   * Show one specific document in the browser instead of saving it (#1190):
+   * granskning should not require leaving the app for the Downloads folder.
+   *
+   * Which document may be shown is the same question as for the download, and
+   * gets the same answer: the archived delivery when it exists, a re-render only
+   * with the caveat spelled out, and a question rather than a guess when the
+   * delivery history could not be read. Only the mechanism differs, so a tab is
+   * opened synchronously (before any await) to keep the click's user activation
+   * and stay clear of the popup blocker.
+   */
+  function runInvoicePreview(source: InvoicePdfSource) {
+    if (!invoice) return
+
+    if (source.kind === 'unavailable') {
+      setPdfIntent('preview')
+      setPdfArchiveIssue('history')
+      return
     }
 
+    const url =
+      source.kind === 'archived' ? source.url : invoiceRerenderUrl(invoice.id, { inline: true })
+
+    if (!window.open(url, '_blank', 'noopener,noreferrer')) {
+      toast({
+        title: t('pdf_preview_blocked_title'),
+        description: t('pdf_preview_blocked_description'),
+        variant: 'destructive',
+      })
+      return
+    }
+
+    const caveat = invoiceDocumentCaveat(source)
+    if (caveat) {
+      toast({
+        title: t('pdf_rerender_preview_title'),
+        description: t(RERENDER_CAVEAT_KEYS[caveat]),
+      })
+    }
+  }
+
+  function previewPDF() {
+    if (!invoice) return
+    setPdfArchiveIssue(null)
+    runInvoicePreview(
+      resolveInvoicePdfSource({
+        invoiceId: invoice.id,
+        invoiceStatus: invoice.status,
+        deliveriesLoaded: !deliveriesUnreadable,
+        deliveries,
+      }),
+    )
+  }
+
+  // "Försök igen" from the archive dialog. Re-reads the delivery history first
+  // so a transient list failure resolves back to the archived copy instead of
+  // getting stuck on the stale empty state.
+  async function retryArchivedDownload() {
+    if (!invoice) return
+    setIsDownloading(true)
+    const result = await retryLoadDeliveries()
     setIsDownloading(false)
+    setPdfArchiveIssue(null)
+    const source = resolveInvoicePdfSource({
+      invoiceId: invoice.id,
+      invoiceStatus: invoice.status,
+      deliveriesLoaded: result.ok,
+      deliveries: result.deliveries,
+    })
+    // The retry is a second attempt at what the user asked for, not a switch to
+    // the other mechanism. A preview retry re-resolves the source first, so the
+    // tab it opens is no longer inside the original click's activation window;
+    // a blocked popup is reported rather than swallowed.
+    if (pdfIntent === 'preview') {
+      runInvoicePreview(source)
+      return
+    }
+    await runInvoiceDownload(source)
+  }
+
+  // The user explicitly accepted a re-render after being told it is not the
+  // document that was sent. The toast still says so.
+  async function downloadRerenderAnyway() {
+    if (!invoice) return
+    setPdfArchiveIssue(null)
+    const source = {
+      kind: 'rerender' as const,
+      url: invoiceRerenderUrl(invoice.id),
+      reason: 'archive_unreachable' as const,
+    }
+    if (pdfIntent === 'preview') {
+      runInvoicePreview(source)
+      return
+    }
+    await runInvoiceDownload(source)
   }
 
   // Open the finalize dialog and peek the next F-number so the user can see
@@ -398,7 +669,7 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
         const preview = json?.data?.preview
         // Only show a value that looks like a real invoice number. Guards the
         // preview against an unexpected/oversized API response being rendered
-        // verbatim — a short alphanumeric token (optional series prefix), never
+        // verbatim, a short alphanumeric token (optional series prefix), never
         // free-form text.
         setNextNumberPreview(
           typeof preview === 'string' && /^[A-Za-z0-9-]{1,32}$/.test(preview) ? preview : null
@@ -409,7 +680,7 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
     }
   }
 
-  // "Granska & skapa" — finalize an unnumbered draft into a real invoice:
+  // "Granska & skapa": finalize an unnumbered draft into a real invoice:
   // allocate the F-number and emit invoice.created. After this the invoice
   // behaves like any draft (send / makulera), no longer hard-deletable.
   async function finalizeInvoice() {
@@ -438,7 +709,7 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
     } catch (error) {
       toast({
         title: t('finalize_failed_title'),
-        description: error instanceof Error ? error.message : t('fallback_try_again'),
+        description: error instanceof Error ? getUserErrorMessage(error) : t('fallback_try_again'),
         variant: 'destructive',
       })
     } finally {
@@ -464,7 +735,7 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
       // Unnumbered drafts are hard deleted ("Ta bort"); numbered drafts are
       // makulerade and keep their number in the series.
       toast(
-        invoice.invoice_number
+        invoice.invoice_number && !invoice.credited_invoice_id
           ? {
               title: t('cancelled_toast_title'),
               description: t('cancelled_with_number', { number: invoice.invoice_number }),
@@ -475,11 +746,15 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
             }
       )
 
-      router.push('/invoices')
+      router.push(
+        invoice.credited_invoice_id
+          ? `/invoices/${invoice.credited_invoice_id}`
+          : '/invoices',
+      )
     } catch (error) {
       toast({
         title: t('cancel_failed_title'),
-        description: error instanceof Error ? error.message : t('fallback_try_again'),
+        description: error instanceof Error ? getUserErrorMessage(error) : t('fallback_try_again'),
         variant: 'destructive',
       })
     }
@@ -507,19 +782,55 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
   const isProforma = docType === 'proforma'
   const isDeliveryNote = docType === 'delivery_note'
   const isRealInvoice = docType === 'invoice'
+  const isCreditNote = !!invoice.credited_invoice_id
+  const booksOnIssue = isCreditNote
+    ? !!originalInvoice && creditNoteNeedsJournalEntry(accountingMethod, originalInvoice)
+    : accountingMethod === 'accrual' && !deferInvoiceBooking
+  // #967: sent under deferred booking; ekonomi books the revenue verifikat
+  // from here afterwards.
+  const canBookAfterwards =
+    isRealInvoice &&
+    !isCreditNote &&
+    !invoice.journal_entry_id &&
+    accountingMethod === 'accrual' &&
+    ['sent', 'overdue'].includes(invoice.status)
+  const preferredSendMode = getCreditNoteSendMode({
+    customerHasEmail,
+    isSandbox,
+    canEmail,
+  })
+  const creditNoteNeedsRepair =
+    isCreditNote &&
+    invoice.status === 'sent' &&
+    !!originalInvoice &&
+    (
+      originalInvoice.status !== 'credited' ||
+      (
+        creditNoteNeedsJournalEntry(accountingMethod, originalInvoice) &&
+        !invoice.journal_entry_id
+      )
+    )
   // An unnumbered draft is one saved via "Spara som utkast" that hasn't been
-  // finalized — no F-number yet, so it can still be reviewed-and-created or
+  // finalized: no F-number yet, so it can still be reviewed-and-created or
   // hard-deleted. Once finalized it gets a number and behaves like any draft.
   const isUnnumberedDraft = invoice.status === 'draft' && !invoice.invoice_number && isRealInvoice
   // A numbered draft is issued-but-unsent ("Ej skickad"), distinct from an
-  // unnumbered draft ("Utkast"). Display-only — the DB status stays 'draft'.
+  // unnumbered draft ("Utkast"). Display-only: the DB status stays 'draft'.
   const isUnsentNumberedInvoice = invoice.status === 'draft' && !!invoice.invoice_number && isRealInvoice
   const displayStatusVariant = isUnsentNumberedInvoice ? 'outline' : statusVariant
   const displayStatusLabel = isUnsentNumberedInvoice ? t('status_unsent') : statusLabel(invoice.status)
   // Self-billing invoices we received: the document is the counterparty's, so
-  // there is no own PDF to render and no send step — it arrives already booked.
+  // there is no own PDF to render and no send step: it arrives already booked.
   const isSelfBilled = !!invoice.is_self_billed
+  // A draft (no committed verifikat, not sent, not self-billed) can be edited
+  // in place (header + lines) via /invoices/{id}/edit. Sent/paid invoices are
+  // immutable (BFL); they are corrected with a credit note instead.
+  const isEditableDraft = isEditableInvoiceDraft(invoice)
+  const isCopyable = canCopyInvoice(invoice)
   const hasAccruedItems = invoice.items.some(itemHasAccrual)
+  const latestCompletedDelivery = deliveries.find(
+    (delivery) => delivery.status === 'sent' || delivery.status === 'marked_sent',
+  )
   return (
     <div className="space-y-8">
       {/* Header */}
@@ -530,12 +841,12 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
           </Button>
           <div>
             <div className="flex flex-wrap items-center gap-2 sm:gap-3">
-              <h1 className={cn('font-display text-2xl sm:text-3xl font-medium tracking-tight', !invoice.invoice_number && !isSelfBilled && 'italic text-muted-foreground')}>{isSelfBilled ? invoiceDisplayNumber(invoice as Invoice) : (invoice.invoice_number ?? '—')}</h1>
+              <h1 className={cn('font-display text-2xl leading-8 tracking-tight', !invoice.invoice_number && !isSelfBilled && 'italic text-muted-foreground')}>{isSelfBilled ? invoiceDisplayNumber(invoice as Invoice) : (invoice.invoice_number ?? '-')}</h1>
               {isProforma && (
-                <Badge variant="secondary" className="bg-primary/10 text-primary">{t('badge_proforma')}</Badge>
+                <Badge variant="outline">{t('badge_proforma')}</Badge>
               )}
               {isDeliveryNote && (
-                <Badge variant="secondary" className="bg-success/10 text-success">{t('badge_delivery_note')}</Badge>
+                <Badge variant="success">{t('badge_delivery_note')}</Badge>
               )}
               {isSelfBilled && (
                 <Badge variant="outline">{t('badge_self_billed')}</Badge>
@@ -552,13 +863,22 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
             </div>
             <p className="text-muted-foreground">
               {t('created_at', { date: formatDate(invoice.created_at) })}
-              {invoice.sent_at && t('sent_at_suffix', { date: formatDate(invoice.sent_at) })}
+              {latestCompletedDelivery?.sent_at &&
+                t('sent_at_suffix', { date: formatDate(latestCompletedDelivery.sent_at) })}
             </p>
           </div>
         </div>
 
         {/* Actions */}
         <div className="flex flex-wrap items-center gap-2">
+          {isEditableDraft && canWrite && (
+            <Link href={`/invoices/${invoice.id}/edit`}>
+              <Button variant="outline">
+                <Pencil className="mr-2 h-4 w-4" />
+                {t('edit_draft')}
+              </Button>
+            </Link>
+          )}
           {isProforma && invoice.status !== 'cancelled' && (
             <Button
               onClick={convertToInvoice}
@@ -586,14 +906,14 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
             </Button>
           )}
           {invoice.status === 'draft' && !isDeliveryNote && invoice.invoice_number && (
-            customerHasEmail ? (
+            preferredSendMode === 'email' ? (
               <Button
                 onClick={() => openSendDialog('email')}
                 disabled={!canWrite}
                 title={!canWrite ? t('viewer_disabled_tooltip') : undefined}
               >
                 {canWrite ? <Mail className="mr-2 h-4 w-4" /> : <Lock className="mr-2 h-4 w-4" />}
-                {t('send_via_email')}
+                {t(booksOnIssue ? 'send_via_email_and_book' : 'send_via_email')}
               </Button>
             ) : (
               <Button
@@ -603,9 +923,28 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
                 title={!canWrite ? t('viewer_disabled_tooltip') : undefined}
               >
                 {canWrite ? <Send className="mr-2 h-4 w-4" /> : <Lock className="mr-2 h-4 w-4" />}
-                {t('mark_sent_manually')}
+                {t(booksOnIssue ? 'mark_sent_and_book' : 'mark_as_sent')}
               </Button>
             )
+          )}
+          {isCopyable && canWrite && (
+            <Link href={`/invoices?copy=${invoice.id}`}>
+              <Button variant="outline">
+                <Copy className="mr-2 h-4 w-4" />
+                {t('copy_invoice')}
+              </Button>
+            </Link>
+          )}
+          {creditNoteNeedsRepair && (
+            <Button
+              variant="secondary"
+              onClick={() => openSendDialog('manual')}
+              disabled={!canWrite}
+              title={!canWrite ? t('viewer_disabled_tooltip') : undefined}
+            >
+              {canWrite ? <AlertTriangle className="mr-2 h-4 w-4" /> : <Lock className="mr-2 h-4 w-4" />}
+              {t('complete_credit_bookkeeping')}
+            </Button>
           )}
           {isDeliveryNote && invoice.status === 'draft' && (
             <Button
@@ -618,7 +957,7 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
               {t('mark_as_sent')}
             </Button>
           )}
-          {(invoice.status === 'sent' || invoice.status === 'overdue') && isRealInvoice && (
+          {(invoice.status === 'sent' || invoice.status === 'overdue') && isRealInvoice && !isCreditNote && (
             <Button
               onClick={() => setShowPaymentDialog(true)}
               disabled={isUpdating || !canWrite}
@@ -628,16 +967,23 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
               {t('mark_as_paid')}
             </Button>
           )}
-          {/* No own PDF for a received self-billing invoice — the verifikationsunderlag is the document the customer sent us. */}
+          {/* No own PDF for a received self-billing invoice: the verifikationsunderlag is the document the customer sent us. */}
           {!isSelfBilled && (
-            <Button variant="outline" onClick={downloadPDF} disabled={isDownloading}>
-              {isDownloading ? (
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              ) : (
-                <Download className="mr-2 h-4 w-4" />
-              )}
-              {t('download_pdf')}
-            </Button>
+            <>
+              {/* Review in the browser (#1190); the download stays for keeping a copy. */}
+              <Button variant="outline" onClick={previewPDF}>
+                <Eye className="mr-2 h-4 w-4" />
+                {t('preview_pdf')}
+              </Button>
+              <Button variant="outline" onClick={downloadPDF} disabled={isDownloading}>
+                {isDownloading ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <Download className="mr-2 h-4 w-4" />
+                )}
+                {t('download_pdf')}
+              </Button>
+            </>
           )}
         </div>
       </div>
@@ -686,7 +1032,7 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
           </CardHeader>
           <CardContent>
             <div className="space-y-4">
-              {/* Header — desktop */}
+              {/* Header, desktop */}
               <div className="hidden sm:grid grid-cols-12 gap-4 text-sm font-medium text-muted-foreground border-b pb-2">
                 <div className="col-span-5">{t('th_description')}</div>
                 <div className="col-span-2 text-right">{t('th_quantity')}</div>
@@ -695,11 +1041,11 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
                 <div className="col-span-2 text-right">{t('th_amount')}</div>
               </div>
 
-              {/* Items — desktop. Free-text rows span the full width with no
+              {/* Items, desktop. Free-text rows span the full width with no
                   numeric columns; a blank one renders as a spacer. */}
               <div className="hidden sm:block space-y-4">
                 {invoice.items.map((item) =>
-                  item.line_type === 'text' ? (
+                  isTextLikeLine(item) ? (
                     <div key={item.id} className="grid grid-cols-12 gap-4 text-sm">
                       <div className="col-span-12 text-muted-foreground">{item.description || ' '}</div>
                     </div>
@@ -733,10 +1079,10 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
                 )}
               </div>
 
-              {/* Items — mobile cards */}
+              {/* Items, mobile cards */}
               <div className="sm:hidden space-y-2">
                 {invoice.items.map((item) =>
-                  item.line_type === 'text' ? (
+                  isTextLikeLine(item) ? (
                     <p key={item.id} className="text-sm text-muted-foreground px-1">{item.description || ' '}</p>
                   ) : (
                     <div key={item.id} className="border rounded-lg p-3 text-sm space-y-1.5">
@@ -849,6 +1195,44 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
           </Card>
           )}
 
+        {/* The legacy empty state asserts "sent before delivery history
+            existed". A failed read produces the same empty list, so that
+            claim would be a guess: say what actually happened instead. */}
+        {isRealInvoice && !isSelfBilled && deliveriesUnreadable && (
+          <Card className="lg:col-span-2">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Mail className="h-5 w-5" />
+                {t('delivery_history_title')}
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <div className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
+                <p className="font-medium text-foreground">
+                  {t('delivery_history_unreadable_title')}
+                </p>
+                <p className="mt-1">{t('delivery_history_unreadable_description')}</p>
+              </div>
+              <Button variant="outline" size="sm" onClick={() => void retryLoadDeliveries()}>
+                {t('delivery_history_unreadable_retry')}
+              </Button>
+            </CardContent>
+          </Card>
+        )}
+
+        {isRealInvoice && !isSelfBilled && !deliveriesUnreadable && (
+          <InvoiceDeliveryHistory
+            deliveries={deliveries}
+            showLegacyEmptyState={[
+              'sent',
+              'paid',
+              'partially_paid',
+              'overdue',
+              'credited',
+            ].includes(invoice.status)}
+          />
+        )}
+
         {/* Sidebar */}
         <div className="lg:col-start-3 lg:row-start-1 lg:row-span-3 space-y-6">
           {/* Invoice details */}
@@ -859,7 +1243,7 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
             <CardContent className="space-y-4">
               <div className="flex justify-between">
                 <span className="text-muted-foreground">{isSelfBilled ? t('external_number_label') : t('invoice_number_label')}</span>
-                <span className={cn('font-medium', !invoice.invoice_number && !isSelfBilled && 'italic text-muted-foreground')}>{isSelfBilled ? invoiceDisplayNumber(invoice as Invoice) : (invoice.invoice_number ?? '—')}</span>
+                <span className={cn('font-medium', !invoice.invoice_number && !isSelfBilled && 'italic text-muted-foreground')}>{isSelfBilled ? invoiceDisplayNumber(invoice as Invoice) : (invoice.invoice_number ?? '-')}</span>
               </div>
               {isSelfBilled && (invoice as Invoice).self_billing_agreement_ref && (
                 <div className="flex justify-between">
@@ -887,28 +1271,36 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
                 </span>
               </div>
               {invoice.your_reference && (
-                <div className="space-y-1">
+                <div className="flex justify-between gap-4">
                   <span className="text-muted-foreground">{t('your_reference_label')}</span>
-                  <div className="flex flex-wrap gap-1">
-                    {invoice.your_reference.split(',').map((ref, i) => (
-                      <Badge key={i} variant="secondary" className="text-xs font-normal">
-                        {ref.trim()}
-                      </Badge>
-                    ))}
-                  </div>
+                  <span className="text-right">
+                    {invoice.your_reference.split(',').map((ref) => ref.trim()).join(', ')}
+                  </span>
                 </div>
               )}
               {invoice.our_reference && (
-                <div className="space-y-1">
+                <div className="flex justify-between gap-4">
                   <span className="text-muted-foreground">{t('our_reference_label')}</span>
-                  <div className="flex flex-wrap gap-1">
-                    {invoice.our_reference.split(',').map((ref, i) => (
-                      <Badge key={i} variant="secondary" className="text-xs font-normal">
-                        {ref.trim()}
-                      </Badge>
-                    ))}
-                  </div>
+                  <span className="text-right">
+                    {invoice.our_reference.split(',').map((ref) => ref.trim()).join(', ')}
+                  </span>
                 </div>
+              )}
+              {canBookAfterwards && (
+                <>
+                  <Separator />
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-muted-foreground text-sm">{t('bookkeeping_label')}</span>
+                    <div className="flex items-center gap-3">
+                      <span className="text-sm text-muted-foreground">{t('not_booked_yet')}</span>
+                      {canWrite && (
+                        <Button size="sm" onClick={handleBook} disabled={isUpdating}>
+                          {t('book_action')}
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+                </>
               )}
               {invoice.journal_entry_id && (
                 <>
@@ -950,7 +1342,7 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
               so the user always sees how much has been paid + what remains +
               the individual payment events. Previously only the `paid` case
               had a card, leaving partially-paid invoices without any visible
-              paid_amount/remaining_amount — surfaced by user feedback after
+              paid_amount/remaining_amount: surfaced by user feedback after
               PR #614. */}
           {(invoice.status === 'paid' || invoice.status === 'partially_paid') && (
             <Card>
@@ -1011,7 +1403,7 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
                 )}
 
                 {/* Payment history. Each row links to its verifikat when one
-                    exists. Compact list — dates and amounts tabular-nums for
+                    exists. Compact list: dates and amounts tabular-nums for
                     column alignment, the voucher link sits to the right with
                     a small chevron. */}
                 <div className="space-y-2">
@@ -1073,7 +1465,11 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
                 </CardTitle>
                 {reminders.length === 0 && (
                   <CardDescription>
-                    {t('reminders_description')}
+                    {t('reminders_description', {
+                      day1: reminderDays[0],
+                      day2: reminderDays[1],
+                      day3: reminderDays[2],
+                    })}
                   </CardDescription>
                 )}
               </CardHeader>
@@ -1109,8 +1505,8 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
                                 </>
                               ) : (
                                 <>
-                                  <MessageSquare className="h-3 w-3 text-orange-600" />
-                                  <span className="text-xs text-orange-600">{t('reminder_objection')}</span>
+                                  <MessageSquare className="h-3 w-3 text-destructive" />
+                                  <span className="text-xs text-destructive">{t('reminder_objection')}</span>
                                 </>
                               )}
                             </div>
@@ -1129,22 +1525,26 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
           )}
 
           {/* Credit note reference (if this invoice was credited) */}
-          {invoice.status === 'credited' && creditNote && (
-            <Card className="border-warning/50">
+          {creditNote && (
+            <Card className={creditNote.status === 'draft' ? undefined : 'border-warning/50'}>
               <CardHeader>
-                <CardTitle className="flex items-center gap-2 text-warning">
+                <CardTitle className={cn(
+                  'flex items-center gap-2',
+                  creditNote.status !== 'draft' && 'text-warning',
+                )}>
                   <ReceiptText className="h-5 w-5" />
-                  {t('credited_card_title')}
+                  {creditNote.status === 'draft'
+                    ? t('credit_draft_card_title')
+                    : t('credited_card_title')}
                 </CardTitle>
               </CardHeader>
               <CardContent>
-                <p className="text-sm text-muted-foreground mb-2">
-                  {t('credited_description')}
-                </p>
                 <Link href={`/invoices/${creditNote.id}`}>
                   <Button variant="outline" size="sm" className="w-full">
                     <ExternalLink className="mr-2 h-4 w-4" />
-                    {t('see_credit_note', { number: creditNote.invoice_number ?? '' })}
+                    {creditNote.status === 'draft'
+                      ? t('open_credit_draft', { number: creditNote.invoice_number ?? '' })
+                      : t('see_credit_note', { number: creditNote.invoice_number ?? '' })}
                   </Button>
                 </Link>
               </CardContent>
@@ -1176,9 +1576,9 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
 
           {/* Converted from proforma */}
           {convertedFromInvoice && (
-            <Card className="border-blue-300">
+            <Card>
               <CardHeader>
-                <CardTitle className="flex items-center gap-2 text-blue-600">
+                <CardTitle className="flex items-center gap-2">
                   <FileText className="h-5 w-5" />
                   {t('converted_card_title')}
                 </CardTitle>
@@ -1198,102 +1598,56 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
           )}
 
           {/* Status actions */}
-          {invoice.status !== 'cancelled' && invoice.status !== 'credited' && !invoice.credited_invoice_id && (
+          {invoice.status !== 'cancelled' && invoice.status !== 'credited' && (!invoice.credited_invoice_id || invoice.status === 'draft') && (
             <Card>
               <CardHeader>
                 <CardTitle>{t('actions_card_title')}</CardTitle>
               </CardHeader>
+              {/* Secondary actions only. The primary next-step for every status
+                  (convert / finalize / send / mark-paid) lives in the header
+                  action row next to the status badge: this card holds the
+                  reversible/destructive alternatives so there is one obvious
+                  next step, not two competing copies of it. */}
               <CardContent className="space-y-2">
                 {isProforma && (
-                  <>
-                    <Button
-                      className="w-full"
-                      onClick={convertToInvoice}
-                      disabled={isConverting}
-                    >
-                      {isConverting ? (
-                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                      ) : (
-                        <FileText className="mr-2 h-4 w-4" />
-                      )}
-                      {t('convert_to_invoice')}
-                    </Button>
-                    <Button
-                      variant="outline"
-                      className="w-full"
-                      onClick={() => updateStatus('cancelled')}
-                      disabled={isUpdating}
-                    >
-                      <XCircle className="mr-2 h-4 w-4" />
-                      {t('cancel_action')}
-                    </Button>
-                  </>
+                  <Button
+                    variant="outline"
+                    className="w-full"
+                    onClick={() => updateStatus('cancelled')}
+                    disabled={isUpdating}
+                  >
+                    <XCircle className="mr-2 h-4 w-4" />
+                    {t('cancel_action')}
+                  </Button>
                 )}
                 {!isProforma && invoice.status === 'draft' && (
                   isUnnumberedDraft ? (
-                    <>
-                      {/* Unnumbered draft (saved via "Spara som utkast"): review
-                          and create it, or remove it without a trace. */}
-                      <Button
-                        className="w-full"
-                        onClick={openFinalizeDialog}
-                        disabled={isFinalizing}
-                      >
-                        <FileText className="mr-2 h-4 w-4" />
-                        {t('finalize_action')}
-                      </Button>
-                      <Button
-                        variant="outline"
-                        className="w-full text-destructive hover:text-destructive"
-                        onClick={() => setShowDeleteDialog(true)}
-                        disabled={isDeleting}
-                      >
-                        <Trash2 className="mr-2 h-4 w-4" />
-                        {t('remove_action')}
-                      </Button>
-                    </>
+                    <Button
+                      variant="outline"
+                      className="w-full text-destructive hover:text-destructive"
+                      onClick={() => setShowDeleteDialog(true)}
+                      disabled={isDeleting}
+                    >
+                      <Trash2 className="mr-2 h-4 w-4" />
+                      {t('remove_action')}
+                    </Button>
                   ) : (
                     <>
-                      {!isDeliveryNote && customerHasEmail ? (
+                      {/* When the customer has an email the header offers "Send via
+                          email" as the primary; keep the manual-mark-sent path here
+                          as the secondary alternative (it is not in the header). */}
+                      {!isDeliveryNote && preferredSendMode === 'email' && (
                         <>
-                          <Button
-                            className="w-full"
-                            onClick={() => openSendDialog('email')}
-                          >
-                            <Mail className="mr-2 h-4 w-4" />
-                            {t('send_via_email')}
-                          </Button>
                           <Button
                             variant="ghost"
                             className="w-full text-muted-foreground"
                             onClick={() => openSendDialog('manual')}
                           >
                             <Send className="mr-2 h-4 w-4" />
-                            {t('mark_sent_manually')}
+                            {t(booksOnIssue ? 'mark_sent_and_book' : 'mark_as_sent')}
                           </Button>
                           <p className="text-[11px] text-muted-foreground/60 px-1 -mt-1">
                             {t('send_manual_hint_with_email')}
-                          </p>
-                        </>
-                      ) : (
-                        <>
-                          {!isDeliveryNote && (
-                            <div className="flex items-start gap-2 p-3 bg-yellow-50 border border-yellow-200 rounded-lg mb-2 dark:bg-yellow-950/30 dark:border-yellow-800">
-                              <AlertTriangle className="h-4 w-4 text-yellow-600 dark:text-yellow-500 mt-0.5 flex-shrink-0" />
-                              <p className="text-xs text-yellow-700 dark:text-yellow-400">
-                                {t('no_customer_email_warning')}
-                              </p>
-                            </div>
-                          )}
-                          <Button
-                            className="w-full"
-                            onClick={() => openSendDialog('manual')}
-                          >
-                            <Send className="mr-2 h-4 w-4" />
-                            {t('mark_sent_manually')}
-                          </Button>
-                          <p className="text-[11px] text-muted-foreground/60 px-1 -mt-1">
-                            {t('send_manual_hint_no_email')}
                           </p>
                         </>
                       )}
@@ -1304,30 +1658,12 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
                         disabled={isDeleting}
                       >
                         <Trash2 className="mr-2 h-4 w-4" />
-                        {t('delete_draft')}
+                        {t(isCreditNote ? 'remove_credit_draft' : 'delete_draft')}
                       </Button>
                     </>
                   )
                 )}
-                {(invoice.status === 'sent' || invoice.status === 'overdue') && isRealInvoice && (
-                  <>
-                    <Button
-                      className="w-full"
-                      onClick={() => setShowPaymentDialog(true)}
-                      disabled={isUpdating}
-                    >
-                      <CheckCircle className="mr-2 h-4 w-4" />
-                      {t('mark_as_paid')}
-                    </Button>
-                    <Link href={`/invoices/${invoice.id}/credit`} className="block">
-                      <Button variant="outline" className="w-full">
-                        <ReceiptText className="mr-2 h-4 w-4" />
-                        {t('create_credit_note')}
-                      </Button>
-                    </Link>
-                  </>
-                )}
-                {invoice.status === 'paid' && isRealInvoice && (
+                {((invoice.status === 'sent' || invoice.status === 'overdue' || invoice.status === 'paid') && isRealInvoice && !creditNote) && (
                   <Link href={`/invoices/${invoice.id}/credit`} className="block">
                     <Button variant="outline" className="w-full">
                       <ReceiptText className="mr-2 h-4 w-4" />
@@ -1341,15 +1677,23 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
         </div>
       </div>
 
-      {/* Remove/cancel confirmation. A numbered draft is makulerad (status flips
-          to 'cancelled', number retained for a gap-free series); an unnumbered
-          draft is hard deleted since it never entered the number series. */}
+      {/* Remove/cancel confirmation. An unissued credit-note draft and an
+          unnumbered invoice draft are hard deleted; other numbered drafts are
+          retained as cancelled to preserve their number series. */}
       <Dialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{invoice.invoice_number ? t('delete_dialog_title') : t('remove_dialog_title')}</DialogTitle>
+            <DialogTitle>
+              {isCreditNote
+                ? t('remove_credit_dialog_title')
+                : invoice.invoice_number
+                  ? t('delete_dialog_title')
+                  : t('remove_dialog_title')}
+            </DialogTitle>
             <DialogDescription>
-              {invoice.invoice_number ? (
+              {isCreditNote ? (
+                t('remove_credit_dialog_desc')
+              ) : invoice.invoice_number ? (
                 <>
                   {t('delete_dialog_desc_with_number_1')}
                   <strong>{t('delete_dialog_status_makulerad')}</strong>
@@ -1371,13 +1715,17 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
             </Button>
             <Button variant="destructive" onClick={deleteInvoice} disabled={isDeleting}>
               {isDeleting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-              {invoice.invoice_number ? t('delete_dialog_confirm') : t('remove_dialog_confirm')}
+              {isCreditNote
+                ? t('remove_credit_dialog_confirm')
+                : invoice.invoice_number
+                  ? t('delete_dialog_confirm')
+                  : t('remove_dialog_confirm')}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
 
-      {/* Finalize confirmation — "Granska & skapa". Allocates the F-number and
+      {/* Finalize confirmation, "Granska & skapa". Allocates the F-number and
           turns the unnumbered draft into a real, issued invoice. */}
       <Dialog open={showFinalizeDialog} onOpenChange={setShowFinalizeDialog}>
         <DialogContent>
@@ -1398,6 +1746,49 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
             <Button onClick={finalizeInvoice} disabled={isFinalizing}>
               {isFinalizing && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
               {t('finalize_dialog_confirm')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* The archived PDF the customer received could not be produced. Nothing
+          has been downloaded at this point: a re-render is a different
+          document, so the user chooses it deliberately or not at all. */}
+      <Dialog
+        open={pdfArchiveIssue !== null}
+        onOpenChange={(open) => {
+          if (!open) setPdfArchiveIssue(null)
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t('pdf_archive_issue_title')}</DialogTitle>
+            <DialogDescription>
+              {pdfArchiveIssue === 'document'
+                ? t('pdf_archive_issue_document_desc')
+                : t('pdf_archive_issue_history_desc')}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setPdfArchiveIssue(null)}
+              disabled={isDownloading}
+            >
+              {t('pdf_archive_issue_cancel')}
+            </Button>
+            <Button
+              variant="secondary"
+              onClick={downloadRerenderAnyway}
+              disabled={isDownloading}
+            >
+              {pdfIntent === 'preview'
+                ? t('pdf_archive_issue_rerender_preview')
+                : t('pdf_archive_issue_rerender')}
+            </Button>
+            <Button onClick={retryArchivedDownload} disabled={isDownloading}>
+              {isDownloading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+              {t('pdf_archive_issue_retry')}
             </Button>
           </DialogFooter>
         </DialogContent>

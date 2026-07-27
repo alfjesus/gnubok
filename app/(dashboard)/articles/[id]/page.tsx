@@ -18,11 +18,13 @@ import {
 import { getErrorMessage, type ErrorLocale } from '@/lib/errors/get-error-message'
 import { DestructiveConfirmDialog, useDestructiveConfirm } from '@/components/ui/destructive-confirm-dialog'
 import {
+  Archive,
+  ArchiveRestore,
   ArrowLeft,
   Package,
   Wrench,
   Edit2,
-  Archive,
+  Trash2,
   Loader2,
   Lock,
 } from 'lucide-react'
@@ -55,6 +57,8 @@ export default function ArticleDetailPage({
   const [isLoading, setIsLoading] = useState(true)
   const [isEditOpen, setIsEditOpen] = useState(false)
   const [isUpdating, setIsUpdating] = useState(false)
+  const [isTogglingActive, setIsTogglingActive] = useState(false)
+  const [isDeleting, setIsDeleting] = useState(false)
   const { dialogProps: confirmDialogProps, confirm: confirmAction } = useDestructiveConfirm()
 
   useEffect(() => {
@@ -84,7 +88,7 @@ export default function ArticleDetailPage({
 
   // Update runs through useSubmitWithAccountActivation so an
   // ACCOUNTS_NOT_IN_CHART response (revenue account not yet activated) opens
-  // the standard activate-and-retry dialog — same UX as the journal entry form.
+  // the standard activate-and-retry dialog: same UX as the journal entry form.
   const pendingUpdateRef = useRef<CreateArticleInput | null>(null)
   const submitUpdate = useCallback(async () => {
     const response = await fetch(`/api/articles/${id}`, {
@@ -127,36 +131,83 @@ export default function ArticleDetailPage({
     }
   }
 
-  async function handleDeactivate() {
+  // Soft deactivation is the answer for an article that has already been used
+  // on an invoice: the delete path refuses those (ARTICLE_IN_USE), while
+  // active=false hides it from the invoice picker, the export and the MCP
+  // listing without touching invoice history. Reactivation is not destructive,
+  // so only the deactivate direction confirms.
+  async function handleToggleActive() {
+    if (!article) return
+    const nextActive = !article.active
+
+    if (!nextActive) {
+      const ok = await confirmAction({
+        title: t('deactivate_confirm_title', { name: article.name }),
+        description: t('deactivate_confirm_description'),
+        confirmLabel: t('deactivate_confirm_label'),
+        variant: 'warning',
+      })
+      if (!ok) return
+    }
+
+    setIsTogglingActive(true)
+    try {
+      const response = await fetch(`/api/articles/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ active: nextActive }),
+      })
+      const { data } = (await throwOnStructuredError(response)) as { data: Article }
+
+      setArticle(data)
+      toast({
+        title: nextActive ? t('activated_title') : t('deactivated_title'),
+        description: article.name,
+      })
+    } catch (err) {
+      const body = (err as { body?: unknown }).body
+      toast({
+        title: nextActive ? t('activate_failed_title') : t('deactivate_failed_title'),
+        description: getErrorMessage(body ?? err, { context: 'article', locale: errorLocale }),
+        variant: 'destructive',
+      })
+    } finally {
+      setIsTogglingActive(false)
+    }
+  }
+
+  async function handleDelete() {
     if (!article) return
     const ok = await confirmAction({
-      title: t('deactivate_confirm_title', { name: article.name }),
-      description: t('deactivate_confirm_description'),
-      confirmLabel: t('deactivate_confirm_label'),
+      title: t('delete_confirm_title', { name: article.name }),
+      description: t('delete_confirm_description'),
+      confirmLabel: t('delete_confirm_label'),
       variant: 'destructive',
     })
     if (!ok) return
 
+    setIsDeleting(true)
     try {
       const response = await fetch(`/api/articles/${id}`, {
         method: 'DELETE',
       })
 
-      if (!response.ok) {
-        throw new Error('Deactivate failed')
-      }
+      await throwOnStructuredError(response)
 
       toast({
-        title: t('deactivated_title'),
+        title: t('deleted_title'),
         description: article.name,
       })
       router.push('/articles')
-    } catch {
+    } catch (err) {
+      const body = (err as { body?: unknown }).body
       toast({
-        title: t('deactivate_failed_title'),
-        description: t('retry'),
+        title: t('delete_failed_title'),
+        description: getErrorMessage(body ?? err, { context: 'article', locale: errorLocale }),
         variant: 'destructive',
       })
+    } finally {
+      setIsDeleting(false)
     }
   }
 
@@ -175,7 +226,7 @@ export default function ArticleDetailPage({
   return (
     <div className="space-y-8">
       {/* Header */}
-      <div className="flex items-start justify-between gap-4">
+      <div className="flex flex-col items-start justify-between gap-4 sm:flex-row">
         <div>
           <Link
             href="/articles"
@@ -189,23 +240,21 @@ export default function ArticleDetailPage({
               <Icon className="h-6 w-6 text-primary" />
             </div>
             <div>
-              <h1 className="font-display text-2xl md:text-3xl font-medium tracking-tight">{article.name}</h1>
+              <h1 className="font-display text-2xl leading-8 tracking-tight">{article.name}</h1>
               <div className="flex items-center gap-2 mt-1">
-                <Badge variant="secondary">{t(ARTICLE_TYPE_KEY[article.type])}</Badge>
-                {article.article_number && (
-                  <span className="text-sm text-muted-foreground tabular-nums">
-                    {article.article_number}
-                  </span>
-                )}
                 <Badge variant={article.active ? 'success' : 'secondary'}>
                   {article.active ? t('status_active') : t('status_inactive')}
                 </Badge>
+                <span className="text-sm text-muted-foreground tabular-nums">
+                  {t(ARTICLE_TYPE_KEY[article.type])}
+                  {article.article_number ? ` · #${article.article_number}` : ''}
+                </span>
               </div>
             </div>
           </div>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center justify-end gap-2">
           <Button
             variant="outline"
             size="sm"
@@ -216,19 +265,42 @@ export default function ArticleDetailPage({
             {canWrite ? <Edit2 className="h-4 w-4 mr-1" /> : <Lock className="h-4 w-4 mr-1" />}
             {t('edit')}
           </Button>
-          {article.active && (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={handleDeactivate}
-              className="text-destructive hover:text-destructive"
-              disabled={!canWrite}
-              title={!canWrite ? t('viewer_disabled_tooltip') : undefined}
-            >
-              {canWrite ? <Archive className="h-4 w-4 mr-1" /> : <Lock className="h-4 w-4 mr-1" />}
-              {t('deactivate')}
-            </Button>
-          )}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleToggleActive}
+            className="min-h-10"
+            disabled={isTogglingActive || !canWrite}
+            title={!canWrite ? t('viewer_disabled_tooltip') : undefined}
+          >
+            {isTogglingActive ? (
+              <Loader2 className="h-4 w-4 mr-1 animate-spin" />
+            ) : !canWrite ? (
+              <Lock className="h-4 w-4 mr-1" />
+            ) : article.active ? (
+              <Archive className="h-4 w-4 mr-1" />
+            ) : (
+              <ArchiveRestore className="h-4 w-4 mr-1" />
+            )}
+            {article.active ? t('deactivate') : t('activate')}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleDelete}
+            className="min-h-10 text-destructive hover:text-destructive"
+            disabled={isDeleting || !canWrite}
+            title={!canWrite ? t('viewer_disabled_tooltip') : undefined}
+          >
+            {isDeleting ? (
+              <Loader2 className="h-4 w-4 mr-1 animate-spin" />
+            ) : canWrite ? (
+              <Trash2 className="h-4 w-4 mr-1" />
+            ) : (
+              <Lock className="h-4 w-4 mr-1" />
+            )}
+            {t('delete')}
+          </Button>
         </div>
       </div>
 
@@ -242,7 +314,7 @@ export default function ArticleDetailPage({
           <CardContent className="space-y-3">
             <div className="text-sm flex items-center justify-between">
               <span className="text-muted-foreground">{t('label_price')}</span>
-              <span className="tabular-nums">{formatCurrency(article.price_excl_vat)}</span>
+              <span className="tabular-nums">{formatCurrency(article.price_excl_vat, article.currency)}</span>
             </div>
             <div className="text-sm flex items-center justify-between">
               <span className="text-muted-foreground">{t('label_vat')}</span>
@@ -255,7 +327,7 @@ export default function ArticleDetailPage({
             {article.cost_price != null && (
               <div className="text-sm flex items-center justify-between">
                 <span className="text-muted-foreground">{t('label_cost_price')}</span>
-                <span className="tabular-nums">{formatCurrency(article.cost_price)}</span>
+                <span className="tabular-nums">{formatCurrency(article.cost_price, article.currency)}</span>
               </div>
             )}
           </CardContent>
@@ -276,7 +348,7 @@ export default function ArticleDetailPage({
             {article.type === 'tjanst' && article.housework_type && (
               <div className="text-sm flex items-center justify-between">
                 <span className="text-muted-foreground">{t('label_housework')}</span>
-                <Badge variant="secondary">{article.housework_type}</Badge>
+                <span>{article.housework_type}</span>
               </div>
             )}
           </CardContent>
@@ -338,13 +410,16 @@ export default function ArticleDetailPage({
           <ArticleForm
             onSubmit={handleUpdate}
             isLoading={isUpdating}
+            onCancel={() => setIsEditOpen(false)}
             initialData={{
+              article_number: article.article_number || undefined,
               name: article.name,
               name_en: article.name_en || undefined,
               type: article.type,
               unit: article.unit,
               price_excl_vat: article.price_excl_vat,
               vat_rate: article.vat_rate,
+              currency: article.currency,
               revenue_account: article.revenue_account || undefined,
               cost_price: article.cost_price ?? undefined,
               ean: article.ean || undefined,

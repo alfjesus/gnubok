@@ -134,7 +134,7 @@ describe('GET /api/transactions', () => {
     const chain = fromSpy.mock.results[0].value as { __calls: { method: string; args: unknown[] }[] }
     const notCall = chain.__calls.find((c) => c.method === 'not')
     expect(notCall).toEqual({ method: 'not', args: ['journal_entry_id', 'is', null] })
-    // unmatched and reconciled are mutually exclusive — when reconciled is set, no .is() filter
+    // unmatched and reconciled are mutually exclusive: when reconciled is set, no .is() filter
     const isCall = chain.__calls.find((c) => c.method === 'is')
     expect(isCall).toBeUndefined()
   })
@@ -187,6 +187,6 @@ describe('GET /api/transactions', () => {
     const { status, body } = await parseJsonResponse<{ error: string }>(response)
 
     expect(status).toBe(500)
-    expect(body.error).toBe('boom')
+    expect(body.error).toBe('Något gick fel. Försök igen.')
   })
 })

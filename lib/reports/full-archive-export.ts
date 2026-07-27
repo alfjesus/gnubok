@@ -8,9 +8,23 @@ import { generateGeneralLedger } from './general-ledger'
 import { generateJournalRegister } from './journal-register'
 import { calculateVatDeclaration } from './vat-declaration'
 import { getAuditLog } from '@/lib/core/audit/audit-service'
+import { downloadDocumentObject } from '@/lib/core/documents/document-service'
 import { fetchAllRows } from '@/lib/supabase/fetch-all'
 import { getBranding } from '@/lib/branding/service'
-import type { AuditLogEntry } from '@/types'
+import {
+  trialBalanceToCsv,
+  incomeStatementToCsv,
+  balanceSheetToCsv,
+  generalLedgerToCsv,
+  type TrialBalanceLike,
+} from './archive-csv'
+import { buildArchiveReadme, buildDriveFolderReadme } from './archive-readme'
+import type { GeneralLedgerReport } from './general-ledger'
+import type {
+  AuditLogEntry,
+  BalanceSheetReport,
+  IncomeStatementReport,
+} from '@/types'
 
 export type FullArchiveOptions =
   | { scope: 'period'; period_id: string; include_documents?: boolean }
@@ -65,7 +79,7 @@ interface DocumentRow {
   // Joined from journal_entries via journal_entry_id. May be null when the
   // entry is a draft (no voucher_number yet) or when the doc is orphaned.
   // PostgREST returns a single row as an object, not an array, when the FK
-  // is many-to-one — but we tolerate both shapes defensively.
+  // is many-to-one, but we tolerate both shapes defensively.
   journal_entries?:
     | { voucher_number: number | null; voucher_series: string | null; entry_date: string | null }
     | { voucher_number: number | null; voucher_series: string | null; entry_date: string | null }[]
@@ -85,7 +99,10 @@ const REPORT_CONCURRENCY = 3
 // 5 MB for SIE + reports + audit + system doc, +3 MB headroom for master-data
 // JSON dumps and raw imported SIE files (the bucket caps each file at 50 MB,
 // but typical SIE4 files are tens of KB so a few MB covers most companies).
-const ARCHIVE_OVERHEAD_BYTES = 8 * 1024 * 1024
+export const ARCHIVE_OVERHEAD_BYTES = 8 * 1024 * 1024
+
+/** Documents included in an archive: per-period, everything, or only the rest. */
+type DocumentMode = ArchiveScope | 'unlinked'
 
 /**
  * Generate a full archive ZIP for a company.
@@ -162,18 +179,70 @@ export async function generateFullArchive(
 
   const revision = zip.folder('revision')!
 
-  const auditFilters =
+  const auditEntries =
     options.scope === 'period'
-      ? {
-          from_date: periods[0].period_start,
-          to_date: `${periods[0].period_end}T23:59:59.999Z`,
-        }
-      : {}
-  const auditEntries = await fetchAllAuditEntries(supabase, companyId, auditFilters)
+      ? await fetchPeriodAuditEntries(supabase, companyId, periods[0])
+      : await fetchAllAuditEntries(supabase, companyId, {})
   revision.file('behandlingshistorik.json', JSON.stringify(auditEntries, null, 2))
 
   const systemDoc = await buildSystemDoc(supabase, companyId, periods, options.scope)
   revision.file('systemdokumentation.json', JSON.stringify(systemDoc, null, 2))
+
+  zip.file(
+    'LÄSMIG.txt',
+    buildArchiveReadme({
+      companyName: company.company_name || 'Okänt företag',
+      orgNumber: company.org_number,
+      generatedAt: new Date().toISOString(),
+      scope: options.scope,
+      periodLabel: options.scope === 'period' ? periodLabel(periods[0]) : undefined,
+      appName: getBranding().appName,
+    })
+  )
+
+  return zip.generateAsync({ type: 'arraybuffer' })
+}
+
+/**
+ * Generate the "Grunddata" archive for the per-fiscal-year Drive backup:
+ * everything that is not tied to a single fiscal year. Master-data JSON
+ * dumps, original imported SIE files, documents no period archive carries
+ * (unlinked/draft), the full behandlingshistorik and the system
+ * documentation. Complements one `generateFullArchive(scope='period')` ZIP
+ * per räkenskapsår.
+ */
+export async function generateBaseDataArchive(
+  supabase: SupabaseClient,
+  companyId: string,
+  options: { include_documents?: boolean } = {}
+): Promise<ArrayBuffer> {
+  const company = await fetchCompany(supabase, companyId)
+  const periods = await fetchAllPeriods(supabase, companyId)
+  const includeDocuments = options.include_documents !== false
+
+  const zip = new JSZip()
+
+  if (includeDocuments) {
+    await writeDocuments(zip, supabase, companyId, periods, 'unlinked')
+  }
+  await writeSieSourceFiles(zip, supabase, companyId, includeDocuments)
+  await writeMasterData(zip, supabase, companyId)
+
+  const revision = zip.folder('revision')!
+  const auditEntries = await fetchAllAuditEntries(supabase, companyId, {})
+  revision.file('behandlingshistorik.json', JSON.stringify(auditEntries, null, 2))
+  const systemDoc = await buildSystemDoc(supabase, companyId, periods, 'all')
+  revision.file('systemdokumentation.json', JSON.stringify(systemDoc, null, 2))
+
+  zip.file(
+    'LÄSMIG.txt',
+    buildDriveFolderReadme({
+      companyName: company.company_name || 'Okänt företag',
+      orgNumber: company.org_number,
+      generatedAt: new Date().toISOString(),
+      appName: getBranding().appName,
+    })
+  )
 
   return zip.generateAsync({ type: 'arraybuffer' })
 }
@@ -192,11 +261,11 @@ export async function estimateArchiveSize(
   scope: ArchiveScope,
   periodId?: string
 ): Promise<{ total_bytes: number; document_bytes: number; document_count: number }> {
+  // Scope=all counts every document (linked or not), mirroring writeDocuments.
   let query = supabase
     .from('document_attachments')
     .select('file_size_bytes, journal_entry_id', { count: 'exact' })
     .eq('company_id', companyId)
-    .not('journal_entry_id', 'is', null)
 
   if (scope === 'period') {
     if (!periodId) {
@@ -209,6 +278,8 @@ export async function estimateArchiveSize(
         .eq('company_id', companyId)
         .eq('fiscal_period_id', periodId)
         .in('status', ['posted', 'reversed'])
+        // Stable total order for correct paging (see fetch-all.ts).
+        .order('id', { ascending: true })
         .range(from, to)
     )
     const ids = periodEntryIds.map((e) => e.id)
@@ -297,7 +368,7 @@ async function generatePeriodReports(
   try {
     const startDate = new Date(period.period_start)
     // Annual VAT for an archive must cover the whole räkenskapsår, which may be
-    // extended/shortened — pass the fiscal period so the span isn't truncated to
+    // extended/shortened: pass the fiscal period so the span isn't truncated to
     // the calendar year that period_start happens to fall in.
     vatDeclaration = await calculateVatDeclaration(
       supabase,
@@ -305,11 +376,10 @@ async function generatePeriodReports(
       'yearly',
       startDate.getFullYear(),
       1,
-      'accrual',
       { fiscalPeriodId: period.id }
     )
   } catch {
-    // VAT declaration may fail if no relevant entries exist — skip gracefully
+    // VAT declaration may fail if no relevant entries exist, skip gracefully
   }
 
   return { trialBalance, incomeStatement, balanceSheet, generalLedger, journalRegister, vatDeclaration }
@@ -324,6 +394,24 @@ function writeReports(folder: JSZip, reports: PeriodReports): void {
   if (reports.vatDeclaration) {
     folder.file('momsdeklaration.json', JSON.stringify(reports.vatDeclaration, null, 2))
   }
+  // CSV twins for humans: the JSON is complete but unreadable in Excel.
+  // Never let a formatting bug take down the archive (the JSON stays
+  // canonical), and never let one broken report take down the other CSVs.
+  const tryCsv = (file: string, make: () => string) => {
+    try {
+      folder.file(file, make())
+    } catch {
+      // Skip this CSV on shape mismatch.
+    }
+  }
+  tryCsv('saldobalans.csv', () => trialBalanceToCsv(reports.trialBalance as TrialBalanceLike))
+  tryCsv('resultatrakning.csv', () =>
+    incomeStatementToCsv(reports.incomeStatement as IncomeStatementReport)
+  )
+  tryCsv('balansrakning.csv', () =>
+    balanceSheetToCsv(reports.balanceSheet as BalanceSheetReport)
+  )
+  tryCsv('huvudbok.csv', () => generalLedgerToCsv(reports.generalLedger as GeneralLedgerReport))
 }
 
 async function writeDocuments(
@@ -331,30 +419,48 @@ async function writeDocuments(
   supabase: SupabaseClient,
   companyId: string,
   periods: FiscalPeriodRow[],
-  scope: ArchiveScope
+  scope: DocumentMode
 ): Promise<void> {
   const dokument = zip.folder('dokument')!
   const manifest: DocumentManifestEntry[] = []
 
   try {
-    const documents = await fetchAllRows<DocumentRow>(({ from, to }) =>
-      supabase
+    const documents = await fetchAllRows<DocumentRow>(({ from, to }) => {
+      let q = supabase
         .from('document_attachments')
         .select(
           'id, file_name, storage_path, journal_entry_id, sha256_hash, version, digitization_date, upload_source, mime_type, file_size_bytes, journal_entries:journal_entry_id(voucher_number, voucher_series, entry_date)'
         )
         .eq('company_id', companyId)
-        .not('journal_entry_id', 'is', null)
-        .range(from, to)
-    )
+      // Backups (scope=all/unlinked) include every document, even those not
+      // yet linked to an entry: inbox items and unbooked receipts are
+      // räkenskapsinformation too. The per-period archive keeps the
+      // linked-only filter.
+      if (scope === 'period') {
+        q = q.not('journal_entry_id', 'is', null)
+      }
+      // Stable total order for correct paging (see fetch-all.ts).
+      return q.order('id', { ascending: true }).range(from, to)
+    })
 
     if (documents.length > 0) {
-      const entryIdToPeriodId = await buildEntryToPeriodMap(supabase, companyId, periods, scope)
+      const entryIdToPeriodId = await buildEntryToPeriodMap(
+        supabase,
+        companyId,
+        periods,
+        scope === 'period' ? 'period' : 'all'
+      )
 
       const inScopeDocuments =
         scope === 'period'
           ? documents.filter((d) => d.journal_entry_id && entryIdToPeriodId.has(d.journal_entry_id))
-          : documents.filter((d) => d.journal_entry_id) // all-mode: keep every linked doc
+          : scope === 'unlinked'
+            ? // Grunddata mode: only what no period archive carries (orphans
+              // and docs linked to draft/unposted entries).
+              documents.filter(
+                (d) => !d.journal_entry_id || !entryIdToPeriodId.has(d.journal_entry_id)
+              )
+            : documents // all-mode: keep every doc, linked or not
 
       // Track used paths so we can disambiguate collisions (two documents with
       // identical voucher prefix + filename) by appending a short id suffix.
@@ -387,9 +493,17 @@ async function writeDocuments(
         }
 
         try {
-          const { data: fileData, error } = await supabase.storage
-            .from('documents')
-            .download(doc.storage_path)
+          // Dual-layout download: the document batch is snapshotted up
+          // front, and a concurrent Phase B backfill can re-home an object
+          // (legacy uploader-scoped -> company-scoped) and later remove the
+          // source mid-run, leaving the stored pointer stale. The helper
+          // tries the stored pointer first, then the alternate layout, so a
+          // healthy document never lands in the manifest as an error.
+          const { blob: fileData, error } = await downloadDocumentObject(
+            supabase,
+            doc.storage_path,
+            companyId
+          )
 
           if (error || !fileData) {
             manifest.push({
@@ -402,7 +516,7 @@ async function writeDocuments(
 
           const buffer = await fileData.arrayBuffer()
           // zipPath is fully qualified (`dokument/<year>/<voucher>_<file>` etc.),
-          // so write at the archive root — calling `dokument.file(zipPath)`
+          // so write at the archive root: calling `dokument.file(zipPath)`
           // would double-prefix to `dokument/dokument/...`.
           zip.file(zipPath, buffer)
           manifest.push({ ...baseManifest, status: 'downloaded' })
@@ -416,7 +530,7 @@ async function writeDocuments(
       }
     }
   } catch {
-    // Document fetch failed — archive will still contain reports and audit trail
+    // Document fetch failed: archive will still contain reports and audit trail
   }
 
   dokument.file('manifest.json', JSON.stringify(manifest, null, 2))
@@ -481,7 +595,7 @@ function buildDocumentZipPath(
     return candidate
   }
 
-  // Collision — disambiguate with a short id suffix before the extension.
+  // Collision: disambiguate with a short id suffix before the extension.
   const dotIdx = safeName.lastIndexOf('.')
   const stem = dotIdx > 0 ? safeName.slice(0, dotIdx) : safeName
   const ext = dotIdx > 0 ? safeName.slice(dotIdx) : ''
@@ -530,7 +644,7 @@ interface SieSourceManifestEntry {
  * the current journal entries).
  *
  * `sie/imports.json` and `sie/account_mappings.json` are written regardless of
- * `includeFiles` — they're small and critical for reconstructing the import
+ * `includeFiles`: they're small and critical for reconstructing the import
  * history. Blob download is gated behind `includeFiles` since the files can be
  * large and share the documents opt-out.
  */
@@ -646,14 +760,295 @@ async function writeSieSourceFiles(
     )
     sieFolder.file('account_mappings.json', JSON.stringify(mappings, null, 2))
   } catch {
-    // SIE metadata fetch failed — archive will still contain the re-generated SIE files
+    // SIE metadata fetch failed: archive will still contain the re-generated SIE files
   }
+}
+
+export interface MasterDataTableSpec {
+  name: string
+  file: string
+  orderBy?: string
+  /**
+   * Unique column used as the paging/dedupe key. Defaults to 'id'; override
+   * for tables whose PK has another name (e.g. journal_entry_no_doc_required).
+   */
+  pageKey?: string
+  /**
+   * Child tables without a company_id column: rows are fetched by first
+   * collecting the parent table's ids for the company, then paging the child
+   * table through `fk IN (...)` chunks.
+   */
+  via?: { parent: string; fk: string }
+  /**
+   * Parent columns copied onto every child row as `<prefix><column>`.
+   *
+   * A child line row carries money but no unit: `invoice_items.line_total` is
+   * denominated in the parent invoice's currency, and the row's own `unit`
+   * column means "st"/"timmar", not the money unit. Parent dumps are fine
+   * (`select('*')` carries `currency`, `exchange_rate` and the `*_sek` twins
+   * side by side), so this is the only place where a reader of a single file
+   * cannot tell SEK from EUR. Denormalising the parent's currency makes each
+   * line self-describing instead of requiring a join back to the parent file.
+   *
+   * Copy the conversion basis (currency + exchange_rate), never the parent's
+   * totals: a line's SEK value is not the invoice's `total_sek`. Leave unset
+   * when the parent has no currency column (nothing to copy, and inventing
+   * one would put a fabricated unit into a statutory archive).
+   *
+   * Additive only. Archives already handed to a revisor must keep every key
+   * they shipped with, so append new keys and never rename or drop one.
+   */
+  denormalize?: { prefix: string; columns: string[] }
+}
+
+/**
+ * Tables dumped as JSON under `data/` in the scope='all' backup.
+ *
+ * This list is a contract enforced by tests/pg/full-archive-coverage.pg.test.ts:
+ * every public table with a company_id column must appear here, in
+ * ARCHIVE_COVERED_ELSEWHERE_TABLES, or in ARCHIVE_EXCLUDED_TABLES. A migration
+ * that adds a company-scoped table fails that test until the table is
+ * classified, so the backup can never silently fall behind the schema again.
+ */
+export const MASTER_DATA_DUMP_TABLES: MasterDataTableSpec[] = [
+  // Counterparties and articles
+  { name: 'customers', file: 'customers.json', orderBy: 'created_at' },
+  { name: 'suppliers', file: 'suppliers.json', orderBy: 'created_at' },
+  { name: 'articles', file: 'articles.json', orderBy: 'created_at' },
+  // Customer invoicing
+  { name: 'invoices', file: 'invoices.json', orderBy: 'invoice_date' },
+  {
+    name: 'invoice_items',
+    file: 'invoice_items.json',
+    via: { parent: 'invoices', fk: 'invoice_id' },
+    denormalize: { prefix: 'invoice_', columns: ['currency', 'exchange_rate'] },
+  },
+  { name: 'invoice_payments', file: 'invoice_payments.json', orderBy: 'payment_date' },
+  { name: 'invoice_reminders', file: 'invoice_reminders.json' },
+  // Delivery metadata proves which recipient received the archived PDF and
+  // when, so it is räkenskapsinformation alongside the invoice itself.
+  { name: 'invoice_deliveries', file: 'invoice_deliveries.json', orderBy: 'created_at' },
+  { name: 'recurring_invoice_schedules', file: 'recurring_invoice_schedules.json' },
+  // Supplier invoicing
+  { name: 'supplier_invoices', file: 'supplier_invoices.json', orderBy: 'invoice_date' },
+  {
+    name: 'supplier_invoice_items',
+    file: 'supplier_invoice_items.json',
+    via: { parent: 'supplier_invoices', fk: 'supplier_invoice_id' },
+    denormalize: { prefix: 'supplier_invoice_', columns: ['currency', 'exchange_rate'] },
+  },
+  { name: 'supplier_invoice_payments', file: 'supplier_invoice_payments.json' },
+  // Receipts
+  { name: 'receipts', file: 'receipts.json', orderBy: 'receipt_date' },
+  // `receipts` has no exchange_rate column, so only the currency is copied:
+  // enough to read the unit, which is what the line was missing.
+  {
+    name: 'receipt_line_items',
+    file: 'receipt_line_items.json',
+    via: { parent: 'receipts', fk: 'receipt_id' },
+    denormalize: { prefix: 'receipt_', columns: ['currency'] },
+  },
+  // Bank and categorization
+  // NOTE: the date column on transactions is `date` (a previous spec said
+  // booking_date, which does not exist: every backup got an error stub).
+  { name: 'transactions', file: 'transactions.json', orderBy: 'date' },
+  { name: 'transaction_voucher_links', file: 'transaction_voucher_links.json' },
+  { name: 'bank_file_imports', file: 'bank_file_imports.json', orderBy: 'created_at' },
+  { name: 'cash_accounts', file: 'cash_accounts.json' },
+  { name: 'mapping_rules', file: 'mapping_rules.json' },
+  { name: 'categorization_templates', file: 'categorization_templates.json' },
+  { name: 'booking_template_library', file: 'booking_template_library.json' },
+  { name: 'skattekonto_rules', file: 'skattekonto_rules.json' },
+  // Salary (räkenskapsinformation with 7-year retention)
+  { name: 'employees', file: 'employees.json', orderBy: 'created_at' },
+  { name: 'employee_benefits', file: 'employee_benefits.json', orderBy: 'created_at' },
+  { name: 'salary_runs', file: 'salary_runs.json', orderBy: 'created_at' },
+  { name: 'salary_run_employees', file: 'salary_run_employees.json', orderBy: 'created_at' },
+  { name: 'salary_line_items', file: 'salary_line_items.json', orderBy: 'created_at' },
+  { name: 'salary_absence_days', file: 'salary_absence_days.json' },
+  // Cutover state (payroll gap-closure 2.1): part of the payroll underlag a
+  // switching company brings; belongs in the archive like the run data it
+  // seeds.
+  { name: 'employee_opening_balances', file: 'employee_opening_balances.json' },
+  // Vacation ledger + year closures (payroll gap-closure 3.1). The closure
+  // report is the underlag for the drift-adjustment verifikation (BFL 7 kap).
+  { name: 'employee_vacation_balances', file: 'employee_vacation_balances.json' },
+  { name: 'vacation_year_closures', file: 'vacation_year_closures.json' },
+  { name: 'salary_worked_days', file: 'salary_worked_days.json' },
+  { name: 'salary_payslip_links', file: 'salary_payslip_links.json' },
+  { name: 'shift_premium_rules', file: 'shift_premium_rules.json' },
+  { name: 'agi_declarations', file: 'agi_declarations.json', orderBy: 'created_at' },
+  // Assets and accruals
+  { name: 'assets', file: 'assets.json', orderBy: 'created_at' },
+  { name: 'depreciation_schedules', file: 'depreciation_schedules.json', orderBy: 'created_at' },
+  { name: 'accrual_schedules', file: 'accrual_schedules.json', orderBy: 'created_at' },
+  { name: 'accrual_schedule_installments', file: 'accrual_schedule_installments.json', orderBy: 'created_at' },
+  // Dimensions
+  { name: 'dimensions', file: 'dimensions.json', orderBy: 'created_at' },
+  { name: 'dimension_values', file: 'dimension_values.json', orderBy: 'created_at' },
+  { name: 'cost_centers', file: 'cost_centers.json', orderBy: 'created_at' },
+  { name: 'projects', file: 'projects.json', orderBy: 'created_at' },
+  { name: 'account_dimension_rules', file: 'account_dimension_rules.json' },
+  // Compliance records
+  { name: 'voucher_gap_explanations', file: 'voucher_gap_explanations.json', orderBy: 'created_at' },
+  // Inline rättelse trail (BFL 5 kap 5 § / 9 §): holds the struck original
+  // lines and the old description/date, i.e. the preserved side of every
+  // in-verifikat rättelse — räkenskapsinformation, not an operation log.
+  { name: 'journal_entry_rattelse_log', file: 'journal_entry_rattelse_log.json', orderBy: 'created_at' },
+  { name: 'journal_entry_no_doc_required', file: 'journal_entry_no_doc_required.json', pageKey: 'journal_entry_id' },
+  { name: 'rot_rut_payout_requests', file: 'rot_rut_payout_requests.json', orderBy: 'created_at' },
+  // No `denormalize`: rot_rut_payout_requests has no currency column either.
+  // A HUS-avdrag claim to Skatteverket is SEK by statute, so there is no unit
+  // to copy down and asserting one here would fabricate it.
+  { name: 'rot_rut_payout_request_items', file: 'rot_rut_payout_request_items.json', via: { parent: 'rot_rut_payout_requests', fk: 'request_id' } },
+  { name: 'fiscal_period_tax_adjustments', file: 'fiscal_period_tax_adjustments.json', orderBy: 'created_at' },
+  { name: 'tax_assessment_notices', file: 'tax_assessment_notices.json', orderBy: 'created_at' },
+  { name: 'arsredovisning_narratives', file: 'arsredovisning_narratives.json' },
+  { name: 'annual_report_profiles', file: 'annual_report_profiles.json', orderBy: 'created_at' },
+  { name: 'annual_report_versions', file: 'annual_report_versions.json', orderBy: 'created_at' },
+  { name: 'annual_report_validation_runs', file: 'annual_report_validation_runs.json', orderBy: 'created_at' },
+  { name: 'arsredovisning_signature_requests', file: 'arsredovisning_signature_requests.json', orderBy: 'created_at' },
+  { name: 'arsredovisning_submissions', file: 'arsredovisning_submissions.json' },
+  // Settings
+  { name: 'company_settings', file: 'company_settings.json' },
+]
+
+/**
+ * Company-scoped tables whose content reaches the archive through another
+ * section, so they are deliberately not part of the `data/` dump.
+ */
+export const ARCHIVE_COVERED_ELSEWHERE_TABLES: Record<string, string> = {
+  journal_entries: 'sie/<period>.se + rapporter/<period>/grundbok.json',
+  fiscal_periods: 'revision/systemdokumentation.json + SIE #RAR',
+  chart_of_accounts: 'revision/systemdokumentation.json (kontoplan)',
+  voucher_sequences: 'revision/systemdokumentation.json (verifikationsserier)',
+  audit_log: 'revision/behandlingshistorik.json',
+  document_attachments: 'dokument/ + dokument/manifest.json',
+  sie_imports: 'sie/imports.json + sie/original/',
+  sie_account_mappings: 'sie/account_mappings.json',
+}
+
+/**
+ * Company-scoped tables deliberately kept out of the archive, with the reason.
+ * Platform state, secrets, telemetry and re-fetchable mirrors do not belong in
+ * a portable räkenskapsinformation backup.
+ */
+export const ARCHIVE_EXCLUDED_TABLES: Record<string, string> = {
+  agent_conversations: 'AI assistant state, not räkenskapsinformation',
+  agent_memory: 'AI assistant state, not räkenskapsinformation',
+  agent_profiles: 'AI assistant state, not räkenskapsinformation',
+  api_keys: 'secrets',
+  bank_connections: 'PSD2 connection state and tokens, not portable',
+  bolagsverket_avtal_acceptances: 'service agreement acceptance state',
+  bolagsverket_subscriptions: 'integration subscription state',
+  booking_template_usage: 'usage telemetry',
+  calendar_feeds: 'feed tokens (secrets)',
+  capability_grants: 'entitlement state',
+  chat_messages: 'AI assistant state, not räkenskapsinformation',
+  chat_sessions: 'AI assistant state, not räkenskapsinformation',
+  company_capability_config: 'entitlement state',
+  company_inbound_domains: 'inbound-mail infrastructure',
+  company_inboxes: 'inbound-mail infrastructure',
+  company_invitations: 'membership state, meaningless outside the platform',
+  company_members: 'membership state, meaningless outside the platform',
+  company_subscriptions: 'billing state',
+  deadlines: 'regenerable operational calendar state',
+  dimension_retag_log: 'operation log',
+  event_log: '30-day TTL event bus log',
+  extension_data: 'extension runtime state (includes this backup\'s own state)',
+  graph_counterparties: 'derived AI context graph, regenerable',
+  graph_transaction_counterparties: 'derived AI context graph, regenerable',
+  idempotency_keys: 'infrastructure',
+  inbox_rate_counters: 'infrastructure',
+  invoice_inbox_items: 'inbox workflow state; the files live in document_attachments',
+  metered_events: 'billing telemetry',
+  notification_log: 'notification dedup log',
+  operations: 'staged-operation workflow state',
+  payment_match_log: 'derived matching log',
+  pending_operations: 'staged-operation workflow state',
+  processing_history: 'internal processing log; behandlingshistorik exports from audit_log',
+  provider_consents: 'consent tokens, not portable',
+  salary_payslip_deliveries: 'delivery log',
+  skattekonto_transactions: 'mirror of Skatteverket skattekonto, re-fetchable at source',
+  skatteverket_api_audit_log: 'integration audit log',
+  skatteverket_company_connections: 'integration connection state',
+  skatteverket_tokens: 'secrets',
+  stripe_connections: 'Stripe OAuth state (secrets)',
+  stripe_payment_events: 'mirror of Stripe data, re-fetchable at source',
+  stripe_payouts: 'mirror of Stripe data, re-fetchable at source',
+  webhook_deliveries: 'automation delivery log',
+  webhooks: 'automation config with signing secrets',
+}
+
+/** Max parent ids per `IN (...)` chunk: keeps the PostgREST URL well under limits. */
+const CHILD_FK_CHUNK = 100
+
+async function fetchChildTableRows(
+  supabase: SupabaseClient,
+  companyId: string,
+  spec: MasterDataTableSpec
+): Promise<Record<string, unknown>[]> {
+  const via = spec.via!
+  const denormalize = spec.denormalize
+  // Narrow select (id + only the denormalized columns): the parent table can
+  // be large and `*` would pull every invoice column just to read a currency.
+  const parentSelect = ['id', ...(denormalize?.columns ?? [])].join(', ')
+  const parents = await fetchAllRows<Record<string, unknown>>(
+    ({ from, to }) =>
+      supabase
+        .from(via.parent)
+        .select(parentSelect)
+        .eq('company_id', companyId)
+        .order('id', { ascending: true })
+        // The select list is built at runtime, so PostgREST's literal-string
+        // type inference cannot resolve it and falls back to an error type.
+        // The runtime shape is id + the declared columns, by construction.
+        .range(from, to) as unknown as PromiseLike<{
+        data: Record<string, unknown>[] | null
+        error: { message: string } | null
+      }>
+  )
+
+  const parentById = new Map<string, Record<string, unknown>>()
+  if (denormalize) {
+    for (const parent of parents) parentById.set(String(parent.id), parent)
+  }
+
+  const pageKey = spec.pageKey ?? 'id'
+  const rows: Record<string, unknown>[] = []
+  for (let i = 0; i < parents.length; i += CHILD_FK_CHUNK) {
+    const chunk = parents.slice(i, i + CHILD_FK_CHUNK).map((p) => String(p.id))
+    const chunkRows = await fetchAllRows<Record<string, unknown>>(
+      ({ from, to }) => {
+        let q = supabase.from(spec.name).select('*').in(via.fk, chunk)
+        if (spec.orderBy) q = q.order(spec.orderBy, { ascending: true })
+        return q.order(pageKey, { ascending: true }).range(from, to)
+      },
+      { dedupeBy: (r) => String(r[pageKey]) }
+    )
+    if (denormalize) {
+      for (const row of chunkRows) {
+        const parent = parentById.get(String(row[via.fk]))
+        for (const column of denormalize.columns) {
+          const key = `${denormalize.prefix}${column}`
+          // Never clobber a real child column that happens to share the name:
+          // the table's own data always wins over the copied parent value.
+          if (key in row) continue
+          // `?? null` is load-bearing: JSON.stringify drops undefined keys, so
+          // a missing parent would silently produce a row with no unit again.
+          row[key] = parent?.[column] ?? null
+        }
+      }
+    }
+    rows.push(...chunkRows)
+  }
+  return rows
 }
 
 /**
  * Dump structured master data as JSON under `data/`. These records are implicit
  * in the SIE export (as journal entries) but not recoverable as domain objects
- * without this dump — critical for disaster recovery of a company's state.
+ * without this dump, critical for disaster recovery of a company's state.
  */
 async function writeMasterData(
   zip: JSZip,
@@ -662,46 +1057,47 @@ async function writeMasterData(
 ): Promise<void> {
   const data = zip.folder('data')!
 
-  const tables: Array<{ name: string; file: string; orderBy?: string }> = [
-    { name: 'customers', file: 'customers.json', orderBy: 'created_at' },
-    { name: 'suppliers', file: 'suppliers.json', orderBy: 'created_at' },
-    { name: 'invoices', file: 'invoices.json', orderBy: 'invoice_date' },
-    { name: 'invoice_items', file: 'invoice_items.json' },
-    { name: 'invoice_payments', file: 'invoice_payments.json', orderBy: 'payment_date' },
-    { name: 'supplier_invoices', file: 'supplier_invoices.json', orderBy: 'invoice_date' },
-    { name: 'supplier_invoice_items', file: 'supplier_invoice_items.json' },
-    { name: 'receipts', file: 'receipts.json', orderBy: 'receipt_date' },
-    { name: 'receipt_line_items', file: 'receipt_line_items.json' },
-    { name: 'transactions', file: 'transactions.json', orderBy: 'booking_date' },
-    { name: 'mapping_rules', file: 'mapping_rules.json' },
-    { name: 'categorization_templates', file: 'categorization_templates.json' },
-    { name: 'bank_file_imports', file: 'bank_file_imports.json', orderBy: 'created_at' },
-    { name: 'company_settings', file: 'company_settings.json' },
-  ]
-
-  await Promise.all(
-    tables.map(async (t) => {
-      try {
-        const rows = await fetchAllRows<Record<string, unknown>>(({ from, to }) => {
-          let q = supabase.from(t.name).select('*').eq('company_id', companyId)
-          if (t.orderBy) {
-            q = q.order(t.orderBy, { ascending: true })
-          }
-          return q.range(from, to)
-        })
-        data.file(t.file, JSON.stringify(rows, null, 2))
-      } catch (err) {
-        data.file(
-          t.file,
-          JSON.stringify(
-            { error: err instanceof Error ? err.message : 'Fetch failed', rows: [] },
-            null,
-            2
-          )
+  // Sequential on purpose: ~50 fast queries in series are gentler on
+  // PostgREST than 50 concurrent ones, and the deterministic order keeps the
+  // queued-mock tests stable.
+  for (const t of MASTER_DATA_DUMP_TABLES) {
+    const pageKey = t.pageKey ?? 'id'
+    try {
+      const rows = t.name === 'invoice_deliveries'
+        ? await fetchAllRows<Record<string, unknown>>(({ from, to }) =>
+            supabase
+              .rpc('export_invoice_delivery_evidence', { p_company_id: companyId })
+              .order('created_at', { ascending: true })
+              .order('id', { ascending: true })
+              .range(from, to),
+          { dedupeBy: (row) => String(row.id) })
+        : t.via
+          ? await fetchChildTableRows(supabase, companyId, t)
+          : await fetchAllRows<Record<string, unknown>>(({ from, to }) => {
+            let q = supabase.from(t.name).select('*').eq('company_id', companyId)
+            if (t.orderBy) {
+              q = q.order(t.orderBy, { ascending: true })
+            }
+            // Always end on the unique PK so paging has a stable TOTAL order. A
+            // non-unique display order (e.g. created_at) or no order at all
+            // silently SKIPS/DUPLICATES rows across page boundaries: data loss in
+            // a statutory 7-year retention archive. dedupeBy is defense-in-depth
+            // against the duplicate case.
+            return q.order(pageKey, { ascending: true }).range(from, to)
+          }, { dedupeBy: (r) => String(r[pageKey]) })
+      data.file(t.file, JSON.stringify(rows, null, 2))
+    } catch (err) {
+      if (t.name === 'invoice_deliveries') throw err
+      data.file(
+        t.file,
+        JSON.stringify(
+          { error: err instanceof Error ? err.message : 'Fetch failed', rows: [] },
+          null,
+          2
         )
-      }
-    })
-  )
+      )
+    }
+  }
 }
 
 function sanitizeFileName(name: string): string {
@@ -730,6 +1126,9 @@ async function buildEntryToPeriodMap(
     query = query.in('fiscal_period_id', periodIds)
   }
 
+  // Stable total order for correct paging (see fetch-all.ts).
+  query = query.order('id', { ascending: true })
+
   const entries = await fetchAllRows<{ id: string; fiscal_period_id: string }>(({ from, to }) =>
     query.range(from, to)
   )
@@ -738,6 +1137,87 @@ async function buildEntryToPeriodMap(
     map.set(entry.id, entry.fiscal_period_id)
   }
   return map
+}
+
+/**
+ * Behandlingshistorik for a single räkenskapsår.
+ *
+ * A date window alone is not enough: bokslut entries and stornos for the year
+ * are routinely committed months after period_end, so their audit rows fall
+ * outside [period_start, period_end]. BFNAR 2013:2 kap 8 expects the year's
+ * archive to carry the treatment history of the year's bokföringsposter, so
+ * the window is complemented with every audit row touching the period's
+ * journal entries and lines, regardless of when it was logged.
+ */
+async function fetchPeriodAuditEntries(
+  supabase: SupabaseClient,
+  companyId: string,
+  period: FiscalPeriodRow
+): Promise<AuditLogEntry[]> {
+  const windowed = await fetchAllAuditEntries(supabase, companyId, {
+    from_date: period.period_start,
+    to_date: `${period.period_end}T23:59:59.999Z`,
+  })
+
+  const entryIds = (
+    await fetchAllRows<{ id: string }>(({ from, to }) =>
+      supabase
+        .from('journal_entries')
+        .select('id')
+        .eq('company_id', companyId)
+        .eq('fiscal_period_id', period.id)
+        .in('status', ['posted', 'reversed'])
+        // Stable total order for correct paging (see fetch-all.ts).
+        .order('id', { ascending: true })
+        .range(from, to)
+    )
+  ).map((r) => r.id)
+  if (entryIds.length === 0) return windowed
+
+  // journal_entry_lines has no company_id column; tenant scoping comes from
+  // the entry ids fetched above.
+  const lineIds: string[] = []
+  for (let i = 0; i < entryIds.length; i += CHILD_FK_CHUNK) {
+    const chunk = entryIds.slice(i, i + CHILD_FK_CHUNK)
+    const lines = await fetchAllRows<{ id: string }>(({ from, to }) =>
+      supabase
+        .from('journal_entry_lines')
+        .select('id')
+        .in('journal_entry_id', chunk)
+        .order('id', { ascending: true })
+        .range(from, to)
+    )
+    lineIds.push(...lines.map((r) => r.id))
+  }
+
+  const byId = new Map<string, AuditLogEntry>()
+  for (const row of windowed) byId.set(row.id, row)
+
+  // write_audit_log derives company_id from the audited row, and
+  // journal_entry_lines has no such column, so line audit rows carry
+  // company_id NULL: a plain company filter would drop them. The record-id
+  // set above is already tenant-scoped; the OR admits NULL-company rows only
+  // for journal_entry_lines. Under RLS (manual download) those rows stay
+  // invisible; the service-role backup path (Drive cron) sees them.
+  const recordIds = [...entryIds, ...lineIds]
+  for (let i = 0; i < recordIds.length; i += CHILD_FK_CHUNK) {
+    const chunk = recordIds.slice(i, i + CHILD_FK_CHUNK)
+    const rows = await fetchAllRows<AuditLogEntry>(({ from, to }) =>
+      supabase
+        .from('audit_log')
+        .select('*')
+        .in('record_id', chunk)
+        .or(
+          `company_id.eq.${companyId},and(company_id.is.null,table_name.eq.journal_entry_lines)`
+        )
+        .order('id', { ascending: true })
+        .range(from, to)
+    )
+    for (const row of rows) byId.set(row.id, row)
+  }
+
+  // Newest first, matching getAuditLog's output order.
+  return [...byId.values()].sort((a, b) => b.created_at.localeCompare(a.created_at))
 }
 
 async function fetchAllAuditEntries(
@@ -750,9 +1230,14 @@ async function fetchAllAuditEntries(
   const pageSize = 500
 
   while (true) {
-    const result = await getAuditLog(supabase, companyId, { ...filters, page, pageSize })
+    const result = await getAuditLog(supabase, companyId, {
+      ...filters,
+      page,
+      pageSize,
+      includeCount: false,
+    })
     all.push(...result.data)
-    if (all.length >= result.count || result.data.length < pageSize) {
+    if (result.data.length < pageSize) {
       break
     }
     page++
@@ -808,10 +1293,17 @@ async function buildSystemDoc(
       rls_aktiv: true,
     },
     arkivering: {
-      lagringstid_ar: 7,
+      lagringsregel: 'Till och med utgången av det sjunde kalenderåret efter det kalenderår då räkenskapsåret avslutades',
+      gallring_tidigare_an: '1 januari det åttonde efterföljande kalenderåret',
       format: 'WORM (Write Once, Read Many)',
       integritetskontroll: 'SHA-256 hashning vid uppladdning, regelbunden verifiering',
       lagringsplats: 'Supabase Storage (krypterad)',
+    },
+    arsredovisning: {
+      versionering: 'Låsta versioner är oföränderliga och SHA-256-hashade',
+      kontrollunderlag: 'Regelverksprofil, upplysningsbekräftelser och valideringsresultat sparas med versionen',
+      underskrifter: 'Undertecknarlista, metod, datum och bevisreferens binds till exakt version',
+      inlamning: 'Exakt skickad iXBRL-fil och Bolagsverkets kvittens arkiveras före och efter överföring',
     },
     integrationer: {
       bank: 'Enable Banking (PSD2)',

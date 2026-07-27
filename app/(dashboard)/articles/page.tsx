@@ -1,39 +1,52 @@
 'use client'
 
 import { useState, useEffect, useMemo, useCallback, useRef, Suspense } from 'react'
+import dynamic from 'next/dynamic'
 import { useLocale, useTranslations } from 'next-intl'
 import { useSearchParams, useRouter, usePathname } from 'next/navigation'
 import { createClient } from '@/lib/supabase/client'
 import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
 import { Skeleton } from '@/components/ui/skeleton'
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui/table'
+import { TH_CLASS, TD_CLASS } from '@/components/ui/dry-table'
 import { useToast } from '@/components/ui/use-toast'
 import { getErrorMessage, type ErrorLocale } from '@/lib/errors/get-error-message'
 import { Plus, Search, Package, Lock, ChevronUp, ChevronDown, ChevronsUpDown } from 'lucide-react'
-import ArticleForm from '@/components/articles/ArticleForm'
 import { ActivateAccountsDialog } from '@/components/bookkeeping/ActivateAccountsDialog'
 import {
   useSubmitWithAccountActivation,
   throwOnStructuredError,
 } from '@/lib/hooks/use-submit-with-account-activation'
 import { EmptyState } from '@/components/ui/empty-state'
-import { PageHeader } from '@/components/ui/page-header'
-import { formatCurrency } from '@/lib/utils'
+import { ContextPicker } from '@/components/common/ContextPicker'
+import { ReportExportMenu } from '@/components/reports/ReportExportMenu'
+import { cn, formatCurrency } from '@/lib/utils'
+import { compareArticles } from '@/lib/articles/sort'
+import {
+  ALL_CURRENCIES,
+  listArticleCurrencies,
+  matchesCurrencyScope,
+  resolveCurrencyScope,
+} from '@/lib/articles/currency-scope'
 import Link from 'next/link'
 import { useCompany } from '@/contexts/CompanyContext'
 import { useCanWrite } from '@/lib/hooks/use-can-write'
 import type { Article, ArticleType, CreateArticleInput } from '@/types'
+
+const ArticleForm = dynamic(
+  () => import('@/components/articles/ArticleForm'),
+  {
+    loading: () => (
+      <div className="space-y-4 py-4" role="status">
+        <Skeleton className="h-10 w-full" />
+        <Skeleton className="h-10 w-full" />
+        <Skeleton className="h-24 w-full" />
+      </div>
+    ),
+  },
+)
 
 const ARTICLE_TYPE_LABEL_KEYS: Record<ArticleType, string> = {
   vara: 'type_vara',
@@ -51,6 +64,7 @@ const SORTABLE_COLUMNS: ReadonlyArray<SortColumn> = [
   'price_excl_vat',
   'vat_rate',
 ]
+const INITIAL_VISIBLE_ROWS = 100
 
 function compareStrings(a: string, b: string): number {
   return a.localeCompare(b, 'sv', { sensitivity: 'base' })
@@ -62,11 +76,13 @@ function ArticlesPageInner() {
   const [articles, setArticles] = useState<Article[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [searchTerm, setSearchTerm] = useState('')
+  const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE_ROWS)
   const [isDialogOpen, setIsDialogOpen] = useState(false)
   const [isCreating, setIsCreating] = useState(false)
   const { toast } = useToast()
   const supabase = createClient()
   const t = useTranslations('articles')
+  const tCommon = useTranslations('common')
   const errorLocale = useLocale() as ErrorLocale
 
   const router = useRouter()
@@ -75,13 +91,18 @@ function ArticlesPageInner() {
 
   const sortParam = searchParams.get('sort')
   const dirParam = searchParams.get('dir')
+  // Currency scope (#1189). In the URL like the sort, so a filtered register
+  // survives opening an article and coming back, and can be linked to.
+  const currencyParam = searchParams.get('currency')
+  // Default to the user's own article numbering (numeric-aware), issue #1053.
   const sortColumn: SortColumn = (SORTABLE_COLUMNS as ReadonlyArray<string>).includes(sortParam ?? '')
     ? (sortParam as SortColumn)
-    : 'name'
+    : 'article_number'
   const sortDir: SortDir = dirParam === 'desc' ? 'desc' : 'asc'
 
   const updateSort = useCallback(
     (column: SortColumn) => {
+      setVisibleCount(INITIAL_VISIBLE_ROWS)
       const params = new URLSearchParams(searchParams.toString())
       let nextDir: SortDir = 'asc'
       if (column === sortColumn) {
@@ -101,7 +122,6 @@ function ArticlesPageInner() {
       .from('articles')
       .select('*')
       .eq('company_id', company.id)
-      .eq('active', true)
       .order('name', { ascending: true })
 
     if (error) {
@@ -123,7 +143,7 @@ function ArticlesPageInner() {
 
   // Create runs through useSubmitWithAccountActivation so an ACCOUNTS_NOT_IN_CHART
   // response (revenue account not yet activated) opens the standard
-  // activate-and-retry dialog instead of failing — same UX as the journal entry form.
+  // activate-and-retry dialog instead of failing: same UX as the journal entry form.
   const pendingCreateRef = useRef<CreateArticleInput | null>(null)
   const submitCreate = useCallback(async () => {
     const response = await fetch('/api/articles', {
@@ -166,17 +186,34 @@ function ArticlesPageInner() {
     }
   }
 
+  const availableCurrencies = useMemo(() => listArticleCurrencies(articles), [articles])
+  const currencyFilter = resolveCurrencyScope(currencyParam, availableCurrencies)
+
+  const updateCurrencyFilter = useCallback(
+    (next: string) => {
+      setVisibleCount(INITIAL_VISIBLE_ROWS)
+      const params = new URLSearchParams(searchParams.toString())
+      if (next === ALL_CURRENCIES) params.delete('currency')
+      else params.set('currency', next)
+      const query = params.toString()
+      router.replace(query ? `${pathname}?${query}` : pathname, { scroll: false })
+    },
+    [searchParams, router, pathname],
+  )
+
   const filteredArticles = useMemo(() => {
     const term = searchTerm.trim().toLowerCase()
-    if (!term) return articles
+    if (!term && currencyFilter === ALL_CURRENCIES) return articles
     return articles.filter((a) => {
+      if (!matchesCurrencyScope(a, currencyFilter)) return false
+      if (!term) return true
       return (
         a.name.toLowerCase().includes(term) ||
         a.name_en?.toLowerCase().includes(term) ||
         a.article_number?.toLowerCase().includes(term)
       )
     })
-  }, [articles, searchTerm])
+  }, [articles, searchTerm, currencyFilter])
 
   const sortedArticles = useMemo(() => {
     const arr = [...filteredArticles]
@@ -193,7 +230,7 @@ function ArticlesPageInner() {
           cmp = compareStrings(a.name || '', b.name || '')
           break
         case 'article_number':
-          cmp = compareStrings(a.article_number || '', b.article_number || '')
+          cmp = compareArticles(a, b)
           break
         case 'type':
           cmp = compareStrings(a.type || '', b.type || '')
@@ -206,8 +243,11 @@ function ArticlesPageInner() {
     })
     return arr
   }, [filteredArticles, sortColumn, sortDir])
+  const visibleArticles = sortedArticles.slice(0, visibleCount)
 
-  function SortableHeader({
+  // Sortable dry-table head: the button inherits the TH typography and only
+  // adds the direction affordance.
+  function SortableTh({
     column,
     label,
     className,
@@ -219,24 +259,32 @@ function ArticlesPageInner() {
     const isActive = sortColumn === column
     const Icon = isActive ? (sortDir === 'asc' ? ChevronUp : ChevronDown) : ChevronsUpDown
     return (
-      <TableHead className={className}>
+      <th className={cn(TH_CLASS, className)}>
         <button
           type="button"
           onClick={() => updateSort(column)}
-          className="inline-flex items-center gap-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground hover:text-foreground transition-colors"
+          className="inline-flex items-center gap-1 transition-colors duration-150 hover:text-foreground"
         >
           {label}
           <Icon className="h-3 w-3 opacity-70" aria-hidden="true" />
         </button>
-      </TableHead>
+      </th>
     )
   }
 
   return (
     <div className="space-y-8">
-      <PageHeader
-        title={t('title')}
-        action={
+      {/* Page header (concept scene 27): title + export + Ny artikel */}
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <h1 className="font-display text-2xl leading-8 tracking-tight">{t('title')}</h1>
+        <div className="flex items-center gap-2">
+          <ReportExportMenu
+            size="default"
+            items={[
+              { format: 'xlsx', href: '/api/export/articles' },
+              { format: 'csv', href: '/api/export/articles?format=csv' },
+            ]}
+          />
           <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
             <DialogTrigger asChild>
               <Button
@@ -258,175 +306,157 @@ function ArticlesPageInner() {
               <ArticleForm
                 onSubmit={handleCreateArticle}
                 isLoading={isCreating}
+                onCancel={() => setIsDialogOpen(false)}
               />
             </DialogContent>
           </Dialog>
-        }
-      />
-
-      {/* Search */}
-      <div className="relative">
-        <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-        <Input
-          placeholder={t('search_placeholder')}
-          value={searchTerm}
-          onChange={(e) => setSearchTerm(e.target.value)}
-          className="pl-10"
-        />
+        </div>
       </div>
 
-      {/* Article list */}
+      {/* Toolbar: search, plus the currency scope far right (convention 8) */}
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative min-w-[190px] max-w-xs flex-1">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+          <Input
+            placeholder={t('search_placeholder')}
+            value={searchTerm}
+            onChange={(e) => {
+              setSearchTerm(e.target.value)
+              setVisibleCount(INITIAL_VISIBLE_ROWS)
+            }}
+            className="h-9 pl-10"
+          />
+        </div>
+        {/* A single-currency register needs no scope: the chip would be a
+            control with one meaningful position. */}
+        {availableCurrencies.length > 1 && (
+          <ContextPicker
+            className="ml-auto"
+            ariaLabel={t('currency_filter_aria')}
+            value={currencyFilter}
+            onChange={updateCurrencyFilter}
+            triggerLabel={
+              currencyFilter === ALL_CURRENCIES
+                ? t('currency_filter_all')
+                : t('currency_filter_selected', { currency: currencyFilter })
+            }
+            items={[
+              { id: ALL_CURRENCIES, label: t('currency_filter_all') },
+              ...availableCurrencies.map((code) => ({ id: code, label: code })),
+            ]}
+          />
+        )}
+      </div>
+
       {isLoading ? (
-        <>
-          {/* Desktop skeleton */}
-          <Card className="hidden md:block">
-            <CardContent className="p-6 space-y-3">
-              {[1, 2, 3, 4, 5].map((i) => (
-                <Skeleton key={i} className="h-10 w-full" />
-              ))}
-            </CardContent>
-          </Card>
-          {/* Mobile skeleton */}
-          <div className="grid gap-4 md:hidden">
-            {[1, 2, 3].map((i) => (
-              <Card key={i}>
-                <CardHeader>
-                  <Skeleton className="h-5 w-1/2" />
-                  <Skeleton className="h-4 w-1/3 mt-2" />
-                </CardHeader>
-                <CardContent>
-                  <Skeleton className="h-4 w-full" />
-                </CardContent>
-              </Card>
-            ))}
-          </div>
-        </>
+        <div className="space-y-3">
+          {[1, 2, 3, 4, 5].map((i) => (
+            <Skeleton key={i} className="h-10 w-full" />
+          ))}
+        </div>
       ) : sortedArticles.length === 0 ? (
-        <Card>
-          <CardContent className="p-0">
-            {searchTerm ? (
-              <EmptyState
-                icon={Package}
-                title={t('no_search_results_title')}
-                description={t('no_search_results_description', { term: searchTerm })}
-              />
-            ) : (
-              <EmptyState
-                icon={Package}
-                title={t('empty_title')}
-                description={t('empty_description')}
-                actionLabel={canWrite ? t('empty_action') : undefined}
-                onAction={canWrite ? () => setIsDialogOpen(true) : undefined}
-              />
-            )}
-          </CardContent>
-        </Card>
+        searchTerm ? (
+          <EmptyState
+            icon={Package}
+            title={t('no_search_results_title')}
+            description={
+              // The currency scope is part of why nothing matched, so it has to
+              // be named: otherwise the register reads as empty of the term
+              // when it is only empty inside the active scope.
+              currencyFilter === ALL_CURRENCIES
+                ? t('no_search_results_description', { term: searchTerm })
+                : t('no_search_results_in_currency_description', {
+                    term: searchTerm,
+                    currency: currencyFilter,
+                  })
+            }
+          />
+        ) : (
+          <EmptyState
+            icon={Package}
+            title={t('empty_title')}
+            description={t('empty_description')}
+            actionLabel={canWrite ? t('empty_action') : undefined}
+            onAction={canWrite ? () => setIsDialogOpen(true) : undefined}
+          />
+        )
       ) : (
         <>
-          {/* Desktop table */}
-          <Card className="hidden md:block">
-            <CardContent className="p-0">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <SortableHeader column="article_number" label={t('col_number')} />
-                    <SortableHeader column="name" label={t('col_name')} />
-                    <SortableHeader column="type" label={t('col_type')} />
-                    <SortableHeader column="unit" label={t('col_unit')} />
-                    <SortableHeader
-                      column="price_excl_vat"
-                      label={t('col_price')}
-                      className="text-right"
-                    />
-                    <SortableHeader
-                      column="vat_rate"
-                      label={t('col_vat')}
-                      className="text-right"
-                    />
-                    <TableHead className="text-right">{t('col_status')}</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {sortedArticles.map((article) => (
-                    <TableRow
-                      key={article.id}
-                      className="cursor-pointer"
-                      onClick={() => router.push(`/articles/${article.id}`)}
-                    >
-                      <TableCell className="tabular-nums text-muted-foreground">
-                        {article.article_number || '—'}
-                      </TableCell>
-                      <TableCell className="font-medium">
-                        <Link
-                          href={`/articles/${article.id}`}
-                          className="hover:text-primary transition-colors"
-                          onClick={(e) => e.stopPropagation()}
-                        >
-                          {article.name}
-                        </Link>
-                      </TableCell>
-                      <TableCell>
-                        <Badge variant="secondary">
-                          {t(ARTICLE_TYPE_LABEL_KEYS[article.type])}
+          <div className="overflow-x-auto">
+            <table className="w-full border-collapse text-[13px]">
+              <thead>
+                <tr>
+                  <SortableTh column="article_number" label={t('col_number')} />
+                  <SortableTh column="name" label={t('col_name')} className="w-full" />
+                  <SortableTh column="type" label={t('col_type')} className="hidden md:table-cell" />
+                  <SortableTh column="unit" label={t('col_unit')} className="hidden text-right sm:table-cell" />
+                  <SortableTh column="price_excl_vat" label={t('col_price')} className="text-right" />
+                  <SortableTh column="vat_rate" label={t('col_vat')} className="hidden text-right sm:table-cell" />
+                  <th className={cn(TH_CLASS, 'text-right')}>{t('col_status')}</th>
+                </tr>
+              </thead>
+              <tbody className="stagger-enter">
+                {visibleArticles.map((article) => (
+                  <tr
+                    key={article.id}
+                    className="group cursor-pointer transition-colors duration-150 hover:bg-secondary/35"
+                    onClick={() => router.push(`/articles/${article.id}`)}
+                  >
+                    <td className={cn(TD_CLASS, 'whitespace-nowrap tabular-nums text-muted-foreground')}>
+                      {article.article_number || '-'}
+                    </td>
+                    <td className={cn(TD_CLASS, 'max-w-0 w-full')}>
+                      <Link
+                        href={`/articles/${article.id}`}
+                        className="block truncate hover:underline"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        {article.name}
+                      </Link>
+                    </td>
+                    <td className={cn(TD_CLASS, 'hidden whitespace-nowrap text-muted-foreground md:table-cell')}>
+                      {t(ARTICLE_TYPE_LABEL_KEYS[article.type])}
+                    </td>
+                    <td className={cn(TD_CLASS, 'hidden whitespace-nowrap text-right text-muted-foreground sm:table-cell')}>
+                      {article.unit}
+                    </td>
+                    <td className={cn(TD_CLASS, 'whitespace-nowrap text-right tabular-nums')}>
+                      {formatCurrency(article.price_excl_vat, article.currency)}
+                    </td>
+                    <td className={cn(TD_CLASS, 'hidden whitespace-nowrap text-right tabular-nums text-muted-foreground sm:table-cell')}>
+                      {article.vat_rate} %
+                    </td>
+                    <td className={cn(TD_CLASS, 'whitespace-nowrap text-right')}>
+                      {article.active ? (
+                        <span className="text-muted-foreground">{t('status_active')}</span>
+                      ) : (
+                        <Badge variant="outline" className="font-normal">
+                          {t('status_inactive')}
                         </Badge>
-                      </TableCell>
-                      <TableCell className="text-muted-foreground">{article.unit}</TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {formatCurrency(article.price_excl_vat)}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums text-muted-foreground">
-                        {article.vat_rate} %
-                      </TableCell>
-                      <TableCell className="text-right">
-                        <Badge variant={article.active ? 'success' : 'secondary'}>
-                          {article.active ? t('status_active') : t('status_inactive')}
-                        </Badge>
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </CardContent>
-          </Card>
-
-          {/* Mobile card list */}
-          <div className="grid gap-4 md:hidden">
-            {sortedArticles.map((article) => (
-              <Link key={article.id} href={`/articles/${article.id}`}>
-                <Card className="cursor-pointer transition-colors duration-150 hover:bg-secondary/60 h-full group">
-                  <CardHeader className="pb-3">
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0">
-                        <CardTitle className="text-base truncate group-hover:text-primary transition-colors">
-                          {article.name}
-                        </CardTitle>
-                        <div className="flex items-center gap-2 mt-1">
-                          <Badge variant="secondary">
-                            {t(ARTICLE_TYPE_LABEL_KEYS[article.type])}
-                          </Badge>
-                          {article.article_number && (
-                            <span className="text-xs text-muted-foreground tabular-nums">
-                              {article.article_number}
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                      <span className="font-display text-lg tabular-nums shrink-0">
-                        {formatCurrency(article.price_excl_vat)}
-                      </span>
-                    </div>
-                  </CardHeader>
-                  <CardContent>
-                    <div className="flex items-center gap-2 text-sm text-muted-foreground tabular-nums">
-                      <span>{t('per_unit', { unit: article.unit })}</span>
-                      <span aria-hidden="true">·</span>
-                      <span>{t('vat_label_value', { rate: article.vat_rate })}</span>
-                    </div>
-                  </CardContent>
-                </Card>
-              </Link>
-            ))}
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
+
+          {/* Footer count (concept pgnote) */}
+          <p className="px-1 text-xs text-muted-foreground tabular-nums">
+            {t('count_footer', { count: sortedArticles.length })}
+          </p>
+
+          {visibleCount < sortedArticles.length && (
+            <div className="flex justify-center">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setVisibleCount((count) => count + INITIAL_VISIBLE_ROWS)}
+              >
+                {tCommon('load_more')}
+              </Button>
+            </div>
+          )}
         </>
       )}
 
@@ -443,7 +473,21 @@ function ArticlesPageInner() {
 
 export default function ArticlesPage() {
   return (
-    <Suspense fallback={null}>
+    <Suspense
+      fallback={
+        <div className="space-y-8">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+            <Skeleton className="h-9 w-40" />
+            <Skeleton className="h-10 w-32" />
+          </div>
+          <div className="space-y-3">
+            {[1, 2, 3, 4].map((i) => (
+              <Skeleton key={i} className="h-10 w-full" />
+            ))}
+          </div>
+        </div>
+      }
+    >
       <ArticlesPageInner />
     </Suspense>
   )

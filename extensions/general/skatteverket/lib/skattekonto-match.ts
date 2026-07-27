@@ -1,5 +1,6 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import type { StoredSkattekontoTransaction } from '../types'
+import { fetchEntryLines, type EntryLinesQuery } from '@/lib/bookkeeping/entry-lines'
 
 /**
  * "Matcha mot befintligt verifikat"-flöde för skattekonto-rader.
@@ -14,7 +15,7 @@ import type { StoredSkattekontoTransaction } from '../types'
  * finds the existing entry and links the SKV row to it, no new draft.
  *
  * The candidate query is intentionally strict (exact amount, exact side,
- * unused entry) — false positives would be silently destructive. False
+ * unused entry): false positives would be silently destructive. False
  * negatives just fall back to "Bokför / Skapa manuellt".
  *
  * AGI period disambiguation: when transaktionstext carries an explicit period
@@ -59,21 +60,75 @@ export interface SkattekontoMatchCandidate {
   matched_via_agi_period?: boolean
 }
 
+/** Swedish month names exactly as SKV writes them in prod transaktionstext. */
+export const SWEDISH_MONTH_NUMBERS: Record<string, number> = {
+  januari: 1,
+  februari: 2,
+  mars: 3,
+  april: 4,
+  maj: 5,
+  juni: 6,
+  juli: 7,
+  augusti: 8,
+  september: 9,
+  oktober: 10,
+  november: 11,
+  december: 12,
+}
+
+const MONTH_NAME_ALTERNATION = Object.keys(SWEDISH_MONTH_NUMBERS).join('|')
+
+// Production skattekonto rows write the period as "<keyword> <månad> <år>"
+// ("Avdragen skatt maj 2026", "Arbetsgivaravgift maj 2026"); the numeric
+// "Arbetsgivardeklaration 202605" form is what the SKV test environment uses.
+const MONTH_NAME_PERIOD_RE = new RegExp(
+  `(?:arbetsgivardeklaration|arbetsgivaravgift|avdragen skatt|\\bagi\\b)\\s+(${MONTH_NAME_ALTERNATION})\\s+(\\d{4})\\b`,
+  'i',
+)
+
 /**
  * Parse an AGI period from a Skatteverket transaktionstext.
  *
  * Examples that match:
- *   "Arbetsgivardeklaration 202605"
+ *   "Arbetsgivardeklaration 202605"      (test environment)
  *   "arbetsgivardeklaration 2026-05"
  *   "AGI 202605"
+ *   "Avdragen skatt maj 2026"            (production)
+ *   "Arbetsgivaravgift maj 2026"         (production)
+ *   "Beslut 260703 arbetsgivaravgift mars 2026"  (production beslut rows)
+ *
+ * Beslut rows parsing to their period is intentional (audited): it lets match
+ * suggestions period-boost correction rows too. This is safe because (a) the
+ * settlement module never uses parseAgiPeriod; it classifies with its own
+ * start-anchored regexes and parseNumericAgiPeriod only, so a beslut row can
+ * never mark a period paid, and (b) the only production callers are
+ * findMatchSuggestionsBulk and findMatchCandidates in this file, both of which
+ * require an exact amount+side match on a 1630 line before suggesting anything,
+ * so a beslut row can only ever be suggested against an entry carrying exactly
+ * the beslut's amount.
  *
  * Returns null when no period token is present or the value is out of range.
+ */
+export function parseAgiPeriod(
+  transaktionstext: string,
+): { year: number; month: number } | null {
+  return (
+    parseNumericAgiPeriod(transaktionstext) ??
+    parseMonthNameAgiPeriod(transaktionstext)
+  )
+}
+
+/**
+ * The numeric-token subset of parseAgiPeriod ("Arbetsgivardeklaration 202605",
+ * "AGI 2026-05"). Exported separately because the settlement's combined-row
+ * classifier must stay pinned to this form: the month-name form always means
+ * the split tax/avgift rows, which settle pairwise.
  *
  * The fallback (numeric YYYYMM after any AGI keyword) covers older SKV variants
  * that omit the leading word but still place the period adjacent to "AGI" or
  * "arbetsgivaravgift" elsewhere in the row.
  */
-export function parseAgiPeriod(
+export function parseNumericAgiPeriod(
   transaktionstext: string,
 ): { year: number; month: number } | null {
   const text = transaktionstext.toLowerCase()
@@ -95,6 +150,17 @@ export function parseAgiPeriod(
     if (isValidPeriod(year, month)) return { year, month }
   }
 
+  return null
+}
+
+function parseMonthNameAgiPeriod(
+  transaktionstext: string,
+): { year: number; month: number } | null {
+  const m = MONTH_NAME_PERIOD_RE.exec(transaktionstext)
+  if (!m) return null
+  const month = SWEDISH_MONTH_NUMBERS[m[1].toLowerCase()]
+  const year = Number(m[2])
+  if (month && isValidPeriod(year, month)) return { year, month }
   return null
 }
 
@@ -220,31 +286,6 @@ export async function findMatchSuggestionsBulk(
   const from = addDays(dates[0], -DATE_WINDOW_DAYS)
   const to = addDays(dates[dates.length - 1], DATE_WINDOW_DAYS)
 
-  const { data, error } = await supabase
-    .from('journal_entry_lines')
-    .select(
-      `
-        debit_amount,
-        credit_amount,
-        journal_entries!inner (
-          id,
-          voucher_number,
-          voucher_series,
-          entry_date,
-          description,
-          status,
-          company_id
-        )
-      `,
-    )
-    .eq('account_number', SKATTEKONTO_ACCOUNT)
-    .eq('journal_entries.company_id', companyId)
-    .gte('journal_entries.entry_date', from)
-    .lte('journal_entries.entry_date', to)
-    .neq('journal_entries.status', 'reversed')
-
-  if (error || !data) return new Map()
-
   type Row = {
     debit_amount: number
     credit_amount: number
@@ -258,7 +299,30 @@ export async function findMatchSuggestionsBulk(
       company_id: string
     }
   }
-  const lines = data as unknown as Row[]
+
+  // Driven from the journal_entries side (lib/bookkeeping/entry-lines.ts):
+  // the scope filters used to sit on a `journal_entries!inner` embed, which
+  // PostgREST compiles into a correlated LATERAL join that walks the ENTIRE
+  // journal_entry_lines table across all tenants. The parent is reattached
+  // under the same `journal_entries` key, so the candidate build is unchanged.
+  let lines: Row[]
+  try {
+    lines = await fetchEntryLines<Row>({
+      supabase,
+      entryColumns: 'id, voucher_number, voucher_series, entry_date, description, status, company_id',
+      lineColumns: 'debit_amount, credit_amount',
+      filterEntries: (q: EntryLinesQuery) =>
+        q
+          .eq('company_id', companyId)
+          .gte('entry_date', from)
+          .lte('entry_date', to)
+          .neq('status', 'reversed'),
+      filterLines: (q: EntryLinesQuery) => q.eq('account_number', SKATTEKONTO_ACCOUNT),
+    })
+  } catch {
+    // Unchanged posture: a candidate-search failure yields no suggestions.
+    return new Map()
+  }
 
   // Filter out entries already linked to another SKV row.
   const candidateEntryIds = Array.from(new Set(lines.map(l => l.journal_entries.id)))
@@ -403,43 +467,6 @@ export async function findMatchCandidates(
   const from = addDays(tx.transaktionsdatum, -DATE_WINDOW_DAYS)
   const to = addDays(tx.transaktionsdatum, DATE_WINDOW_DAYS)
 
-  // Query 1630-lines with the right amount + side, joined to entries in
-  // the date window. `!inner` filters out rows whose joined entry doesn't
-  // match (Supabase pg-rest convention).
-  let q = supabase
-    .from('journal_entry_lines')
-    .select(
-      `
-        debit_amount,
-        credit_amount,
-        journal_entries!inner (
-          id,
-          voucher_number,
-          voucher_series,
-          entry_date,
-          description,
-          status,
-          company_id
-        )
-      `,
-    )
-    .eq('account_number', SKATTEKONTO_ACCOUNT)
-    .eq('journal_entries.company_id', companyId)
-    .gte('journal_entries.entry_date', from)
-    .lte('journal_entries.entry_date', to)
-    .neq('journal_entries.status', 'reversed')
-
-  if (side === 'debit') {
-    q = q.eq('debit_amount', amount).eq('credit_amount', 0)
-  } else {
-    q = q.eq('credit_amount', amount).eq('debit_amount', 0)
-  }
-
-  const { data: rows, error: rowsError } = await q.limit(50)
-  if (rowsError) {
-    throw new Error(`Kunde inte söka kandidater: ${rowsError.message}`)
-  }
-
   type Row = {
     debit_amount: number
     credit_amount: number
@@ -453,14 +480,44 @@ export async function findMatchCandidates(
       company_id: string
     }
   }
-  const typedRows = (rows ?? []) as unknown as Row[]
+
+  // 1630-lines with the right amount + side, scoped to entries in the date
+  // window. The scope used to sit on a `journal_entries!inner` embed, which
+  // PostgREST compiles into a correlated LATERAL join that walks the ENTIRE
+  // journal_entry_lines table across all tenants (see
+  // lib/bookkeeping/entry-lines.ts). The old `.limit(50)` went with it: the
+  // amount+side match is exact, so the candidate set is already tiny.
+  let typedRows: Row[]
+  try {
+    typedRows = await fetchEntryLines<Row>({
+      supabase,
+      entryColumns: 'id, voucher_number, voucher_series, entry_date, description, status, company_id',
+      lineColumns: 'debit_amount, credit_amount',
+      filterEntries: (q: EntryLinesQuery) =>
+        q
+          .eq('company_id', companyId)
+          .gte('entry_date', from)
+          .lte('entry_date', to)
+          .neq('status', 'reversed'),
+      filterLines: (q: EntryLinesQuery) => {
+        const scoped = q.eq('account_number', SKATTEKONTO_ACCOUNT)
+        return side === 'debit'
+          ? scoped.eq('debit_amount', amount).eq('credit_amount', 0)
+          : scoped.eq('credit_amount', amount).eq('debit_amount', 0)
+      },
+    })
+  } catch (err) {
+    throw new Error(
+      `Kunde inte söka kandidater: ${err instanceof Error ? err.message : String(err)}`
+    )
+  }
 
   if (typedRows.length === 0) {
     return { tx, candidates: [] }
   }
 
   // Filter out entries already linked to another skattekonto_transactions
-  // row — those represent payments we've already accounted for.
+  // row: those represent payments we've already accounted for.
   const candidateEntryIds = Array.from(new Set(typedRows.map(r => r.journal_entries.id)))
   const { data: linked } = await supabase
     .from('skattekonto_transactions')

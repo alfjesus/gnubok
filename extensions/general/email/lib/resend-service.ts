@@ -17,6 +17,12 @@ function sanitizeHeaderPart(s: string): string {
   return s.replace(/[\r\n<>]/g, '').trim()
 }
 
+function optionalAddressList(addresses: string | string[] | undefined): string[] | undefined {
+  if (!addresses) return undefined
+  const list = Array.isArray(addresses) ? addresses : [addresses]
+  return list.length > 0 ? list : undefined
+}
+
 let resendClient: Resend | null = null
 
 function getResendClient(): Resend {
@@ -35,14 +41,14 @@ function isResendConfigured(): boolean {
 
 export class ResendEmailService implements EmailService {
   async sendEmail(options: SendEmailOptions): Promise<SendEmailResult> {
-    const { to, cc, subject, html, text, replyTo, fromName, attachments } = options
+    const { to, cc, bcc, subject, html, text, replyTo, fromName, attachments } = options
 
     if (!this.isConfigured()) {
       return { success: false, error: 'Email service is not configured' }
     }
 
     // Strip CRLF and angle brackets from name parts to prevent header injection.
-    // Resend's API does its own validation, but defense in depth — both fromName
+    // Resend's API does its own validation, but defense in depth: both fromName
     // (user-controlled, from company settings) and appName (admin-controlled,
     // from branding) flow into the From header.
     const safeAppName = sanitizeHeaderPart(getBranding().appName)
@@ -56,7 +62,8 @@ export class ResendEmailService implements EmailService {
       const response = await resend.emails.send({
         from,
         to: Array.isArray(to) ? to : [to],
-        cc: cc ? (Array.isArray(cc) ? cc : [cc]) : undefined,
+        cc: optionalAddressList(cc),
+        bcc: optionalAddressList(bcc),
         subject,
         html,
         text,
@@ -72,14 +79,15 @@ export class ResendEmailService implements EmailService {
 
       if (response.error) {
         log.error('Resend error:', response.error)
-        return { success: false, error: response.error.message }
+        return { success: false, provider: 'resend', error: response.error.message }
       }
 
-      return { success: true, messageId: response.data?.id }
+      return { success: true, provider: 'resend', messageId: response.data?.id }
     } catch (error) {
       log.error('Failed to send email:', error)
       return {
         success: false,
+        provider: 'resend',
         error: error instanceof Error ? error.message : 'Unknown error',
       }
     }

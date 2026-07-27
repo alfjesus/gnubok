@@ -76,7 +76,7 @@ describe('GET /api/bookkeeping/journal-entries', () => {
         date_to: '2024-12-31',
         limit: '10',
         offset: '5',
-        // Strict period filtering — exercises the PostgREST path, not the RPC.
+        // Strict period filtering: exercises the PostgREST path, not the RPC.
         include_related: 'false',
       },
     })
@@ -156,6 +156,21 @@ describe('GET /api/bookkeeping/journal-entries', () => {
     expect(mockSupabase.rpc).not.toHaveBeenCalled()
   })
 
+  it('accepts a large limit (the "Alla" page size) and a negative offset without erroring', async () => {
+    enqueue({ data: [], error: null, count: 0 })
+
+    const request = createMockRequest('/api/bookkeeping/journal-entries', {
+      // 'Alla' sends a large limit; the route clamps it to MAX_LIMIT. A negative
+      // offset is floored to 0. Both are bounded server-side (ASVS V1.2.5).
+      searchParams: { limit: '999999', offset: '-5', include_related: 'false' },
+    })
+    const response = await GET(request)
+    const { status } = await parseJsonResponse(response)
+
+    expect(status).toBe(200)
+    expect(mockSupabase.from).toHaveBeenCalledWith('journal_entries')
+  })
+
   it('returns 500 on database error', async () => {
     enqueue({ data: null, error: { message: 'DB error' } })
 
@@ -164,7 +179,8 @@ describe('GET /api/bookkeeping/journal-entries', () => {
     const { status, body } = await parseJsonResponse<{ error: string }>(response)
 
     expect(status).toBe(500)
-    expect(body.error).toBe('DB error')
+    // Raw Supabase messages never reach the response field (issue #337).
+    expect(body.error).toBe('Verifikationerna kunde inte hämtas. Försök igen.')
   })
 })
 
@@ -240,6 +256,7 @@ describe('POST /api/bookkeeping/journal-entries', () => {
     const { status, body } = await parseJsonResponse<{ error: string }>(response)
 
     expect(status).toBe(400)
-    expect(body.error).toBe('Unbalanced entry')
+    // Untyped engine errors map to the Swedish context fallback (issue #337).
+    expect(body.error).toBe('Kunde inte hantera verifikationen. Försök igen.')
   })
 })

@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { ensureInitialized } from '@/lib/init'
 import { withRouteContext } from '@/lib/api/with-route-context'
+import { getErrorMessage } from '@/lib/errors/get-error-message'
 import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
 import { dissolveScheduleNow } from '@/lib/bookkeeping/accruals/service'
 import {
@@ -18,7 +19,7 @@ ensureInitialized()
  * "Lös upp nu": books the schedule's remaining months in ONE verifikat dated
  * today (clamped by lock date) and completes the schedule. Used when the
  * underlying service ends early or the user wants the rest expensed now.
- * Cancelling-with-storno only happens via the credit flows — a standalone
+ * Cancelling-with-storno only happens via the credit flows: a standalone
  * cancel would strand the interim-account balance.
  */
 export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
@@ -29,7 +30,7 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
 
     try {
       const result = await dissolveScheduleNow(supabase, companyId!, user.id, id)
-      // Manual financial write — log the acting user for auditability.
+      // Manual financial write: log the acting user for auditability.
       log.info('accrual schedule dissolved', {
         userId: user.id,
         companyId,
@@ -39,8 +40,7 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
       })
       return NextResponse.json({ data: result })
     } catch (err) {
-      const reason = err instanceof Error ? err.message : 'unknown'
-      // Typed domain errors carry a stable code — never match Swedish prose.
+      // Typed domain errors carry a stable code: never match Swedish prose.
       if (isAccrualError(err)) {
         switch (err.code) {
           case ACCRUAL_SCHEDULE_NOT_FOUND:
@@ -57,7 +57,7 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
       log.error('accrual dissolve failed', err as Error, { entityId: id })
       return errorResponseFromCode('ACCRUAL_DISSOLVE_FAILED', log, {
         requestId,
-        details: { reason },
+        details: { reason: getErrorMessage(err) },
       })
     }
   },

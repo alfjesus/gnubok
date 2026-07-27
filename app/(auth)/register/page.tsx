@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useEffect, Suspense } from 'react'
+import dynamic from 'next/dynamic'
 import { useSearchParams, useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { useLocale, useTranslations } from 'next-intl'
@@ -13,26 +14,42 @@ import { Loader2, Mail, ArrowLeft, ExternalLink } from 'lucide-react'
 import { BrandWordmark } from '@/components/branding/BrandWordmark'
 import { getErrorMessage, type ErrorLocale } from '@/lib/errors/get-error-message'
 import { isBankIdEnabled } from '@/lib/auth/bankid'
-import { BankIdAuth } from '@/components/auth/BankIdAuth'
 import type { BankIdResult } from '@/components/auth/BankIdAuth'
 import { getBranding } from '@/lib/branding/service'
 import { detectWebmailHint } from '@/lib/auth/webmail-search'
+import {
+  consumeInviteCookie,
+  INVITE_PROBLEM_MESSAGE_KEYS,
+} from '@/lib/auth/consume-invite-cookie'
+import { AuthPageSkeleton } from '@/components/auth/AuthPageSkeleton'
 
 const branding = getBranding()
 
+const BankIdAuth = dynamic(
+  () => import('@/components/auth/BankIdAuth').then((module) => module.BankIdAuth),
+  { ssr: false },
+)
+
 export default function RegisterPage() {
   return (
-    <Suspense fallback={
-      <div className="min-h-screen flex items-center justify-center">
-        <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
-      </div>
-    }>
+    <Suspense fallback={<AuthPageSkeleton />}>
       <RegisterPageContent />
     </Suspense>
   )
 }
 
 function RegisterPageContent() {
+  // `invite` is the only query parameter this page reads. It deliberately does
+  // NOT read `next`: nothing links here with one (bounceToAuth in
+  // lib/supabase/middleware.ts targets /login and the two MFA pages only, and
+  // app/invite/[token]/page.tsx sends `?invite=`), the already-signed-in case
+  // is handled in the middleware behind safeReturnTo, and neither signup path
+  // has a destination to spend it on: the password path leaves through the
+  // confirmation mail and /auth/callback, and the BankID path must land a
+  // brand-new account on '/' or /select-company rather than a deep link it has
+  // no membership for. If a destination is ever wanted here it MUST go through
+  // safeReturnTo (lib/auth/safe-return-to.ts); a hand-rolled check on this
+  // value is an open redirect.
   const searchParams = useSearchParams()
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -49,10 +66,35 @@ function RegisterPageContent() {
   const supabase = createClient()
   const bankIdEnabled = isBankIdEnabled()
   const t = useTranslations('register')
+  const tInvite = useTranslations('invite')
   const errorLocale = useLocale() as ErrorLocale
+
+  // Accept a pending invite, if any, and report a non-definitive failure.
+  // Returns true when the caller should land the user in the app directly.
+  // The invite cookie survives anything that is not a settled outcome, so
+  // /onboarding and /select-company can retry acceptance server-side.
+  const acceptPendingInvite = async (): Promise<boolean> => {
+    const invite = await consumeInviteCookie()
+    if (invite.accepted) return true
+    if (invite.problem) {
+      const keys = INVITE_PROBLEM_MESSAGE_KEYS[invite.problem]
+      toast({
+        title: tInvite(keys.title),
+        description: tInvite(keys.body),
+        variant: 'destructive',
+      })
+    }
+    return false
+  }
 
   // When arriving from an invite link, fetch the invite info to pre-fill
   // and lock the email field so the user registers with the correct address.
+  // BOTH signup forms are pre-filled: the BankID form used to be left blank
+  // and editable, so an invitee who signed up with BankID typed their private
+  // address, POST /api/team/accept answered 403 on the email equality check,
+  // and they landed on /select-company with no membership. The token now
+  // survives that 403 (lib/auth/consume-invite-cookie.ts) so it is recoverable
+  // rather than terminal, but the signup should not walk into it at all.
   useEffect(() => {
     const inviteToken = searchParams.get('invite')
     if (!inviteToken) return
@@ -63,6 +105,7 @@ function RegisterPageContent() {
         if (data?.data?.email) {
           setInviteEmail(data.data.email)
           setEmail(data.data.email)
+          setBankIdEmail(data.data.email)
         }
       })
       .catch(() => {})
@@ -84,7 +127,7 @@ function RegisterPageContent() {
       })
       return
     }
-    // BankID verified — store sessionId and show email form
+    // BankID verified: store sessionId and show email form
     setBankIdUser({ givenName: result.givenName, surname: result.surname })
     if (result.sessionId) setBankIdSessionId(result.sessionId)
   }
@@ -140,7 +183,7 @@ function RegisterPageContent() {
       })
 
       if (error) {
-        console.error('[register] BankID verifyOtp failed', error)
+        console.error('[register] BankID verifyOtp failed', error.message)
         toast({
           title: t('register_failed_complete'),
           description: getErrorMessage(error, { context: 'auth', locale: errorLocale }),
@@ -149,10 +192,20 @@ function RegisterPageContent() {
         return
       }
 
+      // Invited signup: accept the pending invite before routing to the
+      // picker, same as the login page's BankID path. Without this, an
+      // invitee who registers with BankID lands on /select-company with no
+      // membership and gets funneled into creating a company instead of
+      // joining the one they were invited to.
+      if (await acceptPendingInvite()) {
+        window.location.href = '/'
+        return
+      }
+
       router.push('/select-company')
       router.refresh()
     } catch (error) {
-      console.error('[register] BankID signup error', error)
+      console.error('[register] BankID signup error', error instanceof Error ? error.message : String(error))
       toast({
         title: t('register_failed_title'),
         description: getErrorMessage(error, { context: 'auth', locale: errorLocale }),
@@ -201,14 +254,6 @@ function RegisterPageContent() {
     }
 
     try {
-      console.log('[register] attempting signUp', {
-        email: emailValue,
-        hasPassword: !!passwordValue,
-        passwordLength: passwordValue.length,
-        redirectTo: `${window.location.origin}/auth/callback`,
-        supabaseUrl: process.env.NEXT_PUBLIC_SUPABASE_URL,
-      })
-
       const { data, error } = await supabase.auth.signUp({
         email: emailValue,
         password: passwordValue,
@@ -218,15 +263,7 @@ function RegisterPageContent() {
       })
 
       if (error) {
-        console.error('[register] signUp error', {
-          message: error.message,
-          code: error.code,
-          status: error.status,
-          name: error.name,
-          stack: error.stack,
-          cause: error.cause,
-          fullError: JSON.stringify(error, Object.getOwnPropertyNames(error)),
-        })
+        console.error('[register] signUp error', error.message)
         toast({
           title: t('register_failed_title'),
           description: getErrorMessage(error, { context: 'auth', locale: errorLocale }),
@@ -234,16 +271,6 @@ function RegisterPageContent() {
         })
         return
       }
-
-      console.log('[register] signUp response', {
-        userId: data.user?.id,
-        email: data.user?.email,
-        isAnonymous: data.user?.is_anonymous,
-        identities: data.user?.identities?.length,
-        hasSession: !!data.session,
-        confirmationSentAt: data.user?.confirmation_sent_at,
-        provider: data.user?.app_metadata?.provider,
-      })
 
       // If auto-confirmed (local dev), process invite immediately and redirect
       if (data.session) {
@@ -260,23 +287,15 @@ function RegisterPageContent() {
 
             if (res.ok) {
               document.cookie = 'gnubok-invite-token=; path=/; max-age=0'
-              console.log('[register] invite accepted after auto-confirm — redirecting')
               window.location.href = '/'
               return
             }
-
-            // Log the error response so we can diagnose invite failures
-            const errBody = await res.json().catch(() => ({}))
-            console.error('[register] invite acceptance returned non-ok', {
-              status: res.status,
-              error: errBody.error,
-            })
           } catch (err) {
-            console.error('[register] invite acceptance failed:', err)
+            console.error('[register] invite acceptance failed:', err instanceof Error ? err.message : String(err))
           }
         }
 
-        // Auto-confirmed but no invite or invite failed — go to onboarding
+        // Auto-confirmed but no invite or invite failed: go to onboarding
         // (invite cookie is preserved so the onboarding fallback can retry)
         window.location.href = '/'
         return
@@ -294,13 +313,7 @@ function RegisterPageContent() {
       setEmail(emailValue)
       setIsRegistered(true)
     } catch (error) {
-      console.error('[register] unexpected exception', {
-        error,
-        message: error instanceof Error ? error.message : String(error),
-        stack: error instanceof Error ? error.stack : undefined,
-        type: typeof error,
-        constructor: error?.constructor?.name,
-      })
+      console.error('[register] unexpected exception', error instanceof Error ? error.message : String(error))
       toast({
         title: t('register_failed_title'),
         description: getErrorMessage(error, { context: 'auth', locale: errorLocale }),
@@ -329,15 +342,22 @@ function RegisterPageContent() {
             </p>
           </div>
 
-          <div className="rounded-xl border bg-card p-4">
+          <div className="rounded-lg border bg-card p-4">
             <p className="text-sm text-muted-foreground text-center leading-relaxed">
               {t('duplicate_hint')}
             </p>
           </div>
 
           <div className="space-y-2">
+            {/*
+              Plain /login, no `email` parameter: app/(auth)/login/page.tsx
+              reads only `error`, `flow` and `next`, so the address was
+              travelling in the URL (browser history, Referer, every proxy
+              access log) and arriving nowhere. The address is already on
+              screen above, so nothing is lost by dropping it.
+            */}
             <Button className="w-full" asChild>
-              <Link href={`/login?email=${encodeURIComponent(duplicateEmail)}`}>
+              <Link href="/login">
                 {t('sign_in')}
               </Link>
             </Button>
@@ -377,7 +397,7 @@ function RegisterPageContent() {
             </p>
           </div>
 
-          <div className="rounded-xl border bg-card p-4">
+          <div className="rounded-lg border bg-card p-4">
             <p className="text-sm text-muted-foreground text-center leading-relaxed">
               {t('confirm_email_hint')}
             </p>
@@ -416,7 +436,7 @@ function RegisterPageContent() {
           </p>
         </div>
 
-        <div className="rounded-xl border bg-card p-6" style={{ boxShadow: 'var(--shadow-md)' }}>
+        <div className="rounded-lg border bg-card p-6">
           {bankIdEnabled && !bankIdUser && (
             <>
               <div className="mb-5">
@@ -462,11 +482,12 @@ function RegisterPageContent() {
                   value={bankIdEmail}
                   onChange={(e) => setBankIdEmail(e.target.value)}
                   required
-                  disabled={isLoading}
+                  disabled={isLoading || !!inviteEmail}
+                  readOnly={!!inviteEmail}
                   className="h-11"
                 />
                 <p className="text-xs text-muted-foreground">
-                  {t('bankid_email_hint')}
+                  {inviteEmail ? t('invite_email_hint') : t('bankid_email_hint')}
                 </p>
               </div>
               <Button type="submit" className="w-full h-11" disabled={isLoading}>

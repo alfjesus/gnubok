@@ -1,16 +1,13 @@
 import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
+import { withRouteContext } from '@/lib/api/with-route-context'
 import { fetchTaxTableRates, TaxTableUnavailableError } from '@/lib/salary/tax-tables'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 /**
  * Probe Skatteverket's open data API to confirm tax tables are reachable.
  * Used by the salary settings page to surface that fetching is automatic.
  */
-export async function GET(request: Request) {
-  const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
-  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-
+export const GET = withRouteContext('salary.tax_tables.status', async (request) => {
   const { searchParams } = new URL(request.url)
   const year = parseInt(searchParams.get('year') || String(new Date().getFullYear()))
 
@@ -32,10 +29,10 @@ export async function GET(request: Request) {
           source: 'unavailable' as const,
           reachable: false,
           checkedAt: new Date().toISOString(),
-          message: err.message,
+          message: getUserErrorMessage(err),
         },
       })
     }
     throw err
   }
-}
+})

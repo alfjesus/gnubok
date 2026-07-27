@@ -2,7 +2,7 @@ import type { McpResource } from './types'
 
 /**
  * Per-company working memory for agents. Read at session start so Claude
- * knows what exists in the tenant before composing tool calls — counts,
+ * knows what exists in the tenant before composing tool calls: counts,
  * active fiscal period, lock dates, voucher-series state, recent activity,
  * approaching deadlines. Mirrors the `context.md` pattern from
  * Shipper+Claude's "Agent-native Architectures" guidance.
@@ -12,7 +12,7 @@ import type { McpResource } from './types'
 export const companyCurrentResource: McpResource = {
   uri: 'Accounted://company/current',
   name: 'Active Company',
-  description: 'Per-company working memory: identity, active fiscal period, lock dates, entity counts, voucher series state, recent activity, approaching Swedish filing deadlines. Read this first when starting work on a company.',
+  description: 'Working memory for the API key default company: identity, active fiscal period, lock dates, entity counts, voucher series state, recent activity, and filing deadlines. For another company, call gnubok_get_agent_briefing with company_id.',
   mimeType: 'application/json',
   read: async ({ supabase, companyId }) => {
     const today = new Date().toISOString().slice(0, 10)
@@ -45,7 +45,7 @@ export const companyCurrentResource: McpResource = {
         .eq('company_id', companyId)
         .maybeSingle(),
 
-      // The fiscal period covering today — the "active" one for new entries.
+      // The fiscal period covering today: the "active" one for new entries.
       supabase
         .from('fiscal_periods')
         .select('id, name, period_start, period_end, is_closed, locked_at, closing_entry_id')
@@ -94,7 +94,7 @@ export const companyCurrentResource: McpResource = {
         .eq('company_id', companyId)
         .is('journal_entry_id', null),
 
-      // Voucher-series state across open fiscal periods. Scoped by company_id —
+      // Voucher-series state across open fiscal periods. Scoped by company_id:
       // the table also carries user_id, but a multi-company user would otherwise
       // pull series belonging to their other tenants into this company's context
       // (cross-tenant leak flagged by PR #505 review).
@@ -104,18 +104,27 @@ export const companyCurrentResource: McpResource = {
         .eq('company_id', companyId)
         .order('voucher_series', { ascending: true }),
 
-      // Recency signals — when did each surface last move?
+      // Recency signals: when did each surface last move?
+      // 'bank_transaction' is the source_type the engine writes when a bank
+      // transaction is categorized (journal_entries_source_type_check); there
+      // is no 'transaction' value, so filtering on it matched nothing.
       supabase
         .from('journal_entries')
         .select('created_at')
         .eq('company_id', companyId)
-        .eq('source_type', 'transaction')
+        .eq('source_type', 'bank_transaction')
         .order('created_at', { ascending: false })
         .limit(1)
         .maybeSingle(),
 
+      // "Sent" lives in the delivery log, not on invoices: that table has no
+      // sent timestamp at all. Both send paths write invoice_deliveries.sent_at
+      // (email -> status 'sent', manual mark-as-sent -> 'marked_sent'), and the
+      // invoice detail view reads the same rows for its "Skickad" date, so the
+      // agent and the UI now agree. Only sent_at is selected: the rest of the
+      // delivery row is recipient/message PII this resource has no use for.
       supabase
-        .from('invoices')
+        .from('invoice_deliveries')
         .select('sent_at')
         .eq('company_id', companyId)
         .not('sent_at', 'is', null)
@@ -132,7 +141,7 @@ export const companyCurrentResource: McpResource = {
         .limit(1)
         .maybeSingle(),
 
-      // Scoped by company_id — the table also carries user_id (legacy single-tenant
+      // Scoped by company_id: the table also carries user_id (legacy single-tenant
       // design), but RLS + multi-tenant refactor added company_id and the column is
       // indexed. Multi-company users would otherwise see deadlines from all their
       // companies mixed into one company's context (cross-tenant leak flagged by
@@ -149,6 +158,22 @@ export const companyCurrentResource: McpResource = {
 
     if (companyRes.error || !companyRes.data) {
       throw new Error(`Company not found: ${companyRes.error?.message ?? 'unknown'}`)
+    }
+
+    // A null recency signal is a factual claim ("this never happened") that the
+    // agent acts on, so a failed read must surface as an error rather than
+    // degrade into that claim. resources/read turns the throw into a JSON-RPC
+    // error, same as period-active does for its period read. PGRST116 is the
+    // legitimate no-rows case and stays null.
+    const recencyReads = [
+      { label: 'last categorization', error: lastCategorizationRes.error },
+      { label: 'last invoice delivery', error: lastInvoiceSentRes.error },
+      { label: 'last bank sync', error: lastBankSyncRes.error },
+    ]
+    for (const read of recencyReads) {
+      if (read.error && read.error.code !== 'PGRST116') {
+        throw new Error(`Failed to read ${read.label}: ${read.error.message}`)
+      }
     }
 
     const settings = settingsRes.data

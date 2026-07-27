@@ -8,7 +8,7 @@ import {
 import type { KassaflodesanalysReport } from './kassaflodesanalys'
 import type { CompanySettings } from '@/types'
 
-// Single-file PDF template — the kassaflödesanalys layout is distinct enough
+// Single-file PDF template: the kassaflödesanalys layout is distinct enough
 // from the BR/RR template (no per-account rows, three labelled sections, a
 // reconciliation footer) that a dedicated template keeps things readable.
 // Typography mirrors CLAUDE.md design system: Times-Roman as the serif
@@ -193,7 +193,7 @@ export function KassaflodesanalysPDF({
   generatedAt,
 }: KassaflodePDFProps) {
   const companyName = company.company_name || ''
-  const periodLabel = `${formatDateSv(report.period_start)} – ${formatDateSv(report.period_end)}`
+  const periodLabel = `${formatDateSv(report.period_start)}: ${formatDateSv(report.period_end)}`
   const recon = report.reconciliation
   const reconStyles = [
     styles.reconciliationBlock,
@@ -314,6 +314,12 @@ export function KassaflodesanalysPDF({
             <Text style={styles.label}>Nyemission</Text>
             <Text style={styles.amount}>{formatAmount(report.finansierings.nyemission)}</Text>
           </View>
+          <View style={styles.row}>
+            <Text style={styles.label}>Erhållna aktieägartillskott</Text>
+            <Text style={styles.amount}>
+              {formatAmount(report.finansierings.erhallna_aktieagartillskott)}
+            </Text>
+          </View>
           <View style={styles.subtotalRow}>
             <Text style={styles.subtotalLabel}>
               Kassaflöde från finansieringsverksamheten
@@ -364,7 +370,7 @@ export function KassaflodesanalysPDF({
               <Text
                 style={[styles.reconciliationLabel, styles.reconciliationMismatch]}
               >
-                Avvikelse — kontrollera bokföringen
+                Avvikelse: kontrollera bokföringen
               </Text>
               <Text
                 style={[styles.reconciliationAmount, styles.reconciliationMismatch]}

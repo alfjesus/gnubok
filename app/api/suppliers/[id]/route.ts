@@ -1,8 +1,10 @@
 import { NextResponse } from 'next/server'
+import { roundOre } from '@/lib/money'
 import { validateBody } from '@/lib/api/validate'
 import { UpdateSupplierSchema } from '@/lib/api/schemas'
 import { withRouteContext } from '@/lib/api/with-route-context'
 import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 export const GET = withRouteContext(
   'supplier.get',
@@ -24,24 +26,35 @@ export const GET = withRouteContext(
 
     const { data: invoices } = await supabase
       .from('supplier_invoices')
-      .select('status, total, remaining_amount, paid_amount')
+      .select('status, total, remaining_amount, paid_amount, currency')
       .eq('supplier_id', id)
       .eq('company_id', companyId)
 
-    const stats = {
-      total_outstanding: 0,
-      total_paid: 0,
-      invoice_count: 0,
+    // Amounts are in each invoice's own currency, so a single sum across a
+    // mixed-currency supplier would be meaningless: group per currency instead
+    // (nearly every supplier has exactly one).
+    const perCurrency = new Map<string, { total_outstanding: number; total_paid: number }>()
+    if (invoices) {
+      for (const inv of invoices) {
+        const currency = inv.currency || 'SEK'
+        const row = perCurrency.get(currency) ?? { total_outstanding: 0, total_paid: 0 }
+        if (inv.status !== 'paid' && inv.status !== 'credited') {
+          row.total_outstanding += inv.remaining_amount || 0
+        }
+        row.total_paid += inv.paid_amount || 0
+        perCurrency.set(currency, row)
+      }
     }
 
-    if (invoices) {
-      stats.invoice_count = invoices.length
-      for (const inv of invoices) {
-        if (inv.status !== 'paid' && inv.status !== 'credited') {
-          stats.total_outstanding += inv.remaining_amount || 0
-        }
-        stats.total_paid += inv.paid_amount || 0
-      }
+    const stats = {
+      invoice_count: invoices?.length ?? 0,
+      by_currency: [...perCurrency.entries()]
+        .map(([currency, row]) => ({
+          currency,
+          total_outstanding: roundOre(row.total_outstanding),
+          total_paid: roundOre(row.total_paid),
+        }))
+        .sort((a, b) => a.currency.localeCompare(b.currency)),
     }
 
     return NextResponse.json({ data: { ...supplier, stats } })
@@ -101,7 +114,7 @@ export const PUT = withRouteContext(
       opLog.error('supplier update failed', error)
       return errorResponseFromCode('SUPPLIER_UPDATE_FAILED', opLog, {
         requestId,
-        details: { reason: error.message },
+        details: { reason: getUserErrorMessage(error) },
       })
     }
 
@@ -140,7 +153,7 @@ export const DELETE = withRouteContext(
       opLog.error('supplier delete failed', error)
       return errorResponseFromCode('SUPPLIER_DELETE_FAILED', opLog, {
         requestId,
-        details: { reason: error.message },
+        details: { reason: getUserErrorMessage(error) },
       })
     }
 

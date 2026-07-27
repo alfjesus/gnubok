@@ -1,21 +1,12 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import Link from 'next/link'
+import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { Card, CardContent } from '@/components/ui/card'
-import { Button } from '@/components/ui/button'
-import { Progress } from '@/components/ui/progress'
 import { EmptyState } from '@/components/ui/empty-state'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
+import { ContextPicker } from '@/components/common/ContextPicker'
 import { Skeleton } from '@/components/ui/skeleton'
-import { ArrowLeft, Lock } from 'lucide-react'
+import { CalendarPlus, Check, Lock } from 'lucide-react'
 import AgentSparkleButton from '@/components/agent/AgentSparkleButton'
 import { cn } from '@/lib/utils'
 import { useToast } from '@/components/ui/use-toast'
@@ -55,6 +46,9 @@ export default function YearEndPage() {
 
   // ---- Period selection ----
   const [periods, setPeriods] = useState<PeriodOption[] | null>(null)
+  // Whether the company has ANY fiscal periods (eligible or not) — separates
+  // "inget att stänga ännu" from "inget räkenskapsår har skapats".
+  const [hasAnyPeriods, setHasAnyPeriods] = useState(true)
   const [periodsError, setPeriodsError] = useState<string | null>(null)
   const [selectedPeriodId, setSelectedPeriodId] = useState<string | null>(
     searchParams.get('period') ?? null,
@@ -83,17 +77,37 @@ export default function YearEndPage() {
           return
         }
         const { data } = (await res.json()) as { data: FiscalPeriod[] }
+        const all = data ?? []
         const today = new Date().toISOString().split('T')[0]
-        const eligible = (data ?? []).filter(
+        const eligible = all.filter(
           (p) => !p.is_closed && !p.closing_entry_id && p.period_end <= today,
         )
-        // Oldest first — accountants close in order.
+        // Oldest first: accountants close in order.
         eligible.sort((a, b) => a.period_start.localeCompare(b.period_start))
         if (cancelled) return
-        setPeriods(eligible)
-        if (!selectedPeriodId && eligible.length > 0) {
+        setHasAnyPeriods(all.length > 0)
+
+        // The URL ?period= param may point anywhere: at an ineligible period
+        // (e.g. a year that has not ended) or, after a company switch, at a
+        // period that does not exist in this company at all. An unknown id is
+        // reset to the first eligible period; a known-but-ineligible one is
+        // kept selectable in the dropdown so the user can navigate away from
+        // it instead of being stuck (the readiness step explains why it
+        // cannot be closed).
+        let options = eligible
+        if (selectedPeriodId) {
+          const known = all.find((p) => p.id === selectedPeriodId)
+          if (!known) {
+            setSelectedPeriodId(eligible.length > 0 ? eligible[0].id : null)
+          } else if (!eligible.some((p) => p.id === selectedPeriodId)) {
+            options = [...eligible, known].sort((a, b) =>
+              a.period_start.localeCompare(b.period_start),
+            )
+          }
+        } else if (eligible.length > 0) {
           setSelectedPeriodId(eligible[0].id)
         }
+        setPeriods(options)
       } catch {
         if (!cancelled) setPeriodsError('Kunde inte hämta perioder')
       }
@@ -125,7 +139,7 @@ export default function YearEndPage() {
         const body = await res.json()
         if (cancelled) return
         if (!res.ok) {
-          setReportError(body?.error?.message ?? 'Kunde inte ladda bokslutskontroll')
+          setReportError(getErrorMessage(body?.error) ?? 'Kunde inte ladda bokslutskontroll')
           return
         }
         setReport(body.data as BokslutReadinessReport)
@@ -151,7 +165,7 @@ export default function YearEndPage() {
       const res = await fetch(`/api/bookkeeping/fiscal-periods/${selectedPeriodId}/year-end`)
       const body = await res.json()
       if (!res.ok) {
-        setPreviewError(body?.error?.message ?? 'Kunde inte hämta förhandsgranskning')
+        setPreviewError(getErrorMessage(body?.error) ?? 'Kunde inte hämta förhandsgranskning')
         return
       }
       setPreview(body.data.preview as YearEndPreview)
@@ -174,8 +188,8 @@ export default function YearEndPage() {
       if (!res.ok) {
         // body.error.message is the localized Swedish message picked by
         // the structured-error registry. Do NOT interpolate raw details
-        // here — they can contain DB-sourced strings (V2.3 finding).
-        setExecuteError(body?.error?.message ?? 'Bokslutet kunde inte verkställas')
+        // here: they can contain DB-sourced strings (V2.3 finding).
+        setExecuteError(getErrorMessage(body?.error) ?? 'Bokslutet kunde inte verkställas')
         return
       }
       setResult(body.data as YearEndResult)
@@ -192,7 +206,6 @@ export default function YearEndPage() {
   }, [selectedPeriodId, report?.period.name, toast])
 
   const currentStepIndex = STEP_ORDER.indexOf(step)
-  const progressValue = ((currentStepIndex + 1) / STEP_ORDER.length) * 100
 
   const showWizard = useMemo(
     () => selectedPeriodId !== null && (periods?.length ?? 0) > 0,
@@ -202,20 +215,35 @@ export default function YearEndPage() {
   return (
     <div className="space-y-8">
       <div className="flex items-center justify-between gap-3 flex-wrap">
-        <h1 className="font-display text-3xl md:text-4xl tracking-tight">Årsbokslut</h1>
-        <div className="flex gap-2">
+        <h1 className="font-display text-2xl leading-8 tracking-tight">Årsbokslut</h1>
+        <div className="flex items-center gap-2">
           <AgentSparkleButton
             intentId="bokslut.step"
             intentArgs={{ step_id: null }}
             contextRef="bokslut:overview"
             size="default"
           />
-          <Button variant="outline" asChild>
-            <Link href="/bookkeeping">
-              <ArrowLeft className="mr-2 h-4 w-4" />
-              Bokföring
-            </Link>
-          </Button>
+          {showWizard && periods && periods.length > 0 && step !== 'result' && (
+            <ContextPicker
+              items={periods.map((p) => ({
+                id: p.id,
+                label: p.name,
+                annotation: `${p.period_start} till ${p.period_end}`,
+              }))}
+              value={selectedPeriodId}
+              onChange={(value) => {
+                setSelectedPeriodId(value)
+                setStep('preflight')
+                setPreview(null)
+                setResult(null)
+                setExecuteError(null)
+              }}
+              triggerLabel={
+                periods.find((p) => p.id === selectedPeriodId)?.name ?? 'Välj period'
+              }
+              ariaLabel="Period"
+            />
+          )}
         </div>
       </div>
 
@@ -235,73 +263,85 @@ export default function YearEndPage() {
       )}
 
       {periods !== null && periods.length === 0 && (
-        <EmptyState
-          icon={Lock}
-          title="Inga perioder att stänga"
-          description="Det finns ingen öppen räkenskapsperiod vars slutdatum redan har passerat. Bokslut görs efter att periodens slutdatum är passerat."
-        />
+        hasAnyPeriods ? (
+          <EmptyState
+            icon={Lock}
+            title="Inga perioder att stänga"
+            description="Det finns ingen öppen räkenskapsperiod vars slutdatum redan har passerat. Bokslut görs efter att periodens slutdatum är passerat."
+          />
+        ) : (
+          <EmptyState
+            icon={CalendarPlus}
+            title="Inget räkenskapsår ännu"
+            description="Bokslut görs per räkenskapsår. Skapa företagets räkenskapsår i bokföringsinställningarna för att komma igång."
+            actionLabel="Öppna bokföringsinställningar"
+            actionHref="/settings/bookkeeping"
+          />
+        )
       )}
 
-      {showWizard && periods && periods.length > 1 && step !== 'result' && (
-        <Card>
-          <CardContent className="p-4 flex items-center gap-4">
-            <label className="text-sm font-medium shrink-0">Period</label>
-            <Select
-              value={selectedPeriodId ?? undefined}
-              onValueChange={(value) => {
-                setSelectedPeriodId(value)
-                setStep('preflight')
-                setPreview(null)
-                setResult(null)
-                setExecuteError(null)
-              }}
-            >
-              <SelectTrigger className="w-full max-w-sm">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {periods.map((p) => (
-                  <SelectItem key={p.id} value={p.id}>
-                    {p.name} ({p.period_start} – {p.period_end})
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </CardContent>
-        </Card>
-      )}
-
+      {/* Stegen (concept scene 34): dots walk check -> filled -> number.
+          Steps behind the current one are clickable for going back; forward
+          navigation stays with each step's own continue action. */}
       {showWizard && step !== 'result' && (
-        <Card>
-          <CardContent className="p-4 space-y-2">
-            <div className="flex justify-between text-sm">
-              <span className="sm:hidden text-primary font-medium">
-                Steg {currentStepIndex + 1}/{STEP_ORDER.length}: {STEP_LABELS[step]}
-              </span>
-              {STEP_ORDER.map((s, i) => (
+        <div
+          className="mx-auto flex w-full max-w-4xl items-center gap-3 overflow-x-auto px-1"
+          role="tablist"
+          aria-label="Bokslutets steg"
+        >
+          {STEP_ORDER.map((s, i) => (
+            <React.Fragment key={s}>
+              {i > 0 && <span className="h-px min-w-4 flex-1 bg-border" aria-hidden="true" />}
+              <button
+                type="button"
+                role="tab"
+                aria-selected={s === step}
+                disabled={i >= currentStepIndex}
+                onClick={() => {
+                  if (i < currentStepIndex) setStep(s)
+                }}
+                className={cn(
+                  'group flex shrink-0 items-center gap-2 text-left',
+                  i >= currentStepIndex && 'cursor-default',
+                )}
+              >
                 <span
-                  key={s}
                   className={cn(
-                    'hidden sm:inline',
-                    i <= currentStepIndex ? 'text-primary font-medium' : 'text-muted-foreground',
+                    'flex h-7 w-7 shrink-0 items-center justify-center rounded-full border text-xs tabular-nums transition-colors duration-150',
+                    i < currentStepIndex
+                      ? 'border-success/40 text-success'
+                      : s === step
+                        ? 'border-foreground bg-foreground text-background'
+                        : 'border-border text-muted-foreground',
+                  )}
+                >
+                  {i < currentStepIndex ? <Check className="h-3.5 w-3.5" aria-hidden="true" /> : i + 1}
+                </span>
+                <span
+                  className={cn(
+                    'text-[12.5px] transition-colors duration-150',
+                    s === step
+                      ? 'font-medium'
+                      : i < currentStepIndex
+                        ? 'text-muted-foreground group-hover:text-foreground'
+                        : 'text-muted-foreground',
                   )}
                 >
                   {STEP_LABELS[s]}
                 </span>
-              ))}
-            </div>
-            <Progress value={progressValue} className="h-2" />
-          </CardContent>
-        </Card>
+              </button>
+            </React.Fragment>
+          ))}
+        </div>
       )}
 
       {showWizard && step === 'preflight' && (
-        <PreflightStep
+        <div className="mx-auto w-full max-w-3xl"><PreflightStep
           report={report}
           isLoading={reportLoading}
           error={reportError}
           onContinue={() => setStep('accruals')}
-        />
+        /></div>
       )}
 
       {showWizard && step === 'accruals' && selectedPeriodId && (
@@ -321,26 +361,29 @@ export default function YearEndPage() {
       )}
 
       {showWizard && step === 'preview' && (
-        <PreviewStep
+        <div className="mx-auto w-full max-w-3xl"><PreviewStep
           preview={preview}
           isLoading={previewLoading}
           error={previewError}
           onBack={() => setStep('dispositions')}
           onContinue={() => setStep('execute')}
-        />
+        /></div>
       )}
 
       {showWizard && step === 'execute' && report && (
-        <ExecuteStep
+        <div className="mx-auto w-full max-w-3xl"><ExecuteStep
           periodName={report.period.name}
           isRunning={executing}
           error={executeError}
+          bolagsskattMissing={preview?.bolagsskattMissing ?? false}
           onBack={() => setStep('preview')}
           onExecute={executeYearEnd}
-        />
+        /></div>
       )}
 
-      {step === 'result' && result && <ResultStep result={result} />}
+      {step === 'result' && result && (
+        <div className="mx-auto w-full max-w-3xl"><ResultStep result={result} /></div>
+      )}
     </div>
   )
 }

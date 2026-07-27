@@ -1,5 +1,5 @@
 /**
- * Unit tests for gnubok_create_supplier — registration, risk tier, and
+ * Unit tests for gnubok_create_supplier: registration, risk tier, and
  * input validation (ASVS V2.3, V4.5; ISO A.8.28; CC6.3).
  *
  * The financial identifier checks here guard against the supplier-fraud /
@@ -20,7 +20,7 @@ vi.mock('@/lib/currency/riksbanken', () => ({
 
 const tool = () => tools.find((t) => t.name === 'gnubok_create_supplier')!
 
-describe('gnubok_create_supplier — registration', () => {
+describe('gnubok_create_supplier: registration', () => {
   it('is registered with idempotent + non-read-only annotations', () => {
     expect(tool()).toBeDefined()
     expect(tool().annotations.readOnlyHint).toBe(false)
@@ -63,7 +63,7 @@ const noopSupabase = {
   })),
 } as never
 
-describe('gnubok_create_supplier — input validation', () => {
+describe('gnubok_create_supplier: input validation', () => {
   beforeEach(() => {
     vi.clearAllMocks()
   })
@@ -122,10 +122,20 @@ describe('gnubok_create_supplier — input validation', () => {
     ).rejects.toThrow(/default_payment_terms/i)
   })
 
-  it('requires vat_number when supplier_type is eu_business', async () => {
-    await expect(
-      tool().execute({ name: 'Acme GmbH', supplier_type: 'eu_business' }, 'company-1', 'user-1', noopSupabase),
-    ).rejects.toThrow(/vat_number/i)
+  // vat_number is optional for every supplier type, including eu_business: an
+  // EU supplier below its national registration threshold has none, and nothing
+  // downstream needs one (reverse charge keys off supplier_type). See the header
+  // of lib/pending-operations/schemas/create-supplier.ts.
+  it('accepts supplier_type eu_business without a vat_number', async () => {
+    const result = await tool().execute(
+      { name: 'Kleinanbieter GmbH', supplier_type: 'eu_business', dry_run: true },
+      'company-1',
+      'user-1',
+      noopSupabase,
+    ) as { preview?: { supplier_type?: string; vat_number?: string }; dry_run?: boolean }
+    expect(result.dry_run).toBe(true)
+    expect(result.preview?.supplier_type).toBe('eu_business')
+    expect(result.preview?.vat_number).toBeUndefined()
   })
 })
 
@@ -134,7 +144,7 @@ describe('gnubok_create_supplier — input validation', () => {
  * mutate caller intent. We use dry_run so no DB write is attempted; the
  * staging helper still receives the validated params.
  */
-describe('gnubok_create_supplier — staging behaviour', () => {
+describe('gnubok_create_supplier: staging behaviour', () => {
   beforeEach(() => {
     vi.clearAllMocks()
   })

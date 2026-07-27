@@ -6,11 +6,11 @@
  * invocations don't double-deliver), POSTs each one with HMAC signature,
  * and updates the row to one of:
  *
- *   - delivered (2xx response)         — terminal
- *   - failed   (5xx / network / 4xx    — non-terminal until attempts
+ *   - delivered (2xx response)         : terminal
+ *   - failed   (5xx / network / 4xx    : non-terminal until attempts
  *               other than 410)         exhausted; bumps next_attempt_at
  *               by exponential backoff
- *   - dead     (HTTP 410 OR             — terminal
+ *   - dead     (HTTP 410 OR             : terminal
  *               attempts exhausted)
  *
  * The receiver is expected to respond within 10 seconds; we time out
@@ -28,15 +28,15 @@ import { createLogger } from '@/lib/logger'
 
 const log = createLogger('webhooks/dispatcher')
 
-/** 7 retries over ~72h. Index = attempts BEFORE this one. */
+/** 7 retries over ~87h (≈3.6 days). Index = attempts BEFORE this one. */
 const RETRY_BACKOFF_SECONDS: ReadonlyArray<number> = [
-  60,        //  1m  — first retry
+  60,        //  1m: first retry
   5 * 60,    //  5m
   30 * 60,   // 30m
   2 * 60 * 60,   //  2h
   12 * 60 * 60,  // 12h
   24 * 60 * 60,  // 24h
-  48 * 60 * 60,  // 48h — final retry
+  48 * 60 * 60,  // 48h: final retry
 ]
 
 const MAX_ATTEMPTS = RETRY_BACKOFF_SECONDS.length + 1 // initial + 7 retries = 8 total
@@ -121,7 +121,7 @@ export async function dispatchDueDeliveries(args: {
 
     // Defense-in-depth tenancy check: the webhook the delivery row points
     // at MUST belong to the same company as the delivery row. Mismatch
-    // indicates a poisoned row — refuse to dispatch (which would sign with
+    // indicates a poisoned row: refuse to dispatch (which would sign with
     // the wrong tenant's secret and POST to the wrong receiver).
     if (webhook.company_id !== delivery.company_id) {
       log.error('cross-tenant delivery refused', new Error('company_id mismatch'), {
@@ -145,7 +145,7 @@ export async function dispatchDueDeliveries(args: {
     // Structured per-delivery outcome log. Keeps companyId / webhookId /
     // deliveryId available in log aggregation for per-tenant audit-trail
     // reconstruction without grepping through individual mark*-helper
-    // writes (V16 — security event correlation).
+    // writes (V16, security event correlation).
     const logCtx = {
       deliveryId: delivery.id,
       webhookId: webhook.id,
@@ -165,18 +165,18 @@ export async function dispatchDueDeliveries(args: {
         log.warn('delivery dead', { ...logCtx, reason: outcome.reason, responseStatus: outcome.responseStatus })
         summary.dead++
         if (outcome.disableWebhook) {
-          await disableWebhook(args.supabase, webhook.id, outcome.reason)
+          await disableWebhook(args.supabase, webhook.id, webhook.company_id, outcome.reason)
           log.warn('webhook auto-disabled', { ...logCtx, reason: outcome.reason })
         }
         break
       case 'failed':
         if (delivery.attempts + 1 >= MAX_ATTEMPTS) {
           await markDead(args.supabase, delivery.id, 'attempts_exhausted', outcome)
-          log.warn('delivery dead — attempts exhausted', { ...logCtx, lastError: outcome.error })
+          log.warn('delivery dead: attempts exhausted', { ...logCtx, lastError: outcome.error })
           summary.dead++
         } else {
           await markFailedForRetry(args.supabase, delivery.id, delivery.attempts, outcome, now)
-          log.info('delivery failed — retry scheduled', { ...logCtx, error: outcome.error, responseStatus: outcome.responseStatus })
+          log.info('delivery failed: retry scheduled', { ...logCtx, error: outcome.error, responseStatus: outcome.responseStatus })
           summary.failed++
         }
         break
@@ -193,7 +193,7 @@ export async function dispatchDueDeliveries(args: {
 /**
  * Mark in_flight rows whose updated_at is older than the stuck-threshold
  * back to 'failed' with next_attempt_at = now so they re-enter the
- * dispatch queue. Best-effort — a write failure here is logged but
+ * dispatch queue. Best-effort: a write failure here is logged but
  * doesn't block the rest of the cycle.
  */
 async function recoverStuckInFlight(supabase: SupabaseClient, now: Date): Promise<void> {
@@ -202,7 +202,7 @@ async function recoverStuckInFlight(supabase: SupabaseClient, now: Date): Promis
   // clause against each row's current value when it acquires the row lock.
   // A row that raced from 'in_flight' to 'delivered'/'dead' between scan
   // and lock will fail status='in_flight' on re-evaluation and be skipped
-  // entirely — the immutability trigger never fires, so a mid-flight
+  // entirely: the immutability trigger never fires, so a mid-flight
   // terminal flip cannot abort the bulk update.
   const { data, error } = await supabase
     .from('webhook_deliveries')
@@ -231,7 +231,7 @@ async function claimDueDeliveries(
 ): Promise<DueDelivery[]> {
   // Atomic FOR UPDATE SKIP LOCKED claim via the SQL function shipped in
   // migration 20260515220000. PostgREST can't express SKIP LOCKED through
-  // the JS client, so the function form is the documented entry point —
+  // the JS client, so the function form is the documented entry point:
   // see the migration comment for the full rationale (one round trip,
   // no CAS contention, rows locked by a concurrent tick are simply
   // invisible to the second caller).
@@ -256,7 +256,7 @@ async function loadWebhooksByIds(
   ids: string[],
 ): Promise<Map<string, WebhookForDelivery>> {
   // Include company_id so the dispatch loop can assert that the delivery
-  // row's company_id matches the webhook's — defense in depth against a
+  // row's company_id matches the webhook's: defense in depth against a
   // poisoned delivery row pointing at another tenant's webhook
   // (compromised service-role path, faulty INSERT in a future code path,
   // etc.). The DB trigger added in 20260515190000 enforces the same
@@ -327,7 +327,7 @@ async function markDead(
 ): Promise<void> {
   // delivered_at means "the receiver acknowledged the event". For dead
   // rows (HTTP 410, attempts exhausted, webhook deleted, cross-tenant
-  // mismatch, unsafe URL) the receiver did NOT acknowledge — leaving
+  // mismatch, unsafe URL) the receiver did NOT acknowledge: leaving
   // delivered_at NULL keeps the audit semantics clean. An auditor
   // querying `WHERE delivered_at IS NOT NULL` correctly sees only
   // genuinely delivered rows. The terminal-state timestamp lives on
@@ -349,15 +349,27 @@ async function markDead(
 async function disableWebhook(
   supabase: SupabaseClient,
   webhookId: string,
+  companyId: string,
   reason: string,
 ): Promise<void> {
   // Snapshot before the disable so the audit entry can record the prior
   // state. Service-role read; bypasses RLS.
-  const { data: prior } = await supabase
+  //
+  // `webhooks` has NO user_id column: the legacy automation_webhooks table
+  // never had one and webhooks_v2 (20260515170000) didn't add one. Tenancy
+  // lives on company_id (NOT NULL) and the only actor attribution is
+  // created_by_api_key_id. Selecting a phantom column makes PostgREST fail
+  // the ENTIRE read (42703), which previously left `prior` null and the
+  // audit row unscoped, so the read error is checked and logged here rather
+  // than silently degrading to a null snapshot.
+  const { data: prior, error: priorErr } = await supabase
     .from('webhooks')
-    .select('user_id, company_id, name, active, disabled_at, disabled_reason')
+    .select('company_id, name, active, disabled_at, disabled_reason')
     .eq('id', webhookId)
     .maybeSingle()
+  if (priorErr) {
+    log.warn('webhook prior-state snapshot failed', { webhookId, code: priorErr.code })
+  }
 
   const { error } = await supabase
     .from('webhooks')
@@ -373,21 +385,26 @@ async function disableWebhook(
   }
 
   // V16 security event log. Auto-disable is a privileged action taken by
-  // the dispatcher (not a human caller), so actor_id is null. The
-  // audit_log entry is written UNCONDITIONALLY — even when prior is null
-  // or prior.user_id is null — because the SECURITY_EVENT must produce
-  // a durable record (A.8.15 / V16.1.1 / CC7.2). The audit_log.user_id
-  // column is nullable post-multi-tenant-refactor (20260330130000), so
-  // a system-initiated event can legitimately write user_id=NULL. Such
-  // rows are invisible under the user-scoped SELECT policy but remain
-  // queryable under service-role review, which is appropriate for
-  // system-initiated events.
+  // the dispatcher cron itself, not by a human caller or a credential:
+  // user_id and actor_id stay null and the attribution is carried by
+  // actor_type/actor_label instead ('system' is in the
+  // audit_log_actor_type_check allowlist; same vocabulary the
+  // commit_journal_entry audit row uses, migration 20260619120000).
+  //
+  // company_id comes from the webhook row the dispatch loop already
+  // loaded and tenancy-checked against the delivery: the audit row keeps
+  // its company scope even when the prior-state snapshot read fails, so
+  // it stays visible to the per-company audit trail (getAuditLog filters
+  // on company_id).
+  //
+  // The entry is written UNCONDITIONALLY (even when prior is null)
+  // because the SECURITY_EVENT must produce a durable record
+  // (A.8.15 / V16.1.1 / CC7.2).
   //
   // The reason discriminates between the three auto-disable paths
   // (http_410_gone / redirect_blocked / url_unsafe:<class>) so SIEM
   // tooling can alert on systematic patterns.
   const p = prior as {
-    user_id: string | null
     company_id: string | null
     name: string
     active: boolean
@@ -396,12 +413,14 @@ async function disableWebhook(
   } | null
 
   const { error: auditErr } = await supabase.from('audit_log').insert({
-    user_id: p?.user_id ?? null,
-    company_id: p?.company_id ?? null,
+    user_id: null,
+    company_id: companyId,
     action: 'SECURITY_EVENT',
     table_name: 'webhooks',
     record_id: webhookId,
     actor_id: null,
+    actor_type: 'system',
+    actor_label: 'webhook-dispatcher',
     description: p
       ? `Webhook auto-disabled by dispatcher: ${reason} (was "${p.name}")`
       : `Webhook auto-disabled by dispatcher: ${reason} (prior snapshot unavailable)`,
@@ -411,11 +430,20 @@ async function disableWebhook(
     new_state: { active: false, disabled_reason: reason, disabled_at: new Date().toISOString() },
   })
   if (auditErr) {
-    log.warn('audit_log insert failed for webhook auto-disable', {
-      webhookId,
-      reason,
-      code: auditErr.code,
-    })
+    // Escalated from warn to error on purpose. Webhook registrations are
+    // NOT statutory räkenskapsinformation (BFL/BFNAR do not reach them:
+    // see the classification in migration 20260515170000), so a dropped
+    // row here is an operational audit-integrity gap, not a legal one,
+    // and the dispatch cycle must not abort over it. But warn is
+    // suppressed in prod-adjacent noise filters and never reaches the
+    // observability sink, which made this a silent gap; error always
+    // forwards (lib/logger.ts) so the missing SECURITY_EVENT is alertable
+    // (CC7.2).
+    log.error(
+      'audit_log insert failed for webhook auto-disable',
+      new Error(auditErr.message ?? 'audit_log insert failed'),
+      { webhookId, companyId, reason, code: auditErr.code },
+    )
   }
 }
 
@@ -481,7 +509,7 @@ async function attemptDelivery(args: {
   // pinnedHttpsFetch performs DNS validation AND opens the socket against
   // the validated IP in a single call. The previous shape (separate
   // validateWebhookUrl + fetch calls) left a DNS-rebinding window between
-  // the two — closed here. SNI + Host header continue to carry the
+  // the two, closed here. SNI + Host header continue to carry the
   // original hostname so receiver-side TLS + vhost routing still work.
   const result = await pinnedFetchImpl(webhook.webhook_url, {
     method: 'POST',
@@ -538,7 +566,7 @@ async function attemptDelivery(args: {
         ? result.body
         : null
 
-      // HTTP 410 — receiver explicitly asks us to stop. Auto-disable.
+      // HTTP 410: receiver explicitly asks us to stop. Auto-disable.
       if (result.status === 410) {
         return {
           kind: 'dead',

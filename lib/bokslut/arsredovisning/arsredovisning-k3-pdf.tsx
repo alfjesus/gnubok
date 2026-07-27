@@ -1,5 +1,5 @@
 import { Document, Page, Text, View, StyleSheet } from '@react-pdf/renderer'
-import type { ArsredovisningData } from './types'
+import type { ArsredovisningData, StatementRow } from './types'
 
 /**
  * K3 årsredovisning PDF template (BFNAR 2012:1).
@@ -7,7 +7,7 @@ import type { ArsredovisningData } from './types'
  * Layout extends the K2 template with two additional statements required
  * for K3:
  *   - Kassaflödesanalys (K3 ch.7)
- *   - Förändring av eget kapital (K3 ch.6 — separate statement, not a
+ *   - Förändring av eget kapital (K3 ch.6: separate statement, not a
  *     förvaltningsberättelse table).
  *
  * Page order:
@@ -18,7 +18,7 @@ import type { ArsredovisningData } from './types'
  *   4. Balansräkning
  *   5. Kassaflödesanalys
  *   6. Förändring av eget kapital
- *   7+ Noter (paginates automatically — the richer K3 note set rarely fits
+ *   7+ Noter (paginates automatically: the richer K3 note set rarely fits
  *      on one page so we let @react-pdf wrap)
  *   last. Underskrifter + Fastställelseintyg
  *
@@ -146,6 +146,50 @@ function fmt(amount: number): string {
   return Math.round(amount).toLocaleString('sv-SE')
 }
 
+/**
+ * Renders ÅRL post-level statement rows (see statement-rows.ts) with a
+ * jämförelseår column — mirrors the K2 template so the two documents stay
+ * visually consistent.
+ */
+function StatementTable({
+  rows,
+  hasPrevious,
+}: {
+  rows: StatementRow[]
+  hasPrevious: boolean
+}) {
+  return (
+    <>
+      {rows.map((line, i) => {
+        const indentPad = (line.indent ?? 0) * 12
+        if (line.is_heading) {
+          return (
+            <View key={i} style={styles.tableRow}>
+              <Text
+                style={{
+                  flex: 1,
+                  fontFamily: 'Helvetica-Bold',
+                  paddingLeft: indentPad,
+                  marginTop: 6,
+                }}
+              >
+                {line.label}
+              </Text>
+            </View>
+          )
+        }
+        return (
+          <View key={i} style={line.is_total ? styles.tableRowTotal : styles.tableRow}>
+            <Text style={{ flex: 1, paddingLeft: indentPad }}>{line.label}</Text>
+            <Text style={styles.colAmount}>{fmt(line.current ?? 0)}</Text>
+            <Text style={styles.colAmount}>{hasPrevious ? fmt(line.previous ?? 0) : ''}</Text>
+          </View>
+        )
+      })}
+    </>
+  )
+}
+
 function PageChrome({
   data,
   pageLabel,
@@ -169,6 +213,17 @@ function PageChrome({
 }
 
 export function ArsredovisningK3PDF({ data }: { data: ArsredovisningData }) {
+  const reportSignatureDate = data.signatures
+    .map((signature) => signature.signed_at?.slice(0, 10) ?? null)
+    .filter((date): date is string => date !== null)
+    .sort()
+    .at(-1)
+  const agmDispositionDecision =
+    data.forvaltningsberattelse.agm_disposition_outcome === 'proposal_approved'
+      ? `Årsstämman beslutade att godkänna styrelsens förslag: ${data.forvaltningsberattelse.resultatdisposition}`
+      : data.forvaltningsberattelse.agm_disposition_outcome === 'alternative_decision'
+        ? data.forvaltningsberattelse.agm_disposition_decision
+        : null
   return (
     <Document>
       {/* Cover */}
@@ -177,7 +232,7 @@ export function ArsredovisningK3PDF({ data }: { data: ArsredovisningData }) {
         <View>
           <Text style={styles.title}>Årsredovisning</Text>
           <Text style={styles.subtitle}>
-            för räkenskapsåret {data.fiscal_period.period_start} — {data.fiscal_period.period_end}
+            för räkenskapsåret {data.fiscal_period.period_start}: {data.fiscal_period.period_end}
           </Text>
           <Text style={styles.k3Banner}>Upprättad enligt K3 (BFNAR 2012:1)</Text>
           <Text style={styles.paragraph}>{data.company.name}</Text>
@@ -221,68 +276,65 @@ export function ArsredovisningK3PDF({ data }: { data: ArsredovisningData }) {
             <Text style={styles.colAmount}>{fmt(row.net_revenue)}</Text>
             <Text style={styles.colAmount}>{fmt(row.result_after_financial)}</Text>
             <Text style={styles.colAmount}>
-              {row.soliditet_pct === null ? '—' : row.soliditet_pct.toFixed(1)}
+              {row.soliditet_pct === null ? '-' : row.soliditet_pct.toFixed(1)}
             </Text>
           </View>
         ))}
 
         <Text style={styles.sectionTitle}>Förslag till resultatdisposition</Text>
         <Text style={styles.paragraph}>{data.forvaltningsberattelse.resultatdisposition}</Text>
+        {[
+          ['Balanserat resultat', data.forvaltningsberattelse.resultatdisposition_amounts.retained_earnings],
+          ['Fri överkursfond', data.forvaltningsberattelse.resultatdisposition_amounts.share_premium_reserve],
+          ['Årets resultat', data.forvaltningsberattelse.resultatdisposition_amounts.current_year_result],
+          ['Summa till årsstämmans förfogande', data.forvaltningsberattelse.resultatdisposition_amounts.total],
+          ['Föreslagen utdelning', -data.forvaltningsberattelse.resultatdisposition_amounts.proposed_dividend],
+          ['Balanseras i ny räkning', data.forvaltningsberattelse.resultatdisposition_amounts.carried_forward],
+        ].map(([label, amount], index) => (
+          <View
+            key={String(label)}
+            style={index === 3 || index === 5 ? styles.tableRowTotal : styles.tableRow}
+          >
+            <Text style={styles.colLabel}>{label}</Text>
+            <Text style={styles.colAmount}>{fmt(Number(amount))}</Text>
+          </View>
+        ))}
       </Page>
 
-      {/* Resultaträkning */}
-      <Page size="A4" style={styles.page}>
+      {/* Resultaträkning — ÅRL post level, no account numbers. */}
+      <Page size="A4" style={styles.page} wrap>
         <PageChrome data={data} pageLabel="Resultaträkning" />
         <Text style={styles.sectionTitle}>Resultaträkning (kr)</Text>
         <View style={styles.tableHeader}>
           <Text style={styles.colLabel}>Post</Text>
           <Text style={styles.colAmount}>{data.fiscal_period.name}</Text>
+          <Text style={styles.colAmount}>{data.previous_period?.name ?? ''}</Text>
         </View>
-        {data.resultatrakning.map((line, i) => (
-          <View key={i} style={line.is_total ? styles.tableRowTotal : styles.tableRow}>
-            <Text style={styles.colLabel}>{line.label}</Text>
-            <Text style={styles.colAmount}>{fmt(line.amount)}</Text>
-          </View>
-        ))}
+        <StatementTable rows={data.resultatrakning} hasPrevious={data.previous_period !== null} />
       </Page>
 
-      {/* Balansräkning */}
-      <Page size="A4" style={styles.page}>
+      {/* Balansräkning — ÅRL post level, no account numbers. */}
+      <Page size="A4" style={styles.page} wrap>
         <PageChrome data={data} pageLabel="Balansräkning" />
         <Text style={styles.sectionTitle}>Tillgångar (kr)</Text>
         <View style={styles.tableHeader}>
           <Text style={styles.colLabel}>Post</Text>
           <Text style={styles.colAmount}>{data.fiscal_period.period_end}</Text>
+          <Text style={styles.colAmount}>{data.previous_period?.period_end ?? ''}</Text>
         </View>
-        {data.balansrakning.assets.map((line, i) => (
-          <View key={i} style={line.is_total ? styles.tableRowTotal : styles.tableRow}>
-            <Text style={line.indent ? styles.colLabelIndent : styles.colLabel}>
-              {line.label}
-            </Text>
-            <Text style={styles.colAmount}>{fmt(line.amount)}</Text>
-          </View>
-        ))}
-        <View style={styles.tableRowTotal}>
-          <Text style={styles.colLabel}>Summa tillgångar</Text>
-          <Text style={styles.colAmount}>{fmt(data.balansrakning.total_assets)}</Text>
-        </View>
+        <StatementTable
+          rows={data.balansrakning.assets}
+          hasPrevious={data.previous_period !== null}
+        />
 
         <Text style={styles.sectionTitle}>Eget kapital och skulder (kr)</Text>
-        {data.balansrakning.equity_liabilities.map((line, i) => (
-          <View key={i} style={line.is_total ? styles.tableRowTotal : styles.tableRow}>
-            <Text style={line.indent ? styles.colLabelIndent : styles.colLabel}>
-              {line.label}
-            </Text>
-            <Text style={styles.colAmount}>{fmt(line.amount)}</Text>
-          </View>
-        ))}
-        <View style={styles.tableRowTotal}>
-          <Text style={styles.colLabel}>Summa eget kapital och skulder</Text>
-          <Text style={styles.colAmount}>{fmt(data.balansrakning.total_equity_liabilities)}</Text>
-        </View>
+        <StatementTable
+          rows={data.balansrakning.equity_liabilities}
+          hasPrevious={data.previous_period !== null}
+        />
       </Page>
 
-      {/* Kassaflödesanalys — K3 only. Rendered as a flat list of rows so the
+      {/* Kassaflödesanalys: K3 only. Rendered as a flat list of rows so the
           page is laid out consistently with the other statements in this
           template. */}
       {data.kassaflodesanalys && (
@@ -380,6 +432,12 @@ export function ArsredovisningK3PDF({ data }: { data: ArsredovisningData }) {
               {fmt(data.kassaflodesanalys.finansierings.nyemission)}
             </Text>
           </View>
+          <View style={styles.tableRow}>
+            <Text style={styles.colLabel}>Erhållna aktieägartillskott</Text>
+            <Text style={styles.colAmount}>
+              {fmt(data.kassaflodesanalys.finansierings.erhallna_aktieagartillskott)}
+            </Text>
+          </View>
           <View style={styles.tableRowSubtotal}>
             <Text style={styles.colLabel}>Kassaflöde från finansieringsverksamheten</Text>
             <Text style={styles.colAmount}>
@@ -417,7 +475,7 @@ export function ArsredovisningK3PDF({ data }: { data: ArsredovisningData }) {
             {!data.kassaflodesanalys.reconciliation.is_reconciled && (
               <View style={styles.tableRow}>
                 <Text style={[styles.colLabel, { color: '#b91c1c' }]}>
-                  Avvikelse — kontrollera bokföringen
+                  Avvikelse: kontrollera bokföringen
                 </Text>
                 <Text style={[styles.colAmount, { color: '#b91c1c' }]}>
                   {fmt(data.kassaflodesanalys.reconciliation.mismatch_amount)}
@@ -428,7 +486,7 @@ export function ArsredovisningK3PDF({ data }: { data: ArsredovisningData }) {
         </Page>
       )}
 
-      {/* Förändring av eget kapital — K3 separate statement */}
+      {/* Förändring av eget kapital: K3 separate statement */}
       {data.equity_changes_statement && (
         <Page size="A4" style={styles.page}>
           <PageChrome data={data} pageLabel="Förändring av eget kapital" />
@@ -458,7 +516,7 @@ export function ArsredovisningK3PDF({ data }: { data: ArsredovisningData }) {
         {data.noter.map((note) => (
           <View key={note.number} style={{ marginBottom: 16 }} wrap>
             <Text style={{ fontFamily: 'Helvetica-Bold', marginBottom: 4 }}>
-              Not {note.number} — {note.title}
+              Not {note.number}: {note.title}
             </Text>
             <Text style={styles.noteBody}>{note.body}</Text>
           </View>
@@ -471,7 +529,7 @@ export function ArsredovisningK3PDF({ data }: { data: ArsredovisningData }) {
         <Text style={styles.sectionTitle}>Underskrifter</Text>
         <Text style={styles.paragraph}>
           {data.company.city ? `${data.company.city}, ` : ''}
-          {data.fiscal_period.period_end}
+          {reportSignatureDate ?? '____________________'}
         </Text>
         {(data.signatures.length > 0
           ? data.signatures
@@ -490,7 +548,7 @@ export function ArsredovisningK3PDF({ data }: { data: ArsredovisningData }) {
       </Page>
 
       {/*
-        Fastställelseintyg — mirrors the K2 template. K3 documents face the
+        Fastställelseintyg: mirrors the K2 template. K3 documents face the
         same Bolagsverket filing requirement (ÅRL 8 kap 3 §). Signer label
         remains "Styrelseledamot (närvarande vid stämman)".
       */}
@@ -512,7 +570,7 @@ export function ArsredovisningK3PDF({ data }: { data: ArsredovisningData }) {
         </Text>
         <Text style={styles.sectionTitle}>Stämmans beslut om resultatdisposition</Text>
         <Text style={styles.paragraph}>
-          {data.forvaltningsberattelse.resultatdisposition}
+          {agmDispositionDecision ?? 'Årsstämmans beslut har ännu inte registrerats.'}
         </Text>
         <View style={styles.signatureLine}>
           <View style={styles.signatureSlot}>

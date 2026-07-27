@@ -5,7 +5,7 @@ import { useState } from 'react'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { BankNameCombobox } from '@/components/settings/BankNameCombobox'
-import { validateBankgiroNumber, formatBankgiroNumber } from '@/lib/bankgiro/luhn'
+import { validateBankgiroNumber, formatBankgiroNumber, validatePlusgiroNumber, formatPlusgiroNumber } from '@/lib/bankgiro/luhn'
 import { normaliseSwish, isValidSwish } from '@/lib/payments/swish'
 import { ENABLED_EXTENSION_IDS } from '@/lib/extensions/_generated/enabled-extensions'
 import type { CompanySettings } from '@/types'
@@ -17,9 +17,12 @@ interface BankDetailsFormProps {
 export function BankDetailsForm({ settings }: BankDetailsFormProps) {
   const t = useTranslations('settings_bank_details_form')
   const [bankgiroError, setBankgiroError] = useState<string | null>(null)
+  const [plusgiroError, setPlusgiroError] = useState<string | null>(null)
   const [clearingError, setClearingError] = useState<string | null>(null)
   const [accountNumberError, setAccountNumberError] = useState<string | null>(null)
   const [swishError, setSwishError] = useState<string | null>(null)
+  const [ibanError, setIbanError] = useState<string | null>(null)
+  const [bicError, setBicError] = useState<string | null>(null)
   const hasBankingExtension = ENABLED_EXTENSION_IDS.has('enable-banking')
 
   return (
@@ -81,7 +84,7 @@ export function BankDetailsForm({ settings }: BankDetailsFormProps) {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
         <div className="space-y-2">
           <Label htmlFor="bankgiro">{t('bankgiro_label')}</Label>
           <Input
@@ -101,6 +104,27 @@ export function BankDetailsForm({ settings }: BankDetailsFormProps) {
             }}
           />
           {bankgiroError && <p className="text-xs text-destructive">{bankgiroError}</p>}
+        </div>
+
+        <div className="space-y-2">
+          <Label htmlFor="plusgiro">{t('plusgiro_label')}</Label>
+          <Input
+            id="plusgiro"
+            name="plusgiro"
+            placeholder="XXXXXX-X"
+            defaultValue={settings.plusgiro || ''}
+            onBlur={(e) => {
+              const val = e.target.value.trim()
+              if (!val) { setPlusgiroError(null); return }
+              if (validatePlusgiroNumber(val)) {
+                e.target.value = formatPlusgiroNumber(val)
+                setPlusgiroError(null)
+              } else {
+                setPlusgiroError(t('plusgiro_error'))
+              }
+            }}
+          />
+          {plusgiroError && <p className="text-xs text-destructive">{plusgiroError}</p>}
         </div>
 
         <div className="space-y-2">
@@ -124,6 +148,45 @@ export function BankDetailsForm({ settings }: BankDetailsFormProps) {
           {swishError && <p className="text-xs text-destructive">{swishError}</p>}
         </div>
       </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <div className="space-y-2 sm:col-span-2">
+          <Label htmlFor="iban">{t('iban_label')}</Label>
+          <Input
+            id="iban"
+            name="iban"
+            placeholder="SE00 0000 0000 0000 0000 0000"
+            defaultValue={settings.iban || ''}
+            onBlur={(e) => {
+              const val = e.target.value.replace(/\s/g, '').toUpperCase()
+              if (!val) { setIbanError(null); e.target.value = ''; return }
+              e.target.value = val
+              setIbanError(/^SE\d{22}$/.test(val) ? null : t('iban_error'))
+            }}
+          />
+          {ibanError
+            ? <p className="text-xs text-destructive">{ibanError}</p>
+            : <p className="text-xs text-muted-foreground">{t('iban_hint')}</p>}
+        </div>
+
+        <div className="space-y-2">
+          <Label htmlFor="bic">{t('bic_label')}</Label>
+          <Input
+            id="bic"
+            name="bic"
+            placeholder={t('bic_placeholder')}
+            maxLength={11}
+            defaultValue={settings.bic || ''}
+            onBlur={(e) => {
+              const val = e.target.value.replace(/\s/g, '').toUpperCase()
+              if (!val) { setBicError(null); e.target.value = ''; return }
+              e.target.value = val
+              setBicError(/^[A-Z]{6}[A-Z0-9]{2}([A-Z0-9]{3})?$/.test(val) ? null : t('bic_error'))
+            }}
+          />
+          {bicError && <p className="text-xs text-destructive">{bicError}</p>}
+        </div>
+      </div>
     </section>
   )
 }
@@ -134,7 +197,10 @@ export function validateBankFields(formData: FormData): { field: string; message
   const clearing = (formData.get('clearing_number') as string || '').trim()
   const account = (formData.get('account_number') as string || '').trim()
   const bankgiro = (formData.get('bankgiro') as string || '').trim()
+  const plusgiro = (formData.get('plusgiro') as string || '').trim()
   const swish = normaliseSwish(formData.get('swish') as string)
+  const iban = (formData.get('iban') as string || '').replace(/\s/g, '').toUpperCase()
+  const bic = (formData.get('bic') as string || '').replace(/\s/g, '').toUpperCase()
 
   if (clearing && !/^\d{4,5}$/.test(clearing)) {
     errors.push({ field: 'clearing_number', message: 'Clearingnummer måste vara 4-5 siffror' })
@@ -145,8 +211,17 @@ export function validateBankFields(formData: FormData): { field: string; message
   if (bankgiro && !validateBankgiroNumber(bankgiro)) {
     errors.push({ field: 'bankgiro', message: 'Ogiltigt bankgironummer' })
   }
+  if (plusgiro && !validatePlusgiroNumber(plusgiro)) {
+    errors.push({ field: 'plusgiro', message: 'Ogiltigt plusgironummer' })
+  }
   if (swish && !isValidSwish(swish)) {
     errors.push({ field: 'swish', message: 'Ogiltigt Swish-nummer (företagsnummer 123XXXXXXX eller mobilnummer 07XXXXXXXX)' })
+  }
+  if (iban && !/^SE\d{22}$/.test(iban)) {
+    errors.push({ field: 'iban', message: 'Ogiltigt IBAN (SE följt av 22 siffror)' })
+  }
+  if (bic && !/^[A-Z]{6}[A-Z0-9]{2}([A-Z0-9]{3})?$/.test(bic)) {
+    errors.push({ field: 'bic', message: 'Ogiltig BIC/SWIFT (8 eller 11 tecken)' })
   }
   return errors
 }

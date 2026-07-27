@@ -8,12 +8,12 @@
 
 import { z } from 'zod'
 import { ok } from '@/lib/api/v1/response'
-import { registerEndpoint } from '@/lib/api/v1/registry'
+import { registerEndpoint, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
 import { v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
 import { safeGenerate } from '@/lib/api/v1/report-period'
 import { calculateVatDeclaration } from '@/lib/reports/vat-declaration'
-import type { AccountingMethod, VatPeriodType } from '@/types'
+import type { VatPeriodType } from '@/types'
 
 const VatPeriodTypeEnum = z.enum(['monthly', 'quarterly', 'yearly'])
 const AccountingMethodEnum = z.enum(['accrual', 'cash'])
@@ -24,7 +24,7 @@ registerEndpoint({
   path: '/api/v1/companies/:companyId/reports/vat-declaration',
   summary: 'Swedish VAT declaration (momsdeklaration) for a period.',
   description:
-    'Computes momsdeklaration rutor for the given period_type / year / period. The result includes ruta 05 (domestic taxable sales), 10-12 (output VAT 25/12/6%), 20-24 (EU acquisitions of goods + tax on services from EU/non-EU), 30-32 (reverse-charge output VAT 25/12/6%), 39 (export), 40 (EU-services / momsfri försäljning), 48 (input VAT), 50 (import beskattningsunderlag), 60-62 (calculated output VAT on imports 25/12/6%), and 49 (moms att betala/återfå — the bottom line). Mapping rules match SKV 4700.',
+    'Computes momsdeklaration rutor for the given period_type / year / period. The result includes ruta 05 (domestic taxable sales), 10-12 (output VAT 25/12/6%), 20-24 (EU acquisitions of goods + tax on services from EU/non-EU), 30-32 (reverse-charge output VAT 25/12/6%), 39 (export), 40 (EU-services / momsfri försäljning), 48 (input VAT), 50 (import beskattningsunderlag), 60-62 (calculated output VAT on imports 25/12/6%), and 49 (moms att betala/återfå: the bottom line). Mapping rules match SKV 4700.',
   useWhen:
     'Submitting momsdeklaration to Skatteverket, reconciling VAT balances at month/quarter end, or building a VAT-payable dashboard.',
   doNotUseFor:
@@ -32,7 +32,7 @@ registerEndpoint({
   pitfalls: [
     '`period_type` (monthly|quarterly|yearly), `year`, and `period` are all required.',
     'For monthly: period is 1-12. For quarterly: period is 1-4. For yearly: period is 1.',
-    '`accounting_method` defaults to accrual (faktureringsmetoden); pass cash for kontantmetoden to honor the VAT-on-payment rule per ML 15 kap 8–11 §§ (ML 2023:200, which replaced ML 1994:200 on 1 July 2023 — the prior ML 13 kap reference is outdated).',
+    '`accounting_method` is accepted for backward compatibility but has no effect on the figures: the declaration is a pure ledger projection, and the method (faktureringsmetoden vs kontantmetoden per ML 15 kap 8-11 §§, ML 2023:200) is already reflected in when VAT-bearing journal entries are posted.',
     'Output ruta 49 = (10+11+12+30+31+32+60+61+62) − 48. Positive = pay; negative = refund.',
   ],
   example: {
@@ -72,7 +72,7 @@ registerEndpoint({
   idempotent: true,
   reversible: false,
   dryRunSupported: false,
-  response: { success: z.unknown() },
+  response: { success: dataEnvelope(z.unknown()) },
 })
 
 export const GET = withApiV1<{ params: Promise<{ companyId: string }> }>(
@@ -123,7 +123,9 @@ export const GET = withApiV1<{ params: Promise<{ companyId: string }> }>(
         },
       })
     }
-    const { period_type, year, period, accounting_method } = filters.data
+    // accounting_method is still accepted (public API back-compat) but has no
+    // effect: see the invariant note on calculateVatDeclaration.
+    const { period_type, year, period } = filters.data
 
     const gen = await safeGenerate(
       () =>
@@ -133,7 +135,6 @@ export const GET = withApiV1<{ params: Promise<{ companyId: string }> }>(
           period_type as VatPeriodType,
           year,
           period,
-          accounting_method as AccountingMethod | undefined,
         ),
       { log: ctx.log, requestId: ctx.requestId, reportName: 'vat-declaration' },
     )

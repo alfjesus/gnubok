@@ -132,7 +132,7 @@ function makeSupabase(opts: {
 
 beforeEach(() => {
   vi.clearAllMocks()
-  // Zero result so the builder doesn't propose a new avsättning — keeps the
+  // Zero result so the builder doesn't propose a new avsättning: keeps the
   // 21xx balance stable at the trial-balance value, which makes the latent
   // tax math testable in isolation.
   vi.mocked(generateIncomeStatement).mockResolvedValue({
@@ -160,7 +160,7 @@ beforeEach(() => {
   } as unknown as Awaited<ReturnType<typeof generateTrialBalance>>)
 })
 
-describe('buildDispositionsProposal — K3 framework', () => {
+describe('buildDispositionsProposal: K3 framework', () => {
   it('appends an uppskjuten_skatt proposal for K3 aktiebolag', async () => {
     const supabase = makeSupabase({ entityType: 'aktiebolag', accountingFramework: 'k3' })
     const result = await buildDispositionsProposal(
@@ -178,6 +178,31 @@ describe('buildDispositionsProposal — K3 framework', () => {
     const credit = latentTax!.lines.find((l) => l.account_number === '2240')!
     expect(debit.debit_amount).toBe(20_600)
     expect(credit.credit_amount).toBe(20_600)
+  })
+
+  it('computes bolagsskatt on the result AFTER the periodiseringsfond avsättning', async () => {
+    // Regression (customer report): the preview computed bolagsskatt on the
+    // pre-disposition net result, ignoring the avsättning it proposes in the
+    // same snapshot: so the previewed/agent-facing tax was too high and
+    // diverged from ÅR/INK2. With a 1,000,000 result and no existing fonder:
+    //   avsättning   = 25 % × 1,000,000          = 250,000
+    //   skattem. res = 1,000,000 − 250,000        = 750,000
+    //   bolagsskatt  = 20.6 % × 750,000           = 154,500  (NOT 206,000)
+    vi.mocked(generateIncomeStatement).mockResolvedValue({
+      net_result: 1_000_000,
+    } as Awaited<ReturnType<typeof generateIncomeStatement>>)
+
+    const supabase = makeSupabase({ entityType: 'aktiebolag', accountingFramework: 'k2' })
+    const result = await buildDispositionsProposal(
+      supabase as unknown as Parameters<typeof buildDispositionsProposal>[0],
+      'co',
+      'fp1',
+    )
+
+    const avsattning = result.proposals.find((p) => p.kind === 'periodiseringsfond_avsattning')
+    const bolagsskatt = result.proposals.find((p) => p.kind === 'bolagsskatt')
+    expect(avsattning?.amount).toBe(250_000)
+    expect(bolagsskatt?.amount).toBe(154_500)
   })
 
   it('does NOT add an uppskjuten_skatt proposal for K2 aktiebolag', async () => {
@@ -215,7 +240,7 @@ describe('buildDispositionsProposal — K3 framework', () => {
   })
 
   it('skips uppskjuten_skatt when 2240 already matches target (no change)', async () => {
-    // Bump 2240 to exactly 20 600 so the delta is zero — calculator should
+    // Bump 2240 to exactly 20 600 so the delta is zero: calculator should
     // return null and the builder skip the proposal entirely.
     vi.mocked(generateTrialBalance).mockResolvedValue({
       rows: [

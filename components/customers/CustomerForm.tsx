@@ -13,6 +13,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { useToast } from '@/components/ui/use-toast'
 import { Loader2, CheckCircle, XCircle, Lock } from 'lucide-react'
 import { useCanWrite } from '@/lib/hooks/use-can-write'
+import { getErrorMessage } from '@/lib/errors/get-error-message'
 import type { CreateCustomerInput } from '@/types'
 
 interface CustomerFormProps {
@@ -38,6 +39,7 @@ export default function CustomerForm({
   const schema = useMemo(() => z.object({
     name: z.string().min(1, t('name_required')),
     customer_type: z.enum(['individual', 'swedish_business', 'eu_business', 'non_eu_business']),
+    customer_number: z.string().trim().max(32, t('customer_number_too_long')).optional(),
     email: z.string().email(t('email_invalid')).optional().or(z.literal('')),
     phone: z.string().optional(),
     address_line1: z.string().optional(),
@@ -49,7 +51,7 @@ export default function CustomerForm({
     vat_number: z.string().optional(),
     personal_number: z
       .string()
-      .regex(/^(\d{6}|\d{8})[-+]?\d{4}$/, t('personal_number_invalid'))
+      .regex(/^(?:(\d{6}|\d{8})[-+]?\d{4}|\*{8}-\d{4})$/, t('personal_number_invalid'))
       .optional()
       .or(z.literal('')),
     language: z.enum(['sv', 'en']).optional(),
@@ -70,6 +72,7 @@ export default function CustomerForm({
     defaultValues: {
       name: initialData?.name || '',
       customer_type: initialData?.customer_type || 'swedish_business',
+      customer_number: initialData?.customer_number || '',
       email: initialData?.email || '',
       phone: initialData?.phone || '',
       address_line1: initialData?.address_line1 || '',
@@ -103,6 +106,18 @@ export default function CustomerForm({
 
       const result = await response.json()
 
+      if (!response.ok) {
+        // Map the parsed body plus the status: on this path `result.error` is
+        // the canonical envelope OBJECT (the route is withRouteContext), and
+        // rendering it as a toast description would crash the React render.
+        toast({
+          title: t('vat_failed_title'),
+          description: getErrorMessage(result, { statusCode: response.status }),
+          variant: 'destructive',
+        })
+        return
+      }
+
       setVatValidationResult({
         valid: result.valid,
         name: result.name,
@@ -131,11 +146,15 @@ export default function CustomerForm({
   }
 
   const onFormSubmit = (data: FormData) => {
-    onSubmit({
+    const payload: CreateCustomerInput = {
       ...data,
       email: data.email || undefined,
-      personal_number: data.personal_number || undefined,
-    })
+      personal_number: data.personal_number || null,
+    }
+    if (data.personal_number?.startsWith('*') && data.personal_number === initialData?.personal_number) {
+      delete payload.personal_number
+    }
+    onSubmit(payload)
   }
 
   return (
@@ -175,6 +194,21 @@ export default function CustomerForm({
         />
         {errors.name && (
           <p className="text-sm text-destructive">{errors.name.message}</p>
+        )}
+      </div>
+
+      {/* Customer number */}
+      <div className="space-y-2">
+        <Label htmlFor="customer_number">{t('customer_number_label')}</Label>
+        <Input
+          id="customer_number"
+          placeholder={t('customer_number_placeholder')}
+          {...register('customer_number')}
+        />
+        {errors.customer_number ? (
+          <p className="text-sm text-destructive">{errors.customer_number.message}</p>
+        ) : (
+          <p className="text-xs text-muted-foreground">{t('customer_number_hint')}</p>
         )}
       </div>
 
@@ -241,7 +275,7 @@ export default function CustomerForm({
         </div>
       </div>
 
-      {/* Identification — depends on customer type */}
+      {/* Identification: depends on customer type */}
       {customerType === 'individual' ? (
         <div className="space-y-4 pt-4 border-t">
           <h3 className="font-medium">{t('individual_section')}</h3>

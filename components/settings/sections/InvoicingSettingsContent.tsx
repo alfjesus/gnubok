@@ -1,47 +1,42 @@
 'use client'
 
 import { useTranslations } from 'next-intl'
-import { BankDetailsForm, validateBankFields } from '@/components/settings/BankDetailsForm'
 import { InvoiceSettingsForm } from '@/components/settings/InvoiceSettingsForm'
+import { InvoicePaymentLinkSettings } from '@/components/settings/InvoicePaymentLinkSettings'
+import { InvoicePaymentAccountsSettings } from '@/components/settings/InvoicePaymentAccountsSettings'
+import { InvoiceEmailTextsSettings } from '@/components/settings/InvoiceEmailTextsSettings'
+import { InvoiceEmailRecipientsSettings } from '@/components/settings/InvoiceEmailRecipientsSettings'
 import { InvoicePreviewCard } from '@/components/settings/InvoicePreviewCard'
 import { PdfPrintSettings } from '@/components/settings/PdfPrintSettings'
 import { SettingsFormWrapper } from '@/components/settings/SettingsFormWrapper'
 import { SettingsLoadError } from '@/components/settings/SettingsLoadError'
 import { SettingsLoadingSkeleton } from '@/components/settings/SettingsLoadingSkeleton'
+import { SettingsSectionHeader } from '@/components/settings/SettingsRows'
 import { useSettings } from '@/components/settings/useSettings'
-import { useToast } from '@/components/ui/use-toast'
-import { normaliseSwish } from '@/lib/payments/swish'
 import type { CompanySettings } from '@/types'
 
 export function InvoicingSettingsContent() {
-  const t = useTranslations('settings_invoicing')
+  const tNav = useTranslations('settings_nav')
+  const tIntro = useTranslations('settings_intro')
   const { settings, isLoading, updateSettings, refetch } = useSettings()
-  const { toast } = useToast()
 
   if (isLoading) return <SettingsLoadingSkeleton />
   if (!settings) return <SettingsLoadError onRetry={refetch} />
 
   function handleSave(formData: FormData) {
-    const bankErrors = validateBankFields(formData)
-    if (bankErrors.length > 0) {
-      toast({
-        title: t('bank_validation_title'),
-        description: bankErrors.map(e => e.message).join(', '),
-        variant: 'destructive',
-      })
-      return {}
-    }
-
     const updates: Record<string, unknown> = {
-      bank_name: formData.get('bank_name') as string,
-      clearing_number: formData.get('clearing_number') as string,
-      account_number: formData.get('account_number') as string,
-      bankgiro: (formData.get('bankgiro') as string) || null,
-      swish: normaliseSwish(formData.get('swish') as string) || null,
       invoice_prefix: (formData.get('invoice_prefix') as string) || null,
       next_invoice_number: parseInt(formData.get('next_invoice_number') as string) || 1,
+      next_arrival_number: parseInt(formData.get('next_arrival_number') as string) || 1,
       invoice_default_days: parseInt(formData.get('invoice_default_days') as string) || 30,
       invoice_default_notes: (formData.get('invoice_default_notes') as string) || null,
+      default_our_reference: (formData.get('default_our_reference') as string) || null,
+      reminder_days_level_1:
+        Number.parseInt(formData.get('reminder_days_level_1') as string) || 15,
+      reminder_days_level_2:
+        Number.parseInt(formData.get('reminder_days_level_2') as string) || 30,
+      reminder_days_level_3:
+        Number.parseInt(formData.get('reminder_days_level_3') as string) || 45,
     }
     return {
       updates,
@@ -52,22 +47,31 @@ export function InvoicingSettingsContent() {
   }
 
   return (
-    <div className="space-y-8">
-      <div className="flex justify-end">
-        <InvoicePreviewCard settings={settings} />
-      </div>
+    <div>
+      <SettingsSectionHeader
+        title={tNav('invoicing')}
+        intro={tIntro('invoicing')}
+        action={<InvoicePreviewCard settings={settings} />}
+      />
 
-      <SettingsFormWrapper onSave={handleSave} className="space-y-8">
-        <BankDetailsForm settings={settings} />
-        <div className="border-t border-border pt-8">
-          <InvoiceSettingsForm settings={settings} />
-        </div>
+      {/* Owner/admin only: the component gates itself on role. */}
+      <InvoicePaymentAccountsSettings settings={settings} onUpdate={updateSettings} />
+
+      <SettingsFormWrapper onSave={handleSave}>
+        <InvoiceSettingsForm settings={settings} />
       </SettingsFormWrapper>
 
-      {/* PDF settings — saves individually via toggle switches */}
-      <div className="border-t border-border pt-8">
-        <PdfPrintSettings settings={settings} onUpdate={updateSettings} />
-      </div>
+      {/* Payment link opt-in: saves individually via toggle switch */}
+      <InvoicePaymentLinkSettings settings={settings} onUpdate={updateSettings} />
+
+      {/* PDF settings: saves individually via toggle switches */}
+      <PdfPrintSettings settings={settings} onUpdate={updateSettings} />
+
+      {/* Fixed invoice email recipients: explicit save (owner/admin only) */}
+      <InvoiceEmailRecipientsSettings settings={settings} onUpdate={updateSettings} />
+
+      {/* Invoice email texts: autosaves on blur */}
+      <InvoiceEmailTextsSettings settings={settings} onUpdate={updateSettings} />
     </div>
   )
 }

@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { useToast } from '@/components/ui/use-toast'
 import { PaymentCalendar } from '@/extensions/general/calendar/components/PaymentCalendar'
+import type { DeadlineFormValues } from '@/components/deadlines/DeadlineForm'
 import type { WorkspaceComponentProps } from '@/lib/extensions/workspace-registry'
 import type { Invoice, Deadline } from '@/types'
 
@@ -29,6 +30,7 @@ export default function CalendarWorkspace({ userId }: WorkspaceComponentProps) {
       const { data: deadlinesData, error: deadlinesError } = await supabase
         .from('deadlines')
         .select('*, customer:customers(name)')
+        .is('dismissed_at', null)
         .order('due_date', { ascending: true })
 
       if (deadlinesError) throw deadlinesError
@@ -45,7 +47,7 @@ export default function CalendarWorkspace({ userId }: WorkspaceComponentProps) {
       setCustomers(customersData || [])
     } catch {
       toast({
-        title: 'Kunde inte hamta data',
+        title: 'Kunde inte hämta data',
         variant: 'destructive',
       })
     } finally {
@@ -57,9 +59,7 @@ export default function CalendarWorkspace({ userId }: WorkspaceComponentProps) {
     fetchData()
   }, [fetchData])
 
-  const handleDeadlineCreate = async (
-    data: Omit<Deadline, 'id' | 'user_id' | 'company_id' | 'created_at' | 'updated_at'>
-  ) => {
+  const handleDeadlineCreate = async (data: DeadlineFormValues) => {
     try {
       const { error } = await supabase.from('deadlines').insert([data])
 

@@ -62,7 +62,7 @@ describe('GET/POST /api/articles', () => {
 
   it('POST rejects a 3xxx revenue_account unknown to both chart and BAS catalogue', async () => {
     // Non-3xxx numbers are already stopped by the Zod schema; the route-level
-    // 'invalid' branch covers 3xxx numbers that exist nowhere — no chart row
+    // 'invalid' branch covers 3xxx numbers that exist nowhere, no chart row
     // and not in the BAS reference (3041 is not a BAS 2026 account).
     enqueue({ data: null })
 
@@ -129,6 +129,22 @@ describe('GET/POST /api/articles', () => {
 
     expect(status).toBe(200)
     expect(body.data.revenue_account).toBe('3001')
+  })
+
+  it('POST accepts a posting account that is active class 2 in the chart', async () => {
+    enqueue({ data: { account_class: 2, is_active: true } })
+    enqueue({ data: { id: 'a1', name: 'Deposition', article_number: '4', revenue_account: '2897' } })
+
+    const request = createMockRequest('/api/articles', {
+      method: 'POST',
+      body: { name: 'Deposition', price_excl_vat: 1000, vat_rate: 0, revenue_account: '2897' },
+    })
+
+    const response = await POST(request, { params: Promise.resolve({}) })
+    const { status, body } = await parseJsonResponse<{ data: { revenue_account: string } }>(response)
+
+    expect(status).toBe(200)
+    expect(body.data.revenue_account).toBe('2897')
   })
 
   it('POST creates an article and auto-assigns a number', async () => {

@@ -2,21 +2,36 @@
 
 import Link from 'next/link'
 import { useEffect, useState, useCallback } from 'react'
+import { useLocale, useTranslations } from 'next-intl'
 import { PageHeader } from '@/components/ui/page-header'
-import { FiscalYearSelector } from '@/components/common/FiscalYearSelector'
+import { FyPicker } from '@/components/common/FyPicker'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { EmptyState } from '@/components/ui/empty-state'
+import { useToast } from '@/components/ui/use-toast'
 import {
   Tooltip,
   TooltipContent,
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/info-tooltip'
-import { ArrowLeft, Download, FileSpreadsheet, AlertTriangle, CheckCircle2 } from 'lucide-react'
+import {
+  ArrowLeft,
+  Download,
+  FileSpreadsheet,
+  AlertTriangle,
+  CheckCircle2,
+  Loader2,
+} from 'lucide-react'
 import { formatDate } from '@/lib/utils'
+import { downloadFile } from '@/lib/browser/download-file'
+import { failureDescription } from '@/lib/browser/action-failure'
 import type { KassaflodesanalysReport } from '@/lib/reports/kassaflodesanalys'
+import {
+  getErrorMessage as getUserErrorMessage,
+  type ErrorLocale,
+} from '@/lib/errors/get-error-message'
 
 function formatAmount(n: number): string {
   return n.toLocaleString('sv-SE', {
@@ -32,7 +47,7 @@ interface CashRowProps {
 
 function CashRow({ label, amount }: CashRowProps) {
   return (
-    <div className="flex items-center justify-between py-1.5 text-sm">
+    <div className="flex items-center justify-between py-1 text-sm">
       <span className="text-foreground">{label}</span>
       <span className="tabular-nums text-right">{formatAmount(amount)}</span>
     </div>
@@ -54,10 +69,14 @@ function SubtotalRow({ label, amount }: SubtotalRowProps) {
 }
 
 export function KassaflodesanalysClient() {
+  const t = useTranslations('reports')
+  const locale = useLocale() as ErrorLocale
+  const { toast } = useToast()
   const [selectedPeriod, setSelectedPeriod] = useState<string | null>(null)
   const [report, setReport] = useState<KassaflodesanalysReport | null>(null)
   const [isLoadingPeriods, setIsLoadingPeriods] = useState(true)
   const [isLoadingReport, setIsLoadingReport] = useState(false)
+  const [isDownloadingPdf, setIsDownloadingPdf] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   const loadReport = useCallback(async (periodId: string) => {
@@ -72,7 +91,7 @@ export function KassaflodesanalysClient() {
       const { data } = await res.json()
       setReport(data)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Okänt fel')
+      setError(err instanceof Error ? getUserErrorMessage(err) : 'Okänt fel')
       setReport(null)
     } finally {
       setIsLoadingReport(false)
@@ -87,24 +106,74 @@ export function KassaflodesanalysClient() {
     }
   }, [selectedPeriod, loadReport])
 
-  const handleDownloadPdf = useCallback(() => {
-    if (!selectedPeriod) return
-    window.location.href = `/api/reports/kassaflodesanalys/pdf?period_id=${selectedPeriod}`
-  }, [selectedPeriod])
+  /**
+   * Fetch the statutory kassaflödesanalys PDF and save it only if the server
+   * actually produced one.
+   *
+   * This used to be `window.location.href = <pdf route>`, which has no seam for
+   * either half of the problem. On success the browser cancels the navigation
+   * (the route answers Content-Disposition: attachment) and the click gives no
+   * feedback at all, so nothing marks the render as in flight: a second click
+   * starts a second full report query plus renderToBuffer. On failure the route
+   * answers a JSON error envelope with no Content-Disposition, so the browser
+   * navigates the whole app away and the user is left staring at raw JSON with
+   * their report page gone. There is no `res` to check and no promise to catch
+   * on a location assignment; the only fix is to make the download a bounded
+   * fetch.
+   *
+   * The filename mirrors the route's Content-Disposition
+   * (kassaflodesanalys-<period_start>.pdf): both sides derive it from the same
+   * fiscal period, and the button is disabled until that report is loaded.
+   *
+   * No success toast: the saved file is the feedback. On failure nothing was
+   * written to disk and exactly one toast says why. Never two, TOAST_LIMIT is 1
+   * (components/ui/use-toast.tsx), so a second toast in the same tick evicts the
+   * first and only the last is rendered.
+   */
+  const handleDownloadPdf = useCallback(async () => {
+    // The button is disabled while a render is in flight; this guard closes the
+    // double-click / Enter-repeat race before React has re-rendered it.
+    if (!selectedPeriod || !report || isDownloadingPdf) return
+    setIsDownloadingPdf(true)
+    try {
+      // The shared 15s deadline applies: this is one fiscal year of aggregation
+      // plus a single-page render with stock fonts, so the realistic worst case
+      // is a cold start and one round trip. If a healthy render ever needs
+      // longer, the answer is maxDuration on the route plus a matching
+      // timeoutMs here, never an unbounded fetch that spins forever.
+      const result = await downloadFile({
+        url: `/api/reports/kassaflodesanalys/pdf?period_id=${selectedPeriod}`,
+        filename: `kassaflodesanalys-${report.period_start}.pdf`,
+        locale,
+      })
+      if (!result.ok) {
+        toast({
+          title: t('pdf_download_failed_title'),
+          description: failureDescription(result, {
+            timeout: t('pdf_download_timeout'),
+            network: t('pdf_download_network'),
+          }),
+          variant: 'destructive',
+        })
+      }
+    } finally {
+      setIsDownloadingPdf(false)
+    }
+  }, [selectedPeriod, report, isDownloadingPdf, locale, toast, t])
 
   return (
     <div className="space-y-8">
       <Link
         href="/reports"
-        className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors"
+        className="inline-flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground transition-colors"
       >
-        <ArrowLeft className="h-3.5 w-3.5" />
+        <ArrowLeft className="h-4 w-4" />
         Rapporter
       </Link>
       <PageHeader title="Kassaflödesanalys" />
 
       <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
-        <FiscalYearSelector
+        <FyPicker
           value={selectedPeriod}
           onChange={(id) => setSelectedPeriod(id)}
           includeAllOption={false}
@@ -115,9 +184,13 @@ export function KassaflodesanalysClient() {
           <Button
             variant="outline"
             onClick={handleDownloadPdf}
-            disabled={!report || isLoadingReport}
+            disabled={!report || isLoadingReport || isDownloadingPdf}
           >
-            <Download className="mr-2 h-4 w-4" />
+            {isDownloadingPdf ? (
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            ) : (
+              <Download className="mr-2 h-4 w-4" />
+            )}
             Ladda ner PDF
           </Button>
           <TooltipProvider delayDuration={300}>
@@ -159,13 +232,13 @@ export function KassaflodesanalysClient() {
           <Skeleton className="h-32" />
         </div>
       ) : error ? (
-        <Card className="border-destructive/40">
+        <Card className="border-destructive">
           <CardContent className="p-6 text-sm text-destructive">{error}</CardContent>
         </Card>
       ) : report ? (
         <div className="space-y-6">
           <p className="text-sm text-muted-foreground">
-            Period: {formatDate(report.period_start)} – {formatDate(report.period_end)}
+            Period: {formatDate(report.period_start)} till {formatDate(report.period_end)}
           </p>
 
           {/* Section 1: Löpande verksamhet */}
@@ -251,6 +324,10 @@ export function KassaflodesanalysClient() {
               />
               <CashRow label="Utdelningar" amount={report.finansierings.utdelningar} />
               <CashRow label="Nyemission" amount={report.finansierings.nyemission} />
+              <CashRow
+                label="Erhållna aktieägartillskott"
+                amount={report.finansierings.erhallna_aktieagartillskott}
+              />
               <SubtotalRow
                 label="Summa kassaflöde finansieringsverksamhet"
                 amount={report.finansierings.total}
@@ -261,7 +338,7 @@ export function KassaflodesanalysClient() {
           {/* Total */}
           <Card>
             <CardContent className="p-6">
-              <div className="flex items-center justify-between text-base font-medium">
+              <div className="flex items-center justify-between">
                 <span className="font-display text-lg">Årets kassaflöde</span>
                 <span className="font-display text-lg tabular-nums">
                   {formatAmount(report.total_cash_flow)}
@@ -274,8 +351,8 @@ export function KassaflodesanalysClient() {
           <Card
             className={
               report.reconciliation.is_reconciled
-                ? 'border-success/40 bg-success/5'
-                : 'border-destructive/60 bg-destructive/5'
+                ? 'border-border bg-muted/30'
+                : 'border-destructive'
             }
           >
             <CardContent className="p-6 space-y-3">
@@ -287,8 +364,8 @@ export function KassaflodesanalysClient() {
                 )}
                 <span className="font-medium">
                   {report.reconciliation.is_reconciled
-                    ? 'Avstämning OK — kassaflödet stämmer med 19xx'
-                    : 'Avstämning misslyckades — kontrollera bokföringen'}
+                    ? 'Avstämning OK: kassaflödet stämmer med 19xx'
+                    : 'Avstämning misslyckades: kontrollera bokföringen'}
                 </span>
               </div>
               <div className="space-y-1 text-sm">
@@ -309,7 +386,7 @@ export function KassaflodesanalysClient() {
                   amount={report.reconciliation.delta_calculated}
                 />
                 {!report.reconciliation.is_reconciled && (
-                  <div className="flex items-center justify-between border-t border-destructive/40 pt-2 mt-2 text-sm font-medium text-destructive">
+                  <div className="flex items-center justify-between border-t border-destructive pt-2 mt-2 text-sm font-medium text-destructive">
                     <span>Avvikelse</span>
                     <span className="tabular-nums text-right">
                       {formatAmount(report.reconciliation.mismatch_amount)}

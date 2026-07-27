@@ -1,6 +1,7 @@
 'use client'
 
 import { usePathname } from 'next/navigation'
+import { useEffect } from 'react'
 import type { ReactNode } from 'react'
 
 /**
@@ -22,18 +23,40 @@ export function MainContainer({
   children: ReactNode
 }) {
   const pathname = usePathname()
+
+  // The panel (<main>) is its own scroll container on desktop, so Next's
+  // built-in scroll-to-top on navigation (which targets the window) never
+  // fires for it. Reset the panel scroll on every route change; hash-anchor
+  // scrolling still works because pages call scrollIntoView themselves.
+  useEffect(() => {
+    document.getElementById('main-content')?.scrollTo(0, 0)
+  }, [pathname])
+
   // Full-bleed routes own their own padding + multi-pane layout. They
-  // shouldn't sit inside max-w-5xl or any horizontal padding — that's what
+  // shouldn't sit inside max-w-5xl or any horizontal padding: that's what
   // causes a visible gap between the dashboard sidebar and the chat-sidebar
   // pane on wide viewports.
   const isFullBleed = pathname.startsWith('/e/') || pathname.startsWith('/chat')
 
-  return isFullBleed ? (
-    <div key={companyId ?? ''} className="h-full">{children}</div>
-  ) : (
+  // The salary run detail page drives a wide, horizontal-flow layout (progress
+  // band + 5-up KPIs + full-width employee ledger) that the standard max-w-5xl
+  // column squeezes. It opts into a wider canvas — a deliberate, scoped
+  // exception to the locked container token. Match only /salary/runs/{id}, not
+  // its nested employee sub-pages.
+  const isWide = /^\/salary\/runs\/[^/]+$/.test(pathname)
+
+  if (isFullBleed) {
+    return <div key={companyId ?? ''} className="h-full">{children}</div>
+  }
+
+  return (
     <div
       key={companyId ?? ''}
-      className="max-w-5xl mx-auto px-5 py-8 md:px-8 md:py-10"
+      className={
+        isWide
+          ? 'max-w-7xl mx-auto px-5 py-8 md:px-8 md:py-10'
+          : 'max-w-5xl mx-auto px-5 py-8 md:px-8 md:py-10'
+      }
     >
       {children}
     </div>

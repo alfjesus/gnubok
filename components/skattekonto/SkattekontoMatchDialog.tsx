@@ -21,9 +21,10 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { useToast } from '@/components/ui/use-toast'
-import { formatCurrency } from '@/lib/utils'
+import { formatCurrency, formatDate } from '@/lib/utils'
 import { formatVoucher } from '@/lib/bookkeeping/voucher-series-resolver'
 import type { StoredSkattekontoTransaction } from '@/types/skatteverket'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 interface MatchCandidate {
   journal_entry_id: string
@@ -41,7 +42,7 @@ interface MatchCandidate {
  * journal entry. Used by both /skattekonto and /transactions so we don't
  * have two copies of the same dialog drifting apart.
  *
- * The dialog owns its own data fetch — pass the row + open flag and it
+ * The dialog owns its own data fetch: pass the row + open flag and it
  * handles the rest. On successful match it calls onMatched(), letting the
  * caller refresh its data.
  */
@@ -77,14 +78,23 @@ export function SkattekontoMatchDialog({
         const json = await res.json()
         if (cancelled) return
         if (!res.ok) {
-          throw new Error(json.error || t('search_failed_default'))
+          // Map the parsed body plus the status, never `new Error(json.error)`:
+          // the Error constructor stringifies a non-string body field, and the
+          // mapper would discard the route's own Swedish reason.
+          toast({
+            title: t('fetch_candidates_failed_title'),
+            description: getUserErrorMessage(json, { statusCode: res.status }),
+            variant: 'destructive',
+          })
+          onClose()
+          return
         }
         setCandidates(json.data.candidates as MatchCandidate[])
       } catch (err) {
         if (cancelled) return
         toast({
           title: t('fetch_candidates_failed_title'),
-          description: err instanceof Error ? err.message : undefined,
+          description: err instanceof Error ? getUserErrorMessage(err) : undefined,
           variant: 'destructive',
         })
         onClose()
@@ -111,7 +121,12 @@ export function SkattekontoMatchDialog({
       )
       const json = await res.json()
       if (!res.ok) {
-        throw new Error(json.error || t('match_failed_default'))
+        toast({
+          title: t('match_failed_title'),
+          description: getUserErrorMessage(json, { statusCode: res.status }),
+          variant: 'destructive',
+        })
+        return
       }
       toast({ title: t('match_success_title') })
       onMatched()
@@ -119,7 +134,7 @@ export function SkattekontoMatchDialog({
     } catch (err) {
       toast({
         title: t('match_failed_title'),
-        description: err instanceof Error ? err.message : undefined,
+        description: err instanceof Error ? getUserErrorMessage(err) : undefined,
         variant: 'destructive',
       })
     } finally {
@@ -135,7 +150,7 @@ export function SkattekontoMatchDialog({
           <DialogDescription>
             {row && (
               <>
-                {row.transaktionsdatum} • {row.transaktionstext} •{' '}
+                {formatDate(row.transaktionsdatum)} • {row.transaktionstext} •{' '}
                 <span className="tabular-nums">
                   {formatCurrency(Number(row.belopp_skatteverket))}
                 </span>
@@ -176,7 +191,7 @@ export function SkattekontoMatchDialog({
               <TableBody>
                 {candidates.map(c => (
                   <TableRow key={c.journal_entry_id}>
-                    <TableCell className="tabular-nums">{c.entry_date}</TableCell>
+                    <TableCell className="tabular-nums">{formatDate(c.entry_date)}</TableCell>
                     <TableCell className="tabular-nums">
                       {formatVoucher(c)}
                     </TableCell>

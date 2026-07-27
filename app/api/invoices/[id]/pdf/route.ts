@@ -1,25 +1,43 @@
-import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
 import { renderToBuffer } from '@react-pdf/renderer'
+import { withRouteContext } from '@/lib/api/with-route-context'
 import { InvoicePDF } from '@/lib/invoices/pdf-template'
-import { prepareInvoicePdfRender } from '@/lib/invoices/pdf-render-helpers'
-import { requireCompanyId } from '@/lib/company/context'
+import { prepareInvoicePdfRender, buildSwishQrDataUrl, buildPaymentLinkQrDataUrl } from '@/lib/invoices/pdf-render-helpers'
+import { invoicePdfFilename } from '@/lib/invoices/pdf-filename'
+import { contentDisposition } from '@/lib/api/content-disposition'
 import type { Invoice, InvoiceItem, Customer, CompanySettings } from '@/types'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
+import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
+import {
+  hasRequiredInvoicePaymentAccount,
+  invoiceRequiresPaymentAccount,
+} from '@/lib/invoices/payment-accounts'
 
-export async function GET(
-  request: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
+const PRIVATE_NO_STORE_HEADERS = { 'Cache-Control': 'private, no-store' }
+
+/**
+ * `?disposition=inline` serves the PDF for in-browser review instead of forcing
+ * a download (#1190): reviewing an invoice should not mean opening a file from
+ * the Downloads folder. Anything else, including a missing or malformed value,
+ * keeps the download behaviour every existing caller relies on.
+ */
+function resolveDisposition(request: Request): 'inline' | 'attachment' {
+  const requested = new URL(request.url).searchParams.get('disposition')
+  return requested === 'inline' ? 'inline' : 'attachment'
+}
+
+function privateNoStore(response: NextResponse): NextResponse {
+  response.headers.set('Cache-Control', 'private, no-store')
+  return response
+}
+
+export const GET = withRouteContext<{ params: Promise<{ id: string }> }>(
+  'invoice.pdf',
+  async (request, { supabase, companyId, log, requestId }, { params }) => {
   const { id } = await params
-  const supabase = await createClient()
 
-  const { data: { user } } = await supabase.auth.getUser()
-
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const companyId = await requireCompanyId(supabase, user.id)
+  // withRouteContext resolves companyId from the authenticated user's active
+  // membership. Explicit company filters remain mandatory defense in depth.
 
   // Fetch invoice with customer and items
   const { data: invoice, error: invoiceError } = await supabase
@@ -34,7 +52,10 @@ export async function GET(
     .single()
 
   if (invoiceError || !invoice) {
-    return NextResponse.json({ error: 'Invoice not found' }, { status: 404 })
+    return NextResponse.json(
+      { error: 'Invoice not found' },
+      { status: 404, headers: PRIVATE_NO_STORE_HEADERS },
+    )
   }
 
   // Fetch company settings
@@ -45,7 +66,17 @@ export async function GET(
     .single()
 
   if (companyError || !company) {
-    return NextResponse.json({ error: 'Company settings not found' }, { status: 404 })
+    return NextResponse.json(
+      { error: 'Company settings not found' },
+      { status: 404, headers: PRIVATE_NO_STORE_HEADERS },
+    )
+  }
+
+  if (!hasRequiredInvoicePaymentAccount(company as CompanySettings, invoice as Invoice)) {
+    return privateNoStore(errorResponseFromCode('INVOICE_SEND_PAYMENT_ACCOUNT_MISSING', log, {
+      requestId,
+      details: { currency: (invoice as Invoice).currency },
+    }))
   }
 
   // Sort items by sort_order
@@ -58,6 +89,7 @@ export async function GET(
       .from('invoices')
       .select('invoice_number')
       .eq('id', invoice.credited_invoice_id)
+      .eq('company_id', companyId)
       .single()
 
     if (originalInvoice) {
@@ -67,15 +99,23 @@ export async function GET(
 
   try {
     // Generate PDF
-    const { branding } = prepareInvoicePdfRender(company as CompanySettings)
+    const { branding, company: renderCompany } = await prepareInvoicePdfRender(
+      company as CompanySettings,
+      (invoice as Invoice).currency,
+      { paymentAccountRequired: invoiceRequiresPaymentAccount(invoice as Invoice) },
+    )
+    const swishQrDataUrl = await buildSwishQrDataUrl(renderCompany, invoice as Invoice)
+    const paymentLinkQrDataUrl = await buildPaymentLinkQrDataUrl(invoice as Invoice)
     const pdfBuffer = await renderToBuffer(
       InvoicePDF({
         invoice: invoice as Invoice,
         customer: invoice.customer as Customer,
         items,
-        company: company as CompanySettings,
+        company: renderCompany,
         originalInvoiceNumber,
         branding,
+        swishQrDataUrl,
+        paymentLinkQrDataUrl,
       })
     )
 
@@ -84,24 +124,35 @@ export async function GET(
 
     // Return PDF as response
     const isCreditNote = !!invoice.credited_invoice_id
-    const filenameNumber = invoice.invoice_number ?? `utkast-${String(invoice.id).slice(0, 8)}`
-    const filename = isCreditNote
-      ? `kreditfaktura-${filenameNumber}.pdf`
-      : `faktura-${filenameNumber}.pdf`
+    const filename = invoicePdfFilename({
+      companyName: (company as CompanySettings).company_name,
+      customerName: (invoice.customer as Customer).name,
+      invoiceNumber: invoice.invoice_number,
+      invoiceId: invoice.id,
+      invoiceDate: invoice.invoice_date,
+      documentType: invoice.document_type,
+      isCreditNote,
+    })
 
     return new NextResponse(uint8Array, {
       status: 200,
       headers: {
         'Content-Type': 'application/pdf',
-        'Content-Disposition': `attachment; filename="${filename}"`,
+        'Content-Disposition': contentDisposition(resolveDisposition(request), filename),
         'Content-Length': pdfBuffer.length.toString(),
+        'Cache-Control': 'private, no-store',
+        // The filename is derived from company/customer/invoice data, so the
+        // Content-Type must not be re-sniffed from the bytes when the browser
+        // renders this inline.
+        'X-Content-Type-Options': 'nosniff',
       },
     })
   } catch (error) {
-    console.error('PDF generation error:', error)
+    log.error('invoice PDF generation failed', error, { requestId, invoiceId: id })
     return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'PDF generation failed' },
-      { status: 500 }
+      { error: error instanceof Error ? getUserErrorMessage(error) : 'PDF generation failed' },
+      { status: 500, headers: PRIVATE_NO_STORE_HEADERS }
     )
   }
-}
+  },
+)

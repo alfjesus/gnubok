@@ -7,10 +7,11 @@ import { Paperclip, Loader2 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
 import { useToast } from '@/components/ui/use-toast'
+import { openDeferredTab } from '@/lib/browser/deferred-tab'
 
 interface Props {
   documentId: string | null | undefined
-  /** The booked tx's journal entry — link target when the underlag lives only
+  /** The booked tx's journal entry: link target when the underlag lives only
    *  at verifikat level (multi-doc entries, booking-dialog uploads). */
   journalEntryId?: string | null
   /** Underlag exists on the journal entry even though no doc is pinned to the
@@ -18,7 +19,7 @@ interface Props {
   hasJeDoc?: boolean
   /** Booked, requires underlag, has none (computeJeUnderlagStatus === 'missing'). */
   missing?: boolean
-  /** Opens the attach dialog from the negative state. Omit for viewers —
+  /** Opens the attach dialog from the negative state. Omit for viewers:
    *  the badge then renders non-interactive. */
   onAttach?: () => void
   className?: string
@@ -34,7 +35,7 @@ const hitAreaClass = 'shrink-0 p-1 -m-1'
  * - Pinned doc (transactions.document_id): clickable badge that fetches a
  *   signed URL and opens the document in a new tab.
  * - Verifikat-level doc only: same badge, links to the verifikat page (which
- *   lists all attachments — handles multi-doc without a per-row fetch).
+ *   lists all attachments: handles multi-doc without a per-row fetch).
  * - Missing on a booked row: discreet outline badge that doubles as the
  *   attach affordance when onAttach is provided.
  */
@@ -47,6 +48,7 @@ export function TransactionAttachmentIndicator({
   className,
 }: Props) {
   const t = useTranslations('tx_underlag')
+  const tCommon = useTranslations('common')
   const { toast } = useToast()
   const [isLoading, setIsLoading] = useState(false)
 
@@ -55,16 +57,28 @@ export function TransactionAttachmentIndicator({
     e.preventDefault()
     if (isLoading || !documentId) return
     setIsLoading(true)
+    // Pre-open inside the click's user activation: a window.open after the
+    // await is popup-blocked when the signed-URL fetch is slow.
+    const tab = openDeferredTab(tCommon('loading'))
     try {
       const res = await fetch(`/api/documents/${documentId}`)
       if (!res.ok) {
+        tab.close()
         toast({ title: t('open_failed'), variant: 'destructive' })
         return
       }
       const { data } = await res.json()
-      if (data?.download_url) {
-        window.open(data.download_url, '_blank', 'noopener,noreferrer')
+      if (!data?.download_url || !tab.navigate(data.download_url)) {
+        tab.close()
+        toast({
+          title: t('open_failed'),
+          description: tab.blocked ? tCommon('popup_blocked_description') : undefined,
+          variant: 'destructive',
+        })
       }
+    } catch {
+      tab.close()
+      toast({ title: t('open_failed'), variant: 'destructive' })
     } finally {
       setIsLoading(false)
     }

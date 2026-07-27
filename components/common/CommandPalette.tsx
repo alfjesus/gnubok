@@ -4,12 +4,13 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import * as DialogPrimitive from '@radix-ui/react-dialog'
 import {
-  Receipt,
+  ReceiptText,
   ArrowLeftRight,
   Users,
   Wallet,
   Building2,
   BookOpen,
+  ListTree,
   BarChart3,
   Upload,
   Package,
@@ -24,6 +25,8 @@ import {
   type LucideIcon,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { useCompany } from '@/contexts/CompanyContext'
+import { requiredCapabilityForExtension } from '@/lib/entitlements/keys'
 
 type Entry = {
   id: string
@@ -35,26 +38,29 @@ type Entry = {
 }
 
 const ACTION_ENTRIES: Entry[] = [
-  { id: 'new-invoice', label: 'Ny faktura', hint: 'Skapa & skicka faktura', icon: Receipt, href: '/invoices/new', keywords: 'fakturera ny invoice send create' },
+  { id: 'new-invoice', label: 'Ny faktura', hint: 'Skapa & skicka faktura', icon: ReceiptText, href: '/invoices?new=1', keywords: 'fakturera ny invoice send create' },
   { id: 'book-transaction', label: 'Boka transaktion', hint: 'Gå till transaktionsinkorgen', icon: ArrowLeftRight, href: '/transactions', keywords: 'transaktion bokför kategorisera categorize' },
   { id: 'new-customer', label: 'Lägg till kund', icon: Users, href: '/customers', keywords: 'kund customer ny lägg till' },
-  { id: 'new-supplier-invoice', label: 'Skapa leverantörsfaktura', icon: Wallet, href: '/supplier-invoices/new', keywords: 'leverantörsfaktura supplier invoice ny' },
+  { id: 'new-supplier-invoice', label: 'Skapa leverantörsfaktura', icon: Wallet, href: '/supplier-invoices?new=1', keywords: 'leverantörsfaktura supplier invoice ny' },
   { id: 'reports', label: 'Visa resultaträkning', hint: 'Rapporter', icon: BarChart3, href: '/reports', keywords: 'rapport resultat balans report' },
 ]
 
 const PAGE_ENTRIES: Entry[] = [
   { id: 'kunder', label: 'Kunder', icon: Users, href: '/customers' },
   { id: 'leverantörer', label: 'Leverantörer', icon: Building2, href: '/suppliers' },
+  { id: 'kundfakturor', label: 'Kundfakturor', icon: ReceiptText, href: '/invoices', keywords: 'fakturor fakturering invoices kundfaktura' },
   { id: 'leverantörsfakturor', label: 'Leverantörsfakturor', icon: Wallet, href: '/supplier-invoices' },
   { id: 'bokföring', label: 'Bokföring', icon: BookOpen, href: '/bookkeeping', keywords: 'verifikat journal ledger' },
+  { id: 'kontoplan', label: 'Kontoplan', icon: ListTree, href: '/chart-of-accounts', keywords: 'kontoplan konton bas chart of accounts konto' },
   { id: 'anläggningstillgångar', label: 'Anläggningstillgångar', icon: Package, href: '/assets', keywords: 'tillgångar assets' },
   { id: 'rapporter', label: 'Rapporter', icon: BarChart3, href: '/reports' },
   { id: 'rapport-resultatrapport', label: 'Visa rapport: Resultatrapport', icon: BarChart3, href: '/reports/resultatrapport', keywords: 'rapport resultat intäkter kostnader' },
-  { id: 'rapport-balansrapport', label: 'Visa rapport: Balansrapport', icon: BarChart3, href: '/reports/balansrapport', keywords: 'rapport balans tillgångar skulder' },
-  { id: 'rapport-saldobalans', label: 'Visa rapport: Saldobalans', icon: BarChart3, href: '/reports/trial-balance', keywords: 'rapport saldobalans trial balance' },
+  { id: 'rapport-balansrapport', label: 'Visa rapport: Balansrapport', icon: BarChart3, href: '/reports/balansrapport', keywords: 'rapport balans tillgångar skulder saldo per konto' },
+  { id: 'rapport-saldobalans', label: 'Visa rapport: Saldobalans', icon: BarChart3, href: '/reports/trial-balance', keywords: 'rapport saldobalans trial balance saldo per konto' },
   { id: 'rapport-moms', label: 'Visa rapport: Momsdeklaration', icon: BarChart3, href: '/reports/vat-declaration', keywords: 'rapport moms vat deklaration' },
-  { id: 'rapport-huvudbok', label: 'Visa rapport: Huvudbok', icon: BookOpen, href: '/reports/huvudbok', keywords: 'rapport huvudbok ledger konto' },
+  { id: 'rapport-huvudbok', label: 'Visa rapport: Huvudbok', icon: BookOpen, href: '/reports/huvudbok', keywords: 'rapport huvudbok ledger general konto saldo transaktioner per konto kontoutdrag kontoanalys kontokort kontohistorik balance account statement transactions' },
   { id: 'rapport-kundreskontra', label: 'Visa rapport: Kundreskontra', icon: Users, href: '/reports/kundreskontra', keywords: 'rapport kundreskontra ar kundfordringar' },
+  { id: 'rapport-bankavstamning', label: 'Bankavstämning', hint: 'Stäm av bank mot bokföring', icon: ArrowLeftRight, href: '/reports/bank-reconciliation', keywords: 'avstämning stäm av bank matcha banktransaktioner reconcile reconciliation 1930' },
   { id: 'importera', label: 'Importera', icon: Upload, href: '/import' },
   { id: 'granskning', label: 'Granskning', icon: ClipboardCheck, href: '/pending', keywords: 'pending review' },
   { id: 'löner', label: 'Löner', icon: HandCoins, href: '/salary' },
@@ -70,12 +76,28 @@ function matches(entry: Entry, q: string): boolean {
   return q.split(/\s+/).filter(Boolean).every(t => hay.includes(t))
 }
 
-export default function CommandPalette() {
+export default function CommandPalette({ initialOpen = false }: { initialOpen?: boolean } = {}) {
   const router = useRouter()
-  const [open, setOpen] = useState(false)
+  // initialOpen: LazyCommandPalette mounts this component on the first ⌘K,
+  // so the palette must come up already open rather than waiting for a
+  // second keypress.
+  const [open, setOpen] = useState(initialOpen)
   const [query, setQuery] = useState('')
   const [activeIndex, setActiveIndex] = useState(0)
   const inputRef = useRef<HTMLInputElement>(null)
+  const { capabilities } = useCompany()
+
+  // Drop entries that jump to a paywalled extension workspace the active
+  // company can't reach (e.g. the AI-only Dokumentinkorg). The page itself is
+  // gated server-side; this keeps ⌘K from offering a dead destination.
+  const allowedByCapability = useMemo(() => {
+    return (entry: Entry) => {
+      const m = entry.href.match(/^\/e\/([^/]+)\/([^/?#]+)/)
+      if (!m) return true
+      const required = requiredCapabilityForExtension(m[1], m[2])
+      return !required || capabilities.includes(required)
+    }
+  }, [capabilities])
 
   function handleOpenChange(next: boolean) {
     setOpen(next)
@@ -105,28 +127,28 @@ export default function CommandPalette() {
 
   const q = query.trim().toLowerCase()
 
-  const filteredActions = useMemo(
-    () => (q ? ACTION_ENTRIES.filter(e => matches(e, q)) : ACTION_ENTRIES),
-    [q],
-  )
-  const filteredPages = useMemo(
-    () => (q ? PAGE_ENTRIES.filter(e => matches(e, q)) : PAGE_ENTRIES.slice(0, 6)),
-    [q],
-  )
+  const filteredActions = useMemo(() => {
+    const visible = ACTION_ENTRIES.filter(allowedByCapability)
+    return q ? visible.filter(e => matches(e, q)) : visible
+  }, [q, allowedByCapability])
+  const filteredPages = useMemo(() => {
+    const visible = PAGE_ENTRIES.filter(allowedByCapability)
+    return q ? visible.filter(e => matches(e, q)) : visible.slice(0, 6)
+  }, [q, allowedByCapability])
 
   const annaFallback: Entry | null = q && filteredActions.length === 0 && filteredPages.length === 0
     ? {
         id: 'anna-fallback',
         label: `Fråga Anna: "${query.trim()}"`,
         icon: Wand2,
-        href: `/chat?prompt=${encodeURIComponent(query.trim())}`,
+        href: `/chat/new?prompt=${encodeURIComponent(query.trim())}`,
       }
     : q
       ? {
           id: 'anna-followup',
           label: `Fråga Anna istället: "${query.trim()}"`,
           icon: Wand2,
-          href: `/chat?prompt=${encodeURIComponent(query.trim())}`,
+          href: `/chat/new?prompt=${encodeURIComponent(query.trim())}`,
         }
       : null
 

@@ -1,6 +1,6 @@
 'use client'
 
-import { Download, FileSpreadsheet, FileText } from 'lucide-react'
+import { Download, FileCode, FileSpreadsheet, FileText, Table } from 'lucide-react'
 import { useTranslations } from 'next-intl'
 import { Button } from '@/components/ui/button'
 import {
@@ -9,10 +9,15 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import type { ReportExportFormat } from '@/lib/reports/catalog'
+
+/**
+ * pdf/xlsx for reports; csv is additionally used by register exports; xml is the
+ * Skatteverket eSKD momsdeklaration file.
+ */
+export type ExportMenuFormat = 'pdf' | 'xlsx' | 'csv' | 'xml'
 
 export interface ReportExportItem {
-  format: ReportExportFormat
+  format: ExportMenuFormat
   href: string
 }
 
@@ -24,9 +29,14 @@ export interface ReportExportItem {
 export function ReportExportMenu({
   items,
   children,
+  size = 'sm',
+  variant = 'outline',
 }: {
   items?: ReportExportItem[]
   children?: React.ReactNode
+  size?: 'default' | 'sm'
+  /** Trigger style; the VAT Stegen page uses the primary pill. */
+  variant?: 'outline' | 'default'
 }) {
   const t = useTranslations('reports')
   const hasItems = !!items && items.length > 0
@@ -37,7 +47,7 @@ export function ReportExportMenu({
       {hasItems && (
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
-            <Button variant="outline" size="sm">
+            <Button variant={variant} size={size}>
               <Download className="h-4 w-4 mr-2" />
               {t('export')}
             </Button>
@@ -50,10 +60,20 @@ export function ReportExportMenu({
               >
                 {item.format === 'pdf' ? (
                   <FileText className="h-4 w-4 mr-2" />
+                ) : item.format === 'csv' ? (
+                  <Table className="h-4 w-4 mr-2" />
+                ) : item.format === 'xml' ? (
+                  <FileCode className="h-4 w-4 mr-2" />
                 ) : (
                   <FileSpreadsheet className="h-4 w-4 mr-2" />
                 )}
-                {item.format === 'pdf' ? t('download_pdf') : t('download_excel')}
+                {item.format === 'pdf'
+                  ? t('download_pdf')
+                  : item.format === 'csv'
+                    ? t('download_csv')
+                    : item.format === 'xml'
+                      ? t('download_xml')
+                      : t('download_excel')}
               </DropdownMenuItem>
             ))}
           </DropdownMenuContent>

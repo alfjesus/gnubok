@@ -1,61 +1,48 @@
-import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
-import { requireCompanyId } from '@/lib/company/context'
-import { requireWritePermission } from '@/lib/auth/require-write'
 import { ensureInitialized } from '@/lib/init'
 import { eventBus } from '@/lib/events/bus'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
 import { createLogger } from '@/lib/logger'
 import { syncInvoiceStatusFromPaymentEntry } from '@/lib/bookkeeping/payment-sync'
+import { withRouteContext } from '@/lib/api/with-route-context'
+import { validateBody } from '@/lib/api/validate'
+import { CreateJournalEntrySchema } from '@/lib/api/schemas'
+import { updateDraftEntry } from '@/lib/bookkeeping/engine'
+import { bookkeepingErrorResponse } from '@/lib/bookkeeping/errors'
 
 const logger = createLogger('journal-entries')
 
 ensureInitialized()
 
-export async function GET(
-  request: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
-  const { id } = await params
-  const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
+export const GET = withRouteContext<{ params: Promise<{ id: string }> }>(
+  'bookkeeping.journal_entry.get',
+  async (_request, { supabase, companyId }, { params }) => {
+    const { id } = await params
 
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
+    const { data, error } = await supabase
+      .from('journal_entries')
+      .select('*, lines:journal_entry_lines(*)')
+      .eq('id', id)
+      .eq('company_id', companyId)
+      .single()
 
-  const companyId = await requireCompanyId(supabase, user.id)
+    if (error) {
+      // PostgREST's "no rows" message is raw English; the user just needs to
+      // know the verifikat is gone (matches JOURNAL_ENTRY_NOT_FOUND registry).
+      return NextResponse.json(
+        { error: 'Verifikationen kunde inte hittas.' },
+        { status: 404 }
+      )
+    }
 
-  const { data, error } = await supabase
-    .from('journal_entries')
-    .select('*, lines:journal_entry_lines(*)')
-    .eq('id', id)
-    .eq('company_id', companyId)
-    .single()
+    return NextResponse.json({ data })
+  },
+)
 
-  if (error) {
-    return NextResponse.json({ error: error.message }, { status: 404 })
-  }
-
-  return NextResponse.json({ data })
-}
-
-export async function DELETE(
-  request: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
-  const { id } = await params
-  const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
-
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const writeCheck = await requireWritePermission(supabase, user.id)
-  if (!writeCheck.ok) return writeCheck.response
-
-  const companyId = await requireCompanyId(supabase, user.id)
+export const DELETE = withRouteContext<{ params: Promise<{ id: string }> }>(
+  'bookkeeping.journal_entry.delete',
+  async (_request, { supabase, companyId, user }, { params }) => {
+    const { id } = await params
 
   // Read source_type/source_id BEFORE deleting so we can revert the linked
   // invoice/supplier_invoice status afterwards. The GL row gets cancelled by
@@ -102,4 +89,36 @@ export async function DELETE(
   })
 
   return NextResponse.json({ data })
-}
+  },
+  { requireWrite: true },
+)
+
+/**
+ * PATCH: edit a DRAFT verifikat in place (header + lines). Only drafts are
+ * editable; updateDraftEntry rejects committed entries with a 409, and the DB
+ * immutability trigger is the backstop.
+ */
+export const PATCH = withRouteContext<{ params: Promise<{ id: string }> }>(
+  'bookkeeping.journal_entry.update',
+  async (request, { supabase, companyId, user }, { params }) => {
+    const { id } = await params
+    const validation = await validateBody(request, CreateJournalEntrySchema)
+    if (!validation.success) return validation.response
+
+    try {
+      const entry = await updateDraftEntry(supabase, companyId, user.id, id, validation.data)
+      return NextResponse.json({ data: entry })
+    } catch (err) {
+      const typed = bookkeepingErrorResponse(err)
+      if (typed) return typed
+      // Untyped errors map to Swedish via getErrorMessage: the raw message is
+      // logged here and must never reach the user verbatim (issue #337).
+      logger.error('failed to update draft journal entry', { entryId: id, error: err })
+      return NextResponse.json(
+        { error: getErrorMessage(err, { context: 'journal_entry' }) },
+        { status: 400 },
+      )
+    }
+  },
+  { requireWrite: true },
+)

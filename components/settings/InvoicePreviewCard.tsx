@@ -3,7 +3,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Eye } from 'lucide-react'
 import { useLocale, useTranslations } from 'next-intl'
-import { Button } from '@/components/ui/button'
 import {
   Dialog,
   DialogContent,
@@ -64,7 +63,7 @@ export function InvoicePreviewCard({ settings }: InvoicePreviewCardProps) {
         if (cancelled) return
 
         // Non-momsregistrerade säljare ska inte få en exempel-rad med 25 %
-        // VAT — förhandsvisningen är hårdkodad sample-data, inte ett val
+        // VAT: förhandsvisningen är hårdkodad sample-data, inte ett val
         // användaren gjort, så vi följer settings.vat_registered direkt här
         // (till skillnad från /invoices/new som låter användaren välja och
         // bara varnar vid submit).
@@ -128,11 +127,16 @@ export function InvoicePreviewCard({ settings }: InvoicePreviewCardProps) {
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
+      {/* Quiet header-action trigger (Fönster): the preview lives in the
+          section header's action slot, not as a card in the page flow. */}
       <DialogTrigger asChild>
-        <Button variant="outline">
-          <Eye className="h-4 w-4" />
+        <button
+          type="button"
+          className="inline-flex items-center gap-2 text-xs text-muted-foreground transition-colors duration-150 hover:text-foreground"
+        >
+          <Eye className="h-3.5 w-3.5" />
           {t('preview_button')}
-        </Button>
+        </button>
       </DialogTrigger>
       <DialogContent className="max-w-3xl">
         <DialogHeader>

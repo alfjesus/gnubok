@@ -3,7 +3,6 @@
 import { useState, useEffect } from 'react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
-import { Badge } from '@/components/ui/badge'
 import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import {
@@ -17,7 +16,9 @@ import {
   AlertTriangle,
 } from 'lucide-react'
 import { formatCurrency } from '@/lib/utils'
+import { summarizeByCurrency } from '@/lib/import/bank-file/currency-summary'
 import { createClient } from '@/lib/supabase/client'
+import { useCompany } from '@/contexts/CompanyContext'
 import type { BankFileParseResult } from '@/lib/import/bank-file/types'
 
 interface BankAccount {
@@ -41,16 +42,22 @@ export default function BankFileConfirmStep({
   const { transactions, stats, date_from, date_to, issues } = parseResult
   const refsCount = transactions.filter((t) => t.reference).length
   const warnings = issues.filter((i) => i.severity === 'warning')
+  // Same per-currency grouping as the preview step: parser-level totals sum
+  // across currencies, which misleads on Wise/camt.053 multi-currency files.
+  const currencyTotals = summarizeByCurrency(transactions)
 
   const [bankAccounts, setBankAccounts] = useState<BankAccount[]>([])
   const [selectedAccount, setSelectedAccount] = useState('1930')
+  const { company } = useCompany()
 
   useEffect(() => {
-    async function fetchBankAccounts() {
+    if (!company?.id) return
+    async function fetchBankAccounts(companyId: string) {
       const supabase = createClient()
       const { data } = await supabase
         .from('chart_of_accounts')
         .select('account_number, account_name')
+        .eq('company_id', companyId)
         .eq('is_active', true)
         .gte('account_number', '1900')
         .lte('account_number', '1999')
@@ -63,8 +70,8 @@ export default function BankFileConfirmStep({
         if (!has1930) setSelectedAccount(data[0].account_number)
       }
     }
-    fetchBankAccounts()
-  }, [])
+    fetchBankAccounts(company.id)
+  }, [company?.id])
 
   if (isLoading) {
     return (
@@ -103,7 +110,7 @@ export default function BankFileConfirmStep({
                 <FileText className="h-4 w-4" />
                 <span className="text-xs">Transaktioner</span>
               </div>
-              <p className="text-xl font-display font-medium tabular-nums">{stats.parsed_rows}</p>
+              <p className="text-xl font-display tabular-nums">{stats.parsed_rows}</p>
               {stats.skipped_rows > 0 && (
                 <p className="text-xs text-muted-foreground mt-1">
                   {stats.skipped_rows} rader hoppades över
@@ -117,7 +124,7 @@ export default function BankFileConfirmStep({
                 <span className="text-xs">Period</span>
               </div>
               <p className="text-sm font-medium">
-                {date_from} – {date_to}
+                {date_from}: {date_to}
               </p>
             </div>
 
@@ -125,18 +132,22 @@ export default function BankFileConfirmStep({
               <div className="flex items-center gap-2 text-muted-foreground mb-1">
                 <span className="text-xs">Inkomster</span>
               </div>
-              <p className="text-xl font-display font-medium tabular-nums">
-                {formatCurrency(stats.total_income)}
-              </p>
+              {(currencyTotals.length ? currencyTotals : [{ currency: 'SEK', total_income: 0, total_expenses: 0 }]).map((row) => (
+                <p key={row.currency} className="text-xl font-display tabular-nums">
+                  {formatCurrency(row.total_income, row.currency)}
+                </p>
+              ))}
             </div>
 
             <div className="p-4 bg-muted/50 rounded-lg">
               <div className="flex items-center gap-2 text-muted-foreground mb-1">
-                <span className="text-xs">Leverantörsfakturor</span>
+                <span className="text-xs">Utgifter</span>
               </div>
-              <p className="text-xl font-display font-medium tabular-nums">
-                {formatCurrency(stats.total_expenses)}
-              </p>
+              {(currencyTotals.length ? currencyTotals : [{ currency: 'SEK', total_income: 0, total_expenses: 0 }]).map((row) => (
+                <p key={row.currency} className="text-xl font-display tabular-nums">
+                  {formatCurrency(row.total_expenses, row.currency)}
+                </p>
+              ))}
             </div>
           </div>
 
@@ -169,17 +180,15 @@ export default function BankFileConfirmStep({
 
           {/* Additional info */}
           {refsCount > 0 && (
-            <div className="flex flex-wrap gap-2">
-              <Badge variant="outline" className="text-primary border-primary/30">
-                <Link2 className="mr-1 h-3 w-3" />
-                {refsCount} med OCR/referens
-              </Badge>
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <Link2 className="h-3 w-3" />
+              {refsCount} med OCR/referens
             </div>
           )}
         </CardContent>
       </Card>
 
-      {/* Skipped rows — surfaced here because the manual-mapping path skips the
+      {/* Skipped rows: surfaced here because the manual-mapping path skips the
           preview step where these warnings would otherwise be shown. */}
       {warnings.length > 0 && (
         <Card>

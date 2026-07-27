@@ -1,7 +1,6 @@
-import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
 import { generateJournalRegister } from '@/lib/reports/journal-register'
-import { requireCompanyId } from '@/lib/company/context'
+import { withRouteContext } from '@/lib/api/with-route-context'
 import {
   reportToWorkbook,
   textColumn,
@@ -9,6 +8,7 @@ import {
   dateColumn,
   xlsxFilename,
 } from '@/lib/reports/xlsx-export'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 interface FlatRow {
   voucher: string
@@ -28,16 +28,7 @@ function toDate(s: string): Date | null {
   return isNaN(d.getTime()) ? null : d
 }
 
-export async function GET(request: Request) {
-  const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
-
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const companyId = await requireCompanyId(supabase, user.id)
-
+export const GET = withRouteContext('report.journal_register.xlsx', async (request, { supabase, companyId }) => {
   const { searchParams } = new URL(request.url)
   const periodId = searchParams.get('period_id')
 
@@ -112,8 +103,8 @@ export async function GET(request: Request) {
     })
   } catch (err) {
     return NextResponse.json(
-      { error: err instanceof Error ? err.message : 'Kunde inte generera grundbok' },
+      { error: err instanceof Error ? getUserErrorMessage(err) : 'Kunde inte generera grundbok' },
       { status: 500 }
     )
   }
-}
+})

@@ -1,17 +1,12 @@
 import { NextResponse } from 'next/server'
-import {
-  createInvoicePaymentJournalEntry,
-  createInvoiceCashEntry,
-} from '@/lib/bookkeeping/invoice-entries'
-import { createJournalEntry, findFiscalPeriod } from '@/lib/bookkeeping/engine'
-import { resolveInvoicePaymentSourceType } from '@/lib/bookkeeping/propose-payment-lines'
-import { isBookkeepingError } from '@/lib/bookkeeping/errors'
 import { MarkInvoicePaidSchema } from '@/lib/api/schemas'
 import { ensureInitialized } from '@/lib/init'
 import { withRouteContext } from '@/lib/api/with-route-context'
 import { errorResponse, errorResponseFromCode } from '@/lib/errors/get-structured-error'
 import { findDuplicatePaymentCandidatesForInvoice } from '@/lib/invoices/duplicate-payment-candidates'
-import type { CreateJournalEntryInput, EntityType, Invoice } from '@/types'
+import { settleInvoicePayment } from '@/lib/invoices/settle-invoice-payment'
+import { roundOre } from '@/lib/money'
+import type { EntityType, Invoice } from '@/types'
 
 ensureInitialized()
 
@@ -22,6 +17,10 @@ ensureInitialized()
  *
  * Faktureringsmetoden (accrual): Debit 1930, Credit 1510 (clearing entry)
  * Kontantmetoden (cash):         Debit 1930, Credit 30xx, Credit 26xx
+ *
+ * The booking + status transition live in settleInvoicePayment (shared with
+ * the Stripe payment sync); this route owns request parsing, the payable
+ * guard, and the duplicate-payment advisory.
  */
 export const POST = withRouteContext(
   'invoice.mark_paid',
@@ -32,13 +31,33 @@ export const POST = withRouteContext(
 
     const { data: invoice, error: invoiceError } = await supabase
       .from('invoices')
-      .select('*, customer:customers(*), items:invoice_items(*)')
+      .select('*, customer:customers(*), items:invoice_items(*), credit_notes:invoices!credited_invoice_id(id, status, creation_complete)')
       .eq('id', id)
       .eq('company_id', companyId)
       .single()
 
     if (invoiceError || !invoice) {
       return errorResponseFromCode('INVOICE_PAID_NOT_FOUND', opLog, { requestId })
+    }
+
+    if (invoice.credited_invoice_id) {
+      return errorResponseFromCode('INVOICE_PAID_NOT_PAYABLE', opLog, {
+        requestId,
+        details: { reason: 'credit_note' },
+      })
+    }
+
+    const activeCreditNotes = ((invoice as { credit_notes?: Array<{
+      status: string
+      creation_complete?: boolean
+    }> }).credit_notes ?? []).filter(
+      (creditNote) => creditNote.status !== 'cancelled' && creditNote.creation_complete !== false,
+    )
+    if (activeCreditNotes.length > 0) {
+      return errorResponseFromCode('INVOICE_PAID_NOT_PAYABLE', opLog, {
+        requestId,
+        details: { reason: 'active_credit_note' },
+      })
     }
 
     if (invoice.status !== 'sent' && invoice.status !== 'overdue') {
@@ -58,7 +77,7 @@ export const POST = withRouteContext(
       const text = await request.text()
       if (text) rawBody = JSON.parse(text)
     } catch {
-      // Empty / invalid body — fall through to defaults.
+      // Empty / invalid body: fall through to defaults.
     }
 
     if (rawBody) {
@@ -88,12 +107,46 @@ export const POST = withRouteContext(
     // /api/supplier-invoices/[id]/mark-paid. The dialog always sends custom
     // lines, so the partial-payment skip is gated on total debit vs remaining,
     // not on the mere presence of customLines.
+    const invForRemaining = invoice as Invoice & {
+      remaining_amount?: number | null
+      paid_amount?: number | null
+    }
     const remainingAmount =
-      (invoice as Invoice & { remaining_amount?: number }).remaining_amount ?? invoice.total
+      invForRemaining.remaining_amount ?? invoice.total - (invForRemaining.paid_amount ?? 0)
     const paymentAmount = customLines
       ? customLines.reduce((s, l) => s + l.debit_amount, 0)
       : remainingAmount
-    const paidRounded = Math.round(paymentAmount * 100) / 100
+
+    // Unit contract: total / paid_amount / remaining_amount are stored in the
+    // INVOICE currency (total_sek carries the SEK view of total); custom lines
+    // are journal lines, so they are always SEK. The SEK amount therefore has
+    // to be converted before it is compared against, or subtracted from, the
+    // invoice-currency remaining. The default path (no lines) already pays the
+    // remaining in invoice currency and needs no rate at all.
+    const isForeignCurrency = !!invoice.currency && invoice.currency !== 'SEK'
+    const needsFxConversion = isForeignCurrency && customLines !== undefined
+    const fxRate =
+      invoice.exchange_rate && invoice.exchange_rate > 0 ? invoice.exchange_rate : null
+    if (needsFxConversion && fxRate === null) {
+      // Never fall back to rate 1: that reads an 11 496,70 kr payment against a
+      // 1 000 EUR invoice as 11 496,70 EUR and corrupts the AR sub-ledger.
+      // Same code as buildInvoicePaymentClearingLines' refusal
+      // (MATCH_INVOICE_BOOKING_RATE_MISSING, lib/bookkeeping/invoice-payment-lines.ts):
+      // one condition, one code across every invoice-settlement surface.
+      opLog.warn('mark-paid rejected: foreign-currency invoice without exchange rate', {
+        invoiceId: id,
+        currency: invoice.currency,
+      })
+      return errorResponseFromCode('MATCH_INVOICE_BOOKING_RATE_MISSING', opLog, {
+        requestId,
+        details: { invoice_id: id, currency: invoice.currency },
+      })
+    }
+    const paymentAmountInInvoiceCurrency = needsFxConversion
+      ? roundOre(paymentAmount / fxRate!)
+      : paymentAmount
+
+    const paidRounded = Math.round(paymentAmountInInvoiceCurrency * 100) / 100
     const remainingRounded = Math.round(remainingAmount * 100) / 100
     if (!force && paidRounded >= remainingRounded) {
       const customerName = (invoice as Invoice & { customer?: { name?: string } }).customer?.name
@@ -103,10 +156,23 @@ export const POST = withRouteContext(
           invoiceId: id,
         })
       } else {
+        // Invoice currency on purpose. The lookup scans transactions.amount,
+        // which is denominated in the BANK ROW's currency, not necessarily
+        // kronor; it therefore takes the payment in invoice currency plus the
+        // invoice's stored conversion and bands each currency separately.
+        // Handing it the raw SEK custom-line total would band a kronor figure
+        // against a EUR column (and vice versa).
         const candidates = await findDuplicatePaymentCandidatesForInvoice(supabase, {
           companyId: companyId!,
-          invoice: { invoice_number: invoice.invoice_number, customer_name: customerName },
-          paymentAmount,
+          invoice: {
+            invoice_number: invoice.invoice_number,
+            customer_name: customerName,
+            currency: invoice.currency ?? null,
+            total: invoice.total ?? null,
+            total_sek: invoice.total_sek ?? null,
+            exchange_rate: invoice.exchange_rate ?? null,
+          },
+          paymentAmount: paymentAmountInInvoiceCurrency,
           paymentDate,
         })
         if (candidates.length > 0) {
@@ -134,131 +200,51 @@ export const POST = withRouteContext(
     const accountingMethod = settings?.accounting_method || 'accrual'
     const entityType = (settings?.entity_type as EntityType) || 'enskild_firma'
 
-    // Drive the JE shape from the invoice's actual booking state, not from
-    // the current accounting_method setting. If the invoice was booked at
-    // send (Dr 1510 / Cr 30xx + VAT), the payment MUST clear 1510 —
-    // otherwise the receivable orphans and 30xx + VAT double-count. Only
-    // when there is no prior JE (pure kontantmetoden) do we recognise
-    // revenue + VAT here.
-    const invoiceAlreadyBooked = !!(invoice as { journal_entry_id?: string | null }).journal_entry_id
-    const useCashEntry = !invoiceAlreadyBooked && accountingMethod === 'cash'
+    // paymentAmountInInvoiceCurrency was resolved above, before the
+    // duplicate-payment guard, so the guard comparison and the ledger math run
+    // in the same unit as remaining_amount.
+    const result = await settleInvoicePayment(supabase, companyId!, user.id, {
+      invoice: invoice as Invoice & { customer?: { name?: string | null } | null },
+      paymentAmountInInvoiceCurrency,
+      paymentDate,
+      accountingMethod,
+      entityType,
+      exchangeRateDifference,
+      customLines,
+    })
 
-    const isRealInvoice = !invoice.document_type || invoice.document_type === 'invoice'
-    let journalEntryId: string | null = null
-
-    if (isRealInvoice) {
-      try {
-        if (customLines) {
-          const totalDebit = customLines.reduce((s, l) => s + l.debit_amount, 0)
-          const totalCredit = customLines.reduce((s, l) => s + l.credit_amount, 0)
-          if (Math.round((totalDebit - totalCredit) * 100) !== 0 || totalDebit <= 0) {
-            return errorResponseFromCode('INVOICE_PAID_LINES_UNBALANCED', opLog, {
-              requestId,
-              details: { totalDebit, totalCredit },
-            })
-          }
-
-          const fiscalPeriodId = await findFiscalPeriod(supabase, companyId!, paymentDate)
-          if (!fiscalPeriodId) {
-            return errorResponseFromCode('INVOICE_PAID_NO_FISCAL_PERIOD', opLog, {
-              requestId,
-              details: { paymentDate },
-            })
-          }
-          const sourceType = resolveInvoicePaymentSourceType({
-            invoiceAlreadyBooked,
-            accountingMethod,
+    if (!result.ok) {
+      switch (result.code) {
+        case 'BOOKKEEPING_ERROR':
+          return errorResponse(result.error, opLog, { requestId })
+        case 'UPDATE_FAILED':
+          opLog.error('failed to update invoice status', result.error as Error)
+          return errorResponse(result.error, opLog, { requestId })
+        case 'INVOICE_PAID_BOOK_FAILED':
+          opLog.error('failed to create payment journal entry', undefined, {
+            details: result.details,
           })
-          const input: CreateJournalEntryInput = {
-            fiscal_period_id: fiscalPeriodId,
-            entry_date: paymentDate,
-            description: invoice.customer?.name
-              ? `Inbetalning kundfaktura ${invoice.invoice_number}, ${invoice.customer.name}`
-              : `Inbetalning kundfaktura ${invoice.invoice_number}`,
-            source_type: sourceType,
-            source_id: invoice.id,
-            lines: customLines,
-          }
-          const journalEntry = await createJournalEntry(supabase, companyId!, user.id, input)
-          journalEntryId = journalEntry?.id ?? null
-        } else if (useCashEntry) {
-          const journalEntry = await createInvoiceCashEntry(
-            supabase, companyId!, user.id, invoice as Invoice, paymentDate,
-            entityType, invoice.customer?.name,
-          )
-          journalEntryId = journalEntry?.id ?? null
-        } else {
-          const journalEntry = await createInvoicePaymentJournalEntry(
-            supabase, companyId!, user.id, invoice as Invoice, paymentDate,
-            exchangeRateDifference, invoice.customer?.name,
-          )
-          journalEntryId = journalEntry?.id ?? null
-        }
-      } catch (err) {
-        if (isBookkeepingError(err)) {
-          return errorResponse(err, opLog, { requestId })
-        }
-        opLog.error('failed to create payment journal entry', err as Error)
-        return errorResponseFromCode('INVOICE_PAID_BOOK_FAILED', opLog, {
-          requestId,
-          details: { reason: err instanceof Error ? err.message : 'unknown' },
-        })
-      }
-    }
-
-    // CAS guard: only update if status is still in a payable state.
-    const { data: updateResult, error: updateError } = await supabase
-      .from('invoices')
-      .update({
-        status: 'paid',
-        paid_at: now,
-        paid_amount: invoice.total,
-      })
-      .eq('id', id)
-      .eq('company_id', companyId)
-      .in('status', ['sent', 'overdue'])
-      .select('id')
-
-    if (updateError) {
-      opLog.error('failed to update invoice status', updateError)
-      return errorResponse(updateError, opLog, { requestId })
-    }
-
-    if (!updateResult || updateResult.length === 0) {
-      // Status changed between read and write — cancel the orphaned JE and
-      // document the voucher gap before reporting back.
-      if (journalEntryId) {
-        const { data: orphan } = await supabase
-          .from('journal_entries')
-          .select('fiscal_period_id, voucher_series, voucher_number')
-          .eq('id', journalEntryId)
-          .single()
-
-        await supabase
-          .from('journal_entries')
-          .update({ status: 'cancelled' })
-          .eq('id', journalEntryId)
-
-        if (orphan) {
-          await supabase.from('voucher_gap_explanations').insert({
-            company_id: companyId,
-            fiscal_period_id: orphan.fiscal_period_id,
-            voucher_series: orphan.voucher_series || 'A',
-            gap_number: orphan.voucher_number,
-            explanation: 'Automatiskt makulerad: dubblettbokning förhindrad av samtidighetsskydd',
-            created_by: user.id,
+          return errorResponseFromCode(result.code, opLog, {
+            requestId,
+            details: result.details,
           })
-        }
+        case 'INVOICE_PAID_RACE':
+          return errorResponseFromCode(result.code, opLog, { requestId })
+        default:
+          return errorResponseFromCode(result.code, opLog, {
+            requestId,
+            details: result.details,
+          })
       }
-      return errorResponseFromCode('INVOICE_PAID_RACE', opLog, { requestId })
     }
 
     return NextResponse.json({
       success: true,
-      status: 'paid',
-      paid_at: now,
-      paid_amount: invoice.total,
-      journal_entry_id: journalEntryId,
+      status: result.newStatus,
+      paid_at: result.paidAt,
+      paid_amount: result.newPaidAmount,
+      remaining_amount: result.newRemaining,
+      journal_entry_id: result.journalEntryId,
     })
   },
   { requireWrite: true },

@@ -53,7 +53,7 @@ describe('generateK2IxbrlDocument', () => {
     expect(xhtml).toContain('se-cd-base:RakenskapsarSistaDag')
   })
 
-  it('emits the fastställelseintyg with checksum-exclusion wrapper and the magic date id (TA §4.4–4.5)', () => {
+  it('emits the fastställelseintyg with checksum-exclusion wrapper and the magic date id (TA §4.4-4.5)', () => {
     expect(xhtml).toContain('id="id-innehall-faststallelseintyg"')
     expect(xhtml).toContain('id="ID_DATUM_UNDERTECKNANDE_FASTSTALLELSEINTYG"')
     expect(xhtml).toContain('se-bol-base:ArsstammaIntygande')
@@ -82,6 +82,42 @@ describe('generateK2IxbrlDocument', () => {
     expect(xhtml).toMatch(/contextRef="balans1" name="se-gen-base:Tillgangar"[^>]*>253 000/)
   })
 
+  it('emits account 7833 depreciation and debit 2650 as the correct iXBRL facts', () => {
+    const balance = (account: string, name: string, debit: number, credit: number) => ({
+      account_number: account,
+      account_name: name,
+      closing_debit: debit,
+      closing_credit: credit,
+    })
+    const full = [
+      balance('1250', 'Computers', 50, 0),
+      balance('1259', 'Accumulated depreciation', 0, 10),
+      balance('1930', 'Bank', 75, 0),
+      balance('2081', 'Share capital', 0, 50),
+      balance('2099', 'Current-year result', 0, 90),
+      balance('2650', 'VAT settlement account', 25, 0),
+    ]
+    const preClosing = [
+      ...full.filter((row) => row.account_number !== '2099'),
+      balance('3010', 'Revenue', 0, 100),
+      balance('7833', 'Depreciation of computers', 10, 0),
+    ]
+    const mapping = mapTrialBalancesToK2({ full, preClosing }, null)
+    const input = makeInput()
+    input.rr = mapping.rr
+    input.br = mapping.br
+    input.totals = mapping.totals
+
+    const { xhtml: reportedAccountsXhtml } = generateK2IxbrlDocument(input)
+
+    expect(reportedAccountsXhtml).toMatch(
+      /name="se-gen-base:AvskrivningarNedskrivningarMateriellaImmateriellaAnlaggningstillgangar"[^>]*>10<\/ix:nonFraction>/,
+    )
+    expect(reportedAccountsXhtml).toMatch(
+      /name="se-gen-base:OvrigaFordringarKortfristiga"[^>]*>25<\/ix:nonFraction>/,
+    )
+  })
+
   it('tags the underskrifter tuple with per-signer dates (TA §2.9.1)', () => {
     expect(xhtml).toContain('se-gaap-ext:UnderskriftArsredovisningForetradareTuple')
     const tilltalsnamn = xhtml.match(/name="se-gen-base:UnderskriftHandlingTilltalsnamn"/g) ?? []
@@ -105,6 +141,15 @@ describe('generateK2IxbrlDocument', () => {
       /<ix:nonFraction contextRef="period0" name="se-gen-base:MedelantaletAnstallda" unitRef="antal-anstallda"/,
     )
     expect(xhtml).toContain('<xbrli:measure>se-k2-type:AntalAnstallda</xbrli:measure>')
+  })
+
+  it('tags the long-term debt disclosure instead of leaving the note as plain XHTML', () => {
+    expect(xhtml).toMatch(
+      /contextRef="balans0" name="se-gen-base:LangfristigaSkulderForfallerSenare5Ar"[^>]*>0<\/ix:nonFraction>/,
+    )
+    expect(xhtml).toContain('name="se-gen-base:NotStalldaSakerheter"')
+    expect(xhtml).toContain('name="se-gen-base:NotEventualforpliktelser"')
+    expect(xhtml).toContain('name="se-gen-base:NotUpplysningModerforetag"')
   })
 
   it('tags resultatdisposition (BÖR: förslag) consistently with BR', () => {
@@ -137,7 +182,7 @@ describe('generateK2IxbrlDocument', () => {
   })
 })
 
-describe('generateK2IxbrlDocument — dividend + first year variants', () => {
+describe('generateK2IxbrlDocument: dividend + first year variants', () => {
   it('tags förslag till utdelning when proposed (TA §2.9.2 BÖR)', () => {
     const input = makeInput()
     input.forvaltningsberattelse.resultatdisposition.utdelning = 50_000
@@ -146,7 +191,7 @@ describe('generateK2IxbrlDocument — dividend + first year variants', () => {
     expect(xhtml).toMatch(/name="se-gen-base:ForslagDispositionUtdelning"[^>]*>50 000/)
   })
 
-  it('tags fri överkursfond as its own concept in the disposition — identical to BR (TA §2.7.3)', () => {
+  it('tags fri överkursfond as its own concept in the disposition: identical to BR (TA §2.7.3)', () => {
     const input = makeInput()
     input.br['Overkursfond'] = { current: 50_000, previous: 50_000 }
     input.forvaltningsberattelse.resultatdisposition.overkursfond = 50_000
@@ -170,7 +215,7 @@ describe('generateK2IxbrlDocument — dividend + first year variants', () => {
 
   it('renders a deviating cost row WITHOUT the presentational minus (sign="-" carries the deviation)', () => {
     const input = makeInput()
-    // Net income on a cost line (credit balance on 5xxx) — deviating sign.
+    // Net income on a cost line (credit balance on 5xxx): deviating sign.
     input.rr['OvrigaExternaKostnader'] = { current: -5_000, previous: null }
     const { xhtml } = generateK2IxbrlDocument(input)
     expect(xhtml).toMatch(/name="se-gen-base:OvrigaExternaKostnader"[^>]*sign="-"/)
@@ -218,7 +263,7 @@ describe('generateK2IxbrlDocument — dividend + first year variants', () => {
   it('throws on unknown concepts instead of emitting invalid facts', () => {
     const input = makeInput()
     input.rr['PahittatBegrepp'] = { current: 1, previous: null }
-    // Unknown keys in rr are ignored (only mapped posts are rendered) — the
+    // Unknown keys in rr are ignored (only mapped posts are rendered): the
     // throw-path is covered via the writer itself in fact-writer tests.
     expect(() => generateK2IxbrlDocument(input)).not.toThrow()
   })

@@ -15,8 +15,27 @@ vi.mock('@/lib/rate-limits/inbox', () => ({
   checkInboxUploadRateLimit: vi.fn().mockResolvedValue({ ok: true }),
 }))
 
+// Paid AI OCR gate. Retry is an explicit "run AI now" action, so a company
+// without CAPABILITY.ai is hard-blocked (403). Default to entitled here;
+// capabilityBlockedResponse stays real so the 403 envelope is exercised.
+vi.mock('@/lib/entitlements/has-capability', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/entitlements/has-capability')>()
+  return { ...actual, hasCapability: vi.fn().mockResolvedValue(true) }
+})
+
+// The attachment download runs on the service-role client (the storage
+// SELECT policy is per-uploader-folder, and inbox documents are attributed
+// to the company creator, not the caller).
+const serviceDownloadMock = vi.fn()
+vi.mock('@/lib/supabase/server', () => ({
+  createServiceClient: () => ({
+    storage: { from: vi.fn(() => ({ download: serviceDownloadMock })) },
+  }),
+}))
+
 import { extractInvoiceFields } from '@/extensions/general/invoice-inbox/lib/extract-invoice-fields'
 import { checkInboxUploadRateLimit } from '@/lib/rate-limits/inbox'
+import { hasCapability } from '@/lib/entitlements/has-capability'
 
 function findRoute(method: string, path: string) {
   return invoiceInboxExtension.apiRoutes!.find(
@@ -62,6 +81,7 @@ const EXTRACTION_SUCCESS = {
 beforeEach(() => {
   vi.clearAllMocks()
   vi.mocked(checkInboxUploadRateLimit).mockResolvedValue({ ok: true })
+  vi.mocked(hasCapability).mockResolvedValue(true)
 })
 
 describe('POST /items/:id/retry-extraction', () => {
@@ -105,6 +125,21 @@ describe('POST /items/:id/retry-extraction', () => {
     expect(body.error).toMatch(/redan bokfört/i)
   })
 
+  it('hard-blocks with 403 capability_blocked when the company lacks the ai capability', async () => {
+    vi.mocked(hasCapability).mockResolvedValueOnce(false)
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({
+      data: { id: 'item-1', document_id: 'doc-1', correlation_id: null, created_supplier_invoice_id: null },
+      error: null,
+    }) // item lookup: the ai gate fires immediately after
+    const res = await retryRoute.handler(makeReq(), buildCtx(supabase))
+    const { status, body } = await parseJsonResponse<{ capability_blocked: boolean; capability: string }>(res)
+    expect(status).toBe(403)
+    expect(body.capability_blocked).toBe(true)
+    expect(body.capability).toBe('ai')
+    expect(extractInvoiceFields).not.toHaveBeenCalled()
+  })
+
   it('returns 400 when the item has no attached document', async () => {
     const { supabase, enqueue } = createQueuedMockSupabase()
     enqueue({
@@ -130,11 +165,9 @@ describe('POST /items/:id/retry-extraction', () => {
     })
     enqueue({ data: null, error: null }) // inbox update on success
 
-    supabase.storage.from = vi.fn().mockReturnValue({
-      download: vi.fn().mockResolvedValue({
-        data: new Blob([new Uint8Array([1, 2, 3])], { type: 'application/pdf' }),
-        error: null,
-      }),
+    serviceDownloadMock.mockResolvedValue({
+      data: new Blob([new Uint8Array([1, 2, 3])], { type: 'application/pdf' }),
+      error: null,
     })
 
     vi.mocked(extractInvoiceFields).mockResolvedValueOnce(EXTRACTION_SUCCESS as never)
@@ -158,11 +191,9 @@ describe('POST /items/:id/retry-extraction', () => {
     })
     enqueue({ data: null, error: null }) // error-state update
 
-    supabase.storage.from = vi.fn().mockReturnValue({
-      download: vi.fn().mockResolvedValue({
-        data: new Blob([new Uint8Array([1])], { type: 'application/pdf' }),
-        error: null,
-      }),
+    serviceDownloadMock.mockResolvedValue({
+      data: new Blob([new Uint8Array([1])], { type: 'application/pdf' }),
+      error: null,
     })
 
     vi.mocked(extractInvoiceFields).mockRejectedValueOnce(new Error('pdfjs blew up'))

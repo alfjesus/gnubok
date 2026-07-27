@@ -2,6 +2,7 @@
 
 import { useState, useCallback, useEffect } from 'react'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
+import { Badge } from '@/components/ui/badge'
 import { Progress } from '@/components/ui/progress'
 import { Button, buttonVariants } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -12,6 +13,7 @@ import { ConfirmationDialog } from '@/components/ui/confirmation-dialog'
 import Link from 'next/link'
 import { FallbackPrompt } from '@/components/ui/fallback-prompt'
 import { getBranding } from '@/lib/branding/service'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 const branding = getBranding()
 import {
@@ -40,10 +42,10 @@ import type { WorkspaceComponentProps } from '@/lib/extensions/workspace-registr
 
 type ArcimProvider = 'fortnox' | 'visma' | 'briox' | 'bokio' | 'bjornlunden'
 
-// `sieViaApi`: the provider serves its general ledger as SIE over the API —
+// `sieViaApi`: the provider serves its general ledger as SIE over the API:
 // no manual SIE upload needed. Deliberately duplicated from
 // extensions/general/arcim-migration/types.ts (core code must not import from
-// @/extensions/ — CI enforces it). Keep both lists in sync.
+// @/extensions/: CI enforces it). Keep both lists in sync.
 const ARCIM_PROVIDERS: { id: ArcimProvider; name: string; authType: 'oauth' | 'token'; sieViaApi: boolean }[] = [
   { id: 'fortnox', name: 'Fortnox', authType: 'oauth', sieViaApi: true },
   { id: 'visma', name: 'Visma', authType: 'oauth', sieViaApi: false },
@@ -55,7 +57,7 @@ const ARCIM_PROVIDERS: { id: ArcimProvider; name: string; authType: 'oauth' | 't
 /**
  * Extract a human-readable message from an API error body. Routes answer in
  * two shapes: legacy `{ error: 'text' }` and the structured envelope
- * `{ error: { code, message } }` — naively rendering the latter shows
+ * `{ error: { code, message } }`: naively rendering the latter shows
  * "[object Object]".
  */
 function apiErrorMessage(data: unknown, fallback: string): string {
@@ -66,6 +68,16 @@ function apiErrorMessage(data: unknown, fallback: string): string {
     if (typeof message === 'string' && message) return message
   }
   return fallback
+}
+
+/** Pull the structured error `code` from an envelope, if present. */
+function apiErrorCode(data: unknown): string | null {
+  const err = (data as { error?: unknown } | null)?.error
+  if (err && typeof err === 'object') {
+    const code = (err as { code?: unknown }).code
+    if (typeof code === 'string' && code) return code
+  }
+  return null
 }
 
 interface SkipReasons {
@@ -156,7 +168,7 @@ interface PreviewData {
 
 interface SIEFileStatus {
   fiscalYear: number
-  // Legacy field for older builds — read previousImport instead.
+  // Legacy field for older builds: read previousImport instead.
   alreadyImported: boolean
   importedAt: string | null
   // New (period-based) detection. When present, this fiscal year already has a
@@ -179,7 +191,7 @@ interface SIEData {
   newFileCount: number
   replacedFileCount?: number
   // Fiscal years whose provider export failed. Importing the remaining years
-  // anyway leaves an IB/UB gap — the options step warns before proceeding.
+  // anyway leaves an IB/UB gap: the options step warns before proceeding.
   failedYears?: { year: number; error: string }[]
   basAccounts: BASAccount[]
 }
@@ -244,14 +256,14 @@ function ProviderStep({
 
   return (
     <div className="space-y-4">
-      {/* SIE-required banner (not relevant for Fortnox/Briox — they fetch SIE via API) */}
+      {/* SIE-required banner (not relevant for Fortnox/Briox: they fetch SIE via API) */}
       {showSieRequiredBanner && (
         <div className="flex gap-3 rounded-lg border border-amber-500/30 bg-amber-500/5 p-4">
           <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-600 dark:text-amber-500" />
           <div className="min-w-0 flex-1">
             <p className="text-sm font-medium">SIE-import krävs först</p>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              Bokio och Visma hämtar endast kunder, leverantörer och fakturor via API:et. Bokföringsdata (kontoplan, verifikationer och balanser) måste importeras via SIE-fil först. Gäller inte Fortnox, Briox och Björn Lundén — där hämtar vi SIE direkt via API:et.
+              Bokio och Visma hämtar endast kunder, leverantörer och fakturor via API:et. Bokföringsdata (kontoplan, verifikationer och balanser) måste importeras via SIE-fil först. Gäller inte Fortnox, Briox och Björn Lundén: där hämtar vi SIE direkt via API:et.
             </p>
             <Link
               href="/import?mode=sie"
@@ -294,10 +306,10 @@ function ProviderStep({
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-2">
                         <p className="font-medium">{providerInfo?.name ?? consent.provider}</p>
-                        <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
+                        <Badge variant="success" className="gap-1">
                           <CheckCircle className="h-3 w-3" />
                           Ansluten
-                        </span>
+                        </Badge>
                       </div>
                       <div className="mt-0.5 space-y-0.5">
                         {consent.companyName && (
@@ -306,7 +318,7 @@ function ProviderStep({
                         {lastImport ? (
                           <p className="text-xs text-muted-foreground">
                             Senaste import: {new Date(lastImport.imported_at ?? lastImport.created_at).toLocaleDateString('sv-SE')}
-                            {lastImport.transactions_count != null && ` — ${lastImport.transactions_count} verifikationer`}
+                            {lastImport.transactions_count != null && `, ${lastImport.transactions_count} verifikationer`}
                           </p>
                         ) : (
                           <p className="text-xs text-muted-foreground">
@@ -374,7 +386,7 @@ function ProviderStep({
                 const comingSoon = COMING_SOON_PROVIDERS.has(provider.id)
                 const alreadyConnected = activeConsents.some(c => c.provider === provider.id)
                 // Providers without SIE-over-API only expose entity data
-                // (customers, suppliers, invoices) — the ledger must arrive via
+                // (customers, suppliers, invoices): the ledger must arrive via
                 // SIE upload first. Gate the connection entry until a completed
                 // SIE import exists so users don't authenticate into a flow that
                 // can't import anything yet. The /migrate route enforces this
@@ -385,10 +397,10 @@ function ProviderStep({
                   <button
                     key={provider.id}
                     disabled={isDisabled}
-                    className={`relative flex items-center gap-4 rounded-lg border p-4 text-left transition-all ${
+                    className={`relative flex items-center gap-4 rounded-lg border p-4 text-left transition-colors ${
                       isDisabled
                         ? 'cursor-not-allowed border-border/50 opacity-60'
-                        : 'border-border hover:border-primary/50 hover:bg-accent/50 active:scale-[0.98]'
+                        : 'border-border hover:border-primary/50 hover:bg-accent/50'
                     }`}
                     onClick={() => !isDisabled && onSelect(provider.id)}
                   >
@@ -401,19 +413,13 @@ function ProviderStep({
                       <div className="flex items-center gap-2">
                         <p className="font-medium">{provider.name}</p>
                         {comingSoon && (
-                          <span className="inline-flex items-center rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium text-muted-foreground">
-                            Kommer snart
-                          </span>
+                          <Badge variant="secondary">Kommer snart</Badge>
                         )}
                         {alreadyConnected && (
-                          <span className="inline-flex items-center rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
-                            Ansluten
-                          </span>
+                          <Badge variant="success">Ansluten</Badge>
                         )}
                         {needsSieFirst && !comingSoon && !alreadyConnected && (
-                          <span className="inline-flex items-center rounded-full bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-500">
-                            SIE krävs först
-                          </span>
+                          <Badge variant="warning">SIE krävs först</Badge>
                         )}
                       </div>
                       <p className="text-xs text-muted-foreground">
@@ -464,7 +470,7 @@ function ConnectStep({
   const [apiToken, setApiToken] = useState('')
   const [companyId, setCompanyId] = useState('')
 
-  // BL uses server-side client credentials — only needs company ID, no API key
+  // BL uses server-side client credentials: only needs company ID, no API key
   const isClientCredentials = provider === 'bjornlunden'
   const needsApiToken = !isClientCredentials
   // Briox: the account ID is the `clientid` half of the token exchange
@@ -549,7 +555,18 @@ function ConnectStep({
                   const h = 700
                   const left = window.screenX + (window.outerWidth - w) / 2
                   const top = window.screenY + (window.outerHeight - h) / 2
-                  window.open(authUrl, 'arcim-oauth', `width=${w},height=${h},left=${left},top=${top}`)
+                  const popup = window.open(authUrl, 'arcim-oauth', `width=${w},height=${h},left=${left},top=${top}`)
+                  if (!popup) {
+                    // Popup blocked: with the return value discarded, a blocked
+                    // popup looked exactly like a successful one (nothing opens,
+                    // nothing is said, the user clicks again). Fall back to the
+                    // full-page flow instead. The callback already supports it:
+                    // with no window.opener it redirects to
+                    // /import?migration=connected&consentId=..., which
+                    // handleOAuthReturn consumes and resumes the wizard at the
+                    // preview step. Same treatment as SkatteverketConnectPanel.
+                    window.location.href = authUrl
+                  }
                 }}
               >
                 Logga in i {providerName}
@@ -632,12 +649,18 @@ function PreviewStep({
   preview,
   isLoading,
   error,
+  authExpired,
+  licenseMissing,
+  onReconnect,
   onContinue,
   onBack,
 }: {
   preview: PreviewData | null
   isLoading: boolean
   error: string | null
+  authExpired: boolean
+  licenseMissing: boolean
+  onReconnect: () => void
   onContinue: () => void
   onBack: () => void
 }) {
@@ -663,13 +686,26 @@ function PreviewStep({
             <>
               <div className="flex gap-3 rounded-lg border border-destructive/20 bg-destructive/10 p-4">
                 <AlertCircle className="mt-0.5 h-5 w-5 shrink-0 text-destructive" />
-                <p className="text-sm text-muted-foreground">{error}</p>
+                <div className="space-y-3">
+                  <p className="text-sm text-muted-foreground">{error}</p>
+                  {authExpired && (
+                    <Button size="sm" className="min-h-9" onClick={onReconnect} disabled={isLoading}>
+                      <RotateCcw className="mr-2 h-4 w-4" />
+                      Återanslut {providerName}
+                    </Button>
+                  )}
+                </div>
               </div>
-              <FallbackPrompt
-                message="Du kan också importera din bokföringsdata manuellt via en SIE-fil."
-                linkHref="/import?mode=sie"
-                linkLabel="Ladda upp SIE-fil"
-              />
+              {/* License-missing keeps the SIE fallback visible: re-auth loops
+                  until the customer re-orders the Fortnox Integration license,
+                  so a manual SIE import is the reliable escape hatch. */}
+              {(!authExpired || licenseMissing) && (
+                <FallbackPrompt
+                  message="Du kan också importera din bokföringsdata manuellt via en SIE-fil."
+                  linkHref="/import?mode=sie"
+                  linkLabel="Ladda upp SIE-fil"
+                />
+              )}
             </>
           )}
 
@@ -743,7 +779,7 @@ function InfoItem({ label, value }: { label: string; value: string | null }) {
   return (
     <div>
       <p className="text-xs text-muted-foreground">{label}</p>
-      <p className="text-sm font-medium">{value || '—'}</p>
+      <p className="text-sm font-medium">{value || '-'}</p>
     </div>
   )
 }
@@ -891,7 +927,7 @@ function OptionsStep({
 
           {sieAvailable && (
             <>
-              {/* Years whose provider export failed — must be visible before
+              {/* Years whose provider export failed: must be visible before
                   the user proceeds, otherwise an IB/UB gap slips through. */}
               {failedYears.length > 0 && (
                 <div className="rounded-md border border-amber-500/30 bg-amber-50/50 p-3 dark:bg-amber-950/20">
@@ -921,7 +957,7 @@ function OptionsStep({
                   replacedFileCount > 0 && newFileCount > 0
                     ? `${newFileCount} nya och ${replacedFileCount} uppdaterade räkenskapsår`
                     : replacedFileCount > 0
-                      ? `${replacedFileCount} räkenskapsår med uppdaterad data — tidigare import ersätts`
+                      ? `${replacedFileCount} räkenskapsår med uppdaterad data: tidigare import ersätts`
                       : newFileCount > 0
                         ? `${newFileCount} ny(a) räkenskapsår att importera`
                         : 'Kontoplan, ingående balanser och verifikationer'
@@ -938,7 +974,7 @@ function OptionsStep({
                         <>
                           <RefreshCw className="h-3.5 w-3.5 text-amber-500" />
                           <span className="text-muted-foreground">
-                            Räkenskapsår {fs.fiscalYear} — ersätter tidigare import
+                            Räkenskapsår {fs.fiscalYear}: ersätter tidigare import
                             {fs.previousImport.importedAt
                               ? ` från ${new Date(fs.previousImport.importedAt).toLocaleDateString('sv-SE')}`
                               : ''}
@@ -947,7 +983,7 @@ function OptionsStep({
                       ) : (
                         <>
                           <Calendar className="h-3.5 w-3.5 text-primary" />
-                          <span className="font-medium">Räkenskapsår {fs.fiscalYear} — ny data att importera</span>
+                          <span className="font-medium">Räkenskapsår {fs.fiscalYear}: ny data att importera</span>
                         </>
                       )}
                     </div>
@@ -1150,6 +1186,9 @@ function getFYStatus(r: ImportResult): { icon: 'success' | 'warning' | 'error'; 
   if (r.errors.length > 0 || (r.details?.skippedVouchers && r.details.skippedVouchers.total > 0)) {
     return { icon: 'warning', label: 'Delvis importerad' }
   }
+  if (r.details?.untransferredResults && r.details.untransferredResults.length > 0) {
+    return { icon: 'warning', label: 'Importerad med varning' }
+  }
   return { icon: 'success', label: 'Importerad' }
 }
 
@@ -1170,7 +1209,7 @@ function FiscalYearResult({ result, index }: { result: ImportResult; index: numb
 
   return (
     <div className="rounded-lg border border-border">
-      {/* Header — always visible */}
+      {/* Header: always visible */}
       <button
         type="button"
         onClick={() => setExpanded(!expanded)}
@@ -1211,7 +1250,7 @@ function FiscalYearResult({ result, index }: { result: ImportResult; index: numb
       {/* Expanded details */}
       {expanded && (
         <div className="border-t border-border px-4 pb-4 pt-3 space-y-3">
-          {/* Errors — shown prominently */}
+          {/* Errors: shown prominently */}
           {result.errors.length > 0 && (
             <div className="rounded-md border border-destructive/20 bg-destructive/5 p-3">
               <div className="flex items-start gap-2">
@@ -1240,7 +1279,7 @@ function FiscalYearResult({ result, index }: { result: ImportResult; index: numb
                       <>
                         Differens på <span className="tabular-nums font-medium">{Math.abs(d.openingBalance.imbalance).toLocaleString('sv-SE', { minimumFractionDigits: 2 })} SEK</span> bokförd
                         på konto {d.openingBalance.bookedToAccount}. Detta beror troligen på att föregående
-                        års resultat inte allokerats till eget kapital i källsystemet — vanligt vid byte
+                        års resultat inte allokerats till eget kapital i källsystemet, vanligt vid byte
                         av bokföringsprogram.
                       </>
                     )}
@@ -1329,6 +1368,61 @@ function FiscalYearResult({ result, index }: { result: ImportResult; index: numb
               </div>
             </div>
           )}
+
+          {/* Untransferred prior-year results — omföring av årets resultat saknas */}
+          {d?.untransferredResults && d.untransferredResults.length > 0 && (
+            <div className="rounded-md border border-amber-200 bg-amber-50/50 p-3 dark:border-amber-900/30 dark:bg-amber-950/20">
+              <div className="flex items-start gap-2">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
+                <div>
+                  <p className="text-sm font-medium text-amber-700 dark:text-amber-400">
+                    Årets resultat är inte omfört till eget kapital
+                  </p>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    Följande räkenskapsår saknar omföring av årets resultat. Senare års
+                    balansräkning visar en differens på beloppet tills omföringen bokförs
+                    (konto 8999 mot eget kapital, t.ex. 2099) i respektive år.
+                  </p>
+                  <div className="mt-2 space-y-1 text-sm text-muted-foreground tabular-nums">
+                    {d.untransferredResults.map((u) => (
+                      <div key={u.fiscal_period_id} className="flex justify-between gap-6">
+                        <span>{u.period_name}</span>
+                        <span className="font-medium">
+                          {u.pl_net.toLocaleString('sv-SE', { minimumFractionDigits: 2 })} SEK
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Remaining warnings — previously dropped entirely in this flow.
+              Strings covered by structured cards above are filtered out. */}
+          {(() => {
+            const remainingWarnings = result.warnings.filter(
+              (w) =>
+                !(d?.skippedVouchers && d.skippedVouchers.total > 0 && w.includes('hoppades över')) &&
+                !(d?.untransferredResults && d.untransferredResults.length > 0 && w.includes('förts om till eget kapital'))
+            )
+            if (remainingWarnings.length === 0) return null
+            return (
+              <div className="rounded-md border border-amber-200 bg-amber-50/50 p-3 dark:border-amber-900/30 dark:bg-amber-950/20">
+                <div className="flex items-start gap-2">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
+                  <div className="space-y-1.5">
+                    <p className="text-sm font-medium text-amber-700 dark:text-amber-400">
+                      {remainingWarnings.length === 1 ? '1 varning' : `${remainingWarnings.length} varningar`}
+                    </p>
+                    {remainingWarnings.map((w, i) => (
+                      <p key={i} className="text-sm text-muted-foreground">{w}</p>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )
+          })()}
 
           {/* Retry info (only shown if retries happened) */}
           {d && d.retriedBatches > 0 && (
@@ -1419,7 +1513,7 @@ function ResultStep({
       {/* ── Header card with overall summary ── */}
       <Card>
         <CardHeader>
-          <CardTitle className="flex items-center gap-2.5">
+          <CardTitle className="flex items-center gap-2">
             <StatusIcon status={nothingNew ? 'success' : overallIcon} />
             {nothingNew ? 'Allt är uppdaterat' :
              anySieFailed ? 'Migrering delvis genomförd' :
@@ -1638,7 +1732,7 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
   const [isLoading, setIsLoading] = useState(false)
   const [isLoadingStatus, setIsLoadingStatus] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  // Per-item details behind `error` — e.g. the SIE validation errors from
+  // Per-item details behind `error`: e.g. the SIE validation errors from
   // /sie-data, which would otherwise be swallowed (the envelope's `error`
   // field is just the string "validation").
   const [errorDetails, setErrorDetails] = useState<string[] | null>(null)
@@ -1654,6 +1748,14 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
 
   // Preview state
   const [preview, setPreview] = useState<PreviewData | null>(null)
+  // Set when a preview/sync fails because the provider connection expired
+  // (dead refresh token → PROVIDER_AUTH_EXPIRED). Drives the "Återanslut"
+  // affordance so the user can re-authorize in place instead of disconnecting.
+  const [authExpired, setAuthExpired] = useState(false)
+  // Set when the failure is specifically a missing/inactive Fortnox integration
+  // license (PROVIDER_LICENSE_MISSING). Re-auth alone can't fix it, so the SIE
+  // fallback stays available alongside the "Återanslut" CTA.
+  const [licenseMissing, setLicenseMissing] = useState(false)
 
   // SIE data state (held between mapping and execution steps)
   const [sieData, setSieData] = useState<SIEData | null>(null)
@@ -1667,7 +1769,7 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
   const [migrationResults, setMigrationResults] = useState<MigrationResults | null>(null)
   const [sieImportResults, setSieImportResults] = useState<ImportResult[]>([])
 
-  // Wizard progress — only user-interactive steps
+  // Wizard progress: only user-interactive steps
   const userSteps = STEPS.filter(s => {
     if (s === 'migrating' || s === 'result') return false
     if (s === 'mapping' && !preview?.sieAvailable) return false
@@ -1690,7 +1792,7 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
         setConnectionStatus(data)
       }
     } catch {
-      // Non-critical — just means we can't show existing connections
+      // Non-critical: just means we can't show existing connections
     } finally {
       setIsLoadingStatus(false)
     }
@@ -1707,24 +1809,37 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
     setStep('preview')
     setIsLoading(true)
     setError(null)
+    setAuthExpired(false)
+    setLicenseMissing(false)
+    setConsentId(cId)
 
     try {
       const res = await fetch(`/api/extensions/ext/arcim-migration/preview?consentId=${cId}`)
       if (!res.ok) {
         const data = await res.json().catch(() => ({}))
+        // A dead connection (expired/revoked refresh token) is recoverable in
+        // place: flag it so the UI offers "Återanslut" instead of a dead end.
+        // A missing Fortnox integration license shows the same CTA but keeps the
+        // SIE fallback, because re-auth loops until the license is re-ordered.
+        const code = apiErrorCode(data)
+        if (code === 'PROVIDER_AUTH_EXPIRED' || code === 'PROVIDER_LICENSE_MISSING') {
+          setAuthExpired(true)
+        }
+        if (code === 'PROVIDER_LICENSE_MISSING') {
+          setLicenseMissing(true)
+        }
         throw new Error(apiErrorMessage(data, `HTTP ${res.status}`))
       }
 
       const data = await res.json()
       setPreview(data)
-      setConsentId(cId)
 
       // If SIE is not available, disable SIE import by default
       if (!data.sieAvailable) {
         setMigrationOptions(prev => ({ ...prev, importSIEData: false }))
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Kunde inte hämta förhandsgranskning')
+      setError(err instanceof Error ? getUserErrorMessage(err) : 'Kunde inte hämta förhandsgranskning')
     } finally {
       setIsLoading(false)
     }
@@ -1753,7 +1868,7 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
       setAuthType(data.authType)
 
       if (data.alreadyConnected) {
-        // Existing connection — skip auth, go straight to preview
+        // Existing connection: skip auth, go straight to preview
         await loadPreview(data.consentId)
         return
       }
@@ -1763,13 +1878,13 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
       }
       // Token-based providers stay on connect step for credential input
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Anslutning misslyckades')
+      setError(err instanceof Error ? getUserErrorMessage(err) : 'Anslutning misslyckades')
     } finally {
       setIsLoading(false)
     }
   }, [loadPreview])
 
-  // Re-sync with existing consent — go straight to preview
+  // Re-sync with existing consent: go straight to preview
   const handleResync = useCallback(async (provider: ArcimProvider, existingConsentId: string) => {
     setSelectedProvider(provider)
     setConsentId(existingConsentId)
@@ -1779,6 +1894,76 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
     setSieData(null)
     await loadPreview(existingConsentId)
   }, [loadPreview])
+
+  // Re-authorize a dead connection in place. Re-runs provider auth against the
+  // SAME consent so fresh tokens overwrite the expired pair: no disconnect.
+  // OAuth providers open the login popup (the existing postMessage listener
+  // reloads the preview on success); token providers drop to the credential
+  // form. Triggered from the "Återanslut" CTA after a sync hits
+  // PROVIDER_AUTH_EXPIRED.
+  const handleReconnect = useCallback(async (provider: ArcimProvider, existingConsentId: string) => {
+    setError(null)
+    setAuthExpired(false)
+    setLicenseMissing(false)
+    setIsLoading(true)
+    setSelectedProvider(provider)
+
+    // Pre-open the OAuth popup inside the click's user activation: opening it
+    // after the fetch below is popup-blocked when the response is slow (the
+    // activation expires after ~5s). Kept open only for OAuth providers; the
+    // token path and every failure path close it again. The opener reference
+    // stays intact: the provider popup posts back via postMessage.
+    const w = 600
+    const h = 700
+    const left = window.screenX + (window.outerWidth - w) / 2
+    const top = window.screenY + (window.outerHeight - h) / 2
+    const popup = window.open('', 'arcim-oauth', `width=${w},height=${h},left=${left},top=${top}`)
+
+    try {
+      const res = await fetch('/api/extensions/ext/arcim-migration/connect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider, reconnect: true }),
+      })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(apiErrorMessage(data, `HTTP ${res.status}`))
+      }
+
+      const data = await res.json()
+      setConsentId(data.consentId ?? existingConsentId)
+      setAuthType(data.authType)
+
+      if (data.authType === 'oauth' && data.authUrl) {
+        if (popup && !popup.closed) {
+          popup.location.href = data.authUrl
+        } else {
+          // The pre-opened popup was blocked or closed; retrying here is a
+          // long shot (the activation may be gone) but strictly better than
+          // dropping the flow. If the retry is blocked too, take the same
+          // full-page fallback as the first-connect button rather than leaving
+          // "Återanslut" looking like it worked.
+          const retry = window.open(data.authUrl, 'arcim-oauth', `width=${w},height=${h},left=${left},top=${top}`)
+          if (!retry) {
+            window.location.href = data.authUrl
+          }
+        }
+        setAuthUrl(data.authUrl)
+      } else {
+        popup?.close()
+        if (data.authType === 'token') {
+          // Re-enter credentials for token-based providers
+          setStep('connect')
+        }
+      }
+    } catch (err) {
+      popup?.close()
+      setError(err instanceof Error ? getUserErrorMessage(err) : 'Kunde inte återansluta')
+      setAuthExpired(true)
+    } finally {
+      setIsLoading(false)
+    }
+  }, [])
 
   // Disconnect an existing consent
   const handleDisconnect = useCallback(async (consentIdToDelete: string) => {
@@ -1795,7 +1980,7 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
       toast({ title: 'Frånkopplad', description: 'Anslutningen har tagits bort.' })
       await fetchStatus()
     } catch (err) {
-      toast({ title: err instanceof Error ? err.message : 'Något gick fel', variant: 'destructive' })
+      toast({ title: err instanceof Error ? getUserErrorMessage(err) : 'Något gick fel', variant: 'destructive' })
     }
   }, [toast, fetchStatus])
 
@@ -1823,10 +2008,10 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
         throw new Error(apiErrorMessage(data, `HTTP ${res.status}`))
       }
 
-      // Token stored — consent is now accepted, proceed to preview
+      // Token stored: consent is now accepted, proceed to preview
       await loadPreview(consentId)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Kunde inte ansluta')
+      setError(err instanceof Error ? getUserErrorMessage(err) : 'Kunde inte ansluta')
     } finally {
       setIsLoading(false)
     }
@@ -1927,7 +2112,7 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
         setStep('options')
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Kunde inte hämta SIE-data')
+      setError(err instanceof Error ? getUserErrorMessage(err) : 'Kunde inte hämta SIE-data')
     } finally {
       setIsLoading(false)
     }
@@ -1938,7 +2123,7 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
       // Load SIE data for mapping step
       loadSIEData()
     } else {
-      // Skip mapping step — no SIE available
+      // Skip mapping step: no SIE available
       setStep('options')
     }
   }, [preview, loadSIEData])
@@ -1990,7 +2175,7 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
         for (let i = 0; i < filesToImport.length; i++) {
           const progress = 10 + Math.round((i / filesToImport.length) * 40)
           setMigrationProgress(progress)
-          setMigrationStep(`Importerar bokföringsdata (SIE) — fil ${i + 1} av ${filesToImport.length}...`)
+          setMigrationStep(`Importerar bokföringsdata (SIE): fil ${i + 1} av ${filesToImport.length}...`)
 
           const res = await fetch('/api/extensions/ext/arcim-migration/import-sie', {
             method: 'POST',
@@ -2016,7 +2201,7 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
           setSieImportResults(prev => [...prev, result])
 
           // The endpoint returns HTTP 200 with success:false when the import
-          // itself failed (e.g. räkenskapsår mismatch). Stop here — continuing
+          // itself failed (e.g. räkenskapsår mismatch). Stop here: continuing
           // to /migrate would hit its SIE-guard, whose "SIE måste importeras
           // först" message masks the real error.
           if (!result.success) {
@@ -2077,7 +2262,7 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
         description: 'Din bokföringsdata har importerats.',
       })
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Migrering misslyckades'
+      const msg = getUserErrorMessage(err)
       setError(msg)
       setStep('result')
     }
@@ -2104,7 +2289,7 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
 
   return (
     <div className="space-y-6">
-      {/* Progress bar — only during interactive steps */}
+      {/* Progress bar: only during interactive steps */}
       {step !== 'provider' && isInteractiveStep && (
         <Card>
           <CardContent className="pt-6">
@@ -2163,6 +2348,11 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
           preview={preview}
           isLoading={isLoading}
           error={error}
+          authExpired={authExpired}
+          licenseMissing={licenseMissing}
+          onReconnect={() => {
+            if (selectedProvider && consentId) handleReconnect(selectedProvider, consentId)
+          }}
           onContinue={handlePreviewContinue}
           onBack={() => setStep('provider')}
         />

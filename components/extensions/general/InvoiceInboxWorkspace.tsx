@@ -1,11 +1,20 @@
 'use client'
 
 import { useState, useCallback, useEffect, useRef, useMemo } from 'react'
+import { useTranslations } from 'next-intl'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
+import { AttnLine } from '@/components/ui/attn-line'
+import AiFilledIndicator from '@/components/ui/ai-filled-indicator'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { useToast } from '@/components/ui/use-toast'
 import {
   Inbox,
@@ -24,15 +33,26 @@ import {
   Search,
   Circle,
   X,
+  ChevronDown,
+  Sparkles,
 } from 'lucide-react'
 import Link from 'next/link'
 import { cn, formatCurrency } from '@/lib/utils'
 import { createClient } from '@/lib/supabase/client'
+import { fetchWithTimeout } from '@/lib/http/fetch-with-timeout'
+import { copyInboxAddress, type AddressCopyState } from '@/components/extensions/general/inbox-address-copy'
+import { useCapability } from '@/contexts/CompanyContext'
+import { CAPABILITY } from '@/lib/entitlements/keys'
 import type { WorkspaceComponentProps } from '@/lib/extensions/workspace-registry'
 import type { InvoiceExtractionResult } from '@/types'
 import BookDirectlyDialog from '@/components/extensions/general/BookDirectlyDialog'
+import NewSupplierInvoiceDialog from '@/components/supplier-invoices/NewSupplierInvoiceDialog'
+import BulkBookInboxDialog from '@/components/extensions/general/BulkBookInboxDialog'
+// InboxCustomDomainDialog (egen domän) is built but gated off: see
+// INBOX_CUSTOM_DOMAINS_ENABLED in extensions/general/invoice-inbox/index.ts.
 import TransactionMatchPicker from '@/components/inbox/TransactionMatchPicker'
 import { useAgentSheet } from '@/components/agent/AgentSheetProvider'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 type AccountingMethod = 'accrual' | 'cash'
 
@@ -53,7 +73,7 @@ interface InboxItem {
   created_supplier_invoice_id: string | null
   created_journal_entry_id: string | null
   error_message: string | null
-  // True when AI extraction was skipped — either because the upload caller
+  // True when AI extraction was skipped: either because the upload caller
   // passed skip_extraction=true (MCP/agent path) or because the server's
   // page-count gate skipped a PDF above the auto-extract limit (issue #553).
   // Distinct from status='error' (extraction failed) and from extracted_data
@@ -70,6 +90,20 @@ interface InboxAddress {
   local_part: string
   status: string
 }
+
+// How far the underlag behind the selected row got.
+//
+// `none` is the only state that may claim "Inget underlag bifogat": it means the
+// row carries no document_id at all. A failed or hung metadata read is `error`,
+// never `none`: the document exists (the row points at it), we just could not
+// load it, and telling the user their underlag is missing invites a duplicate
+// upload or the conclusion that the receipt is gone (BFL 7 kap 2 § retention).
+type DocumentLoadState = 'none' | 'loading' | 'ready' | 'error'
+
+// A signed-URL lookup is one indexed row plus a storage sign call: seconds at
+// worst, even on a cold start. 15s leaves several times that headroom while
+// still ending the spinner instead of leaving it turning forever.
+const DOCUMENT_FETCH_TIMEOUT_MS = 15_000
 
 // ── Helpers ──────────────────────────────────────────────────
 
@@ -97,12 +131,30 @@ function pickSupplierName(item: InboxItem): string | null {
   return item.extracted_data?.supplier?.name ?? null
 }
 
+// True when extraction produced at least one usable field. Distinguishes a
+// deterministically-parsed underlag (fields present: render the editable
+// list) from an item whose extracted_data is null/empty (AI never ran, or ran
+// and found nothing). Currency is ignored because emptyExtraction() seeds it
+// to 'SEK', so it is never a sign that extraction actually happened.
+function hasAnyExtractedField(data: InvoiceExtractionResult | null): boolean {
+  if (!data) return false
+  const s = data.supplier
+  const inv = data.invoice
+  const t = data.totals
+  return Boolean(
+    s?.name || s?.orgNumber || s?.vatNumber || s?.bankgiro || s?.plusgiro ||
+    inv?.invoiceNumber || inv?.invoiceDate || inv?.dueDate || inv?.paymentReference ||
+    t?.subtotal != null || t?.vatAmount != null || t?.total != null ||
+    (data.lineItems?.length ?? 0) > 0 || (data.vatBreakdown?.length ?? 0) > 0
+  )
+}
+
 // Lifecycle stage of an inbox item. Single source of truth shared by the list
 // filter, the count pills, and the row icons so they never drift apart.
 //
 // Precedence mirrors the FieldsRail: a booked item (supplier invoice OR a
 // direct journal entry) is done and drops out of the active inbox. A
-// matched-but-unbooked item is "linked" — it STAYS in the inbox as its own
+// matched-but-unbooked item is "linked": it STAYS in the inbox as its own
 // category because the bank payment still needs booking (a document attached
 // to a transaction is not the same as a booked one). An extraction failure is
 // "error"; everything else needs a first action.
@@ -122,7 +174,7 @@ function deriveInboxStatus(item: InboxItem): InboxStatus {
 
 function WorkspaceSkeleton() {
   return (
-    <div className="h-[calc(100vh-1px)] p-4 md:p-6">
+    <div className="h-[calc(100vh-1px)] md:h-full p-4 md:p-6">
       <div className="h-full flex flex-col rounded-lg border bg-card overflow-hidden">
         <header className="flex items-center justify-between gap-4 border-b px-4 py-2.5">
           <div className="flex items-center gap-2 min-w-0">
@@ -132,8 +184,8 @@ function WorkspaceSkeleton() {
           </div>
           <Skeleton className="h-8 w-28 shrink-0" />
         </header>
-        <div className="flex-1 grid grid-cols-1 md:grid-cols-[240px_minmax(0,1fr)_320px] lg:grid-cols-[280px_minmax(0,1fr)_340px] min-h-0">
-          <aside className="border-r overflow-hidden bg-muted/20 pt-3">
+        <div className="flex-1 grid grid-cols-1 xl:grid-cols-[280px_minmax(0,1fr)_340px] min-h-0">
+          <aside className="border-b xl:border-b-0 xl:border-r overflow-hidden bg-muted/20 pt-3">
             <div className="px-3 pb-3 space-y-2 border-b">
               <Skeleton className="h-8 w-full" />
               <div className="flex flex-wrap gap-1">
@@ -158,8 +210,8 @@ function WorkspaceSkeleton() {
               ))}
             </ul>
           </aside>
-          <main className="overflow-hidden bg-muted/10 hidden md:block" />
-          <aside className="border-l overflow-hidden hidden md:block" />
+          <main className="overflow-hidden bg-muted/10 hidden xl:block" />
+          <aside className="border-l overflow-hidden hidden xl:block" />
         </div>
       </div>
     </div>
@@ -170,14 +222,19 @@ function WorkspaceSkeleton() {
 
 export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
   const { toast } = useToast()
+  const t = useTranslations('inbox_workspace')
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const { openAgentSheet, identity } = useAgentSheet()
 
   const [items, setItems] = useState<InboxItem[]>([])
   const [isLoading, setIsLoading] = useState(true)
+  // The list read failed (non-2xx, unparseable body, or network). Kept apart
+  // from "the list is empty": with no list at all we know nothing about the
+  // inbox and must not render an authoritative "Inkorgen är tom".
+  const [itemsLoadFailed, setItemsLoadFailed] = useState(false)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   // List filter + search (client-side over the already-fetched items list).
-  // Defaults to 'todo' — the active inbox (everything not yet booked) — so
+  // Defaults to 'todo': the active inbox (everything not yet booked), so
   // booked underlag drop out of the default view while attached-but-unbooked
   // ones stay visible.
   const [filter, setFilter] = useState<'todo' | 'linked' | 'booked' | 'error' | 'all'>('todo')
@@ -198,15 +255,31 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
   const [selected, setSelected] = useState<InboxItem | null>(null)
   const [docUrl, setDocUrl] = useState<string | null>(null)
   const [docMime, setDocMime] = useState<string | null>(null)
+  const [docState, setDocState] = useState<DocumentLoadState>('none')
+  // Which selection the in-flight document read belongs to. The user can click
+  // another row while it is running, and a late resolution must not paint its
+  // outcome (a URL, or an error) onto the row that is now selected.
+  const docRequestRef = useRef<string | null>(null)
   const [inboxAddress, setInboxAddress] = useState<InboxAddress | null>(null)
+  // We asked for the inbox address and did not get an answer we can trust
+  // (5xx, network, unparseable). Distinct from a 404, which honestly means no
+  // address is provisioned yet.
+  const [addressLoadFailed, setAddressLoadFailed] = useState(false)
   const [isUploading, setIsUploading] = useState(false)
   const [isDeleting, setIsDeleting] = useState(false)
   const [isRotating, setIsRotating] = useState(false)
   const [isDragging, setIsDragging] = useState(false)
   const [bookDirectOpen, setBookDirectOpen] = useState(false)
+  // Bulk-book selected underlag (Modell B): the "Bokför valda" selection-bar
+  // action. The dialog filters the selection to bookable items itself.
+  const [bulkBookOpen, setBulkBookOpen] = useState(false)
   // Match-to-bank-transaction picker (opens when user clicks "Matcha mot
   // transaktion" on an unmatched inbox item).
   const [matchPickerOpen, setMatchPickerOpen] = useState(false)
+  // "Skapa leverantörsfaktura" modal for the selected underlag: opens in
+  // place (instead of navigating to a form page) so the user lands right back
+  // here to pick the next document.
+  const [createSupplierInvoiceOpen, setCreateSupplierInvoiceOpen] = useState(false)
   // Cash method users see "Bokför direkt" as the primary CTA; accrual users
   // see "Skapa leverantörsfaktura". Defaults to 'accrual' until we've read
   // the company settings so we don't flicker the CTA order on first paint.
@@ -218,21 +291,27 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
     try {
       const res = await fetch('/api/extensions/ext/invoice-inbox/items?limit=500')
       const json = await res.json()
-      if (res.ok) {
-        const serverItems: InboxItem[] = json.data?.items ?? []
-        // Preserve optimistic upload placeholders that haven't resolved to a
-        // server row yet. A refetch can now fire mid-upload (a realtime event
-        // from an unrelated booking), and a wholesale replace would briefly
-        // drop the in-flight placeholder. Placeholders carry a `temp-` id that
-        // never collides with a real row, and uploadFile() removes its own
-        // placeholder before its fetchItems(), so this never duplicates.
-        setItems((prev) => {
-          const pending = prev.filter((it) => it.isPlaceholder)
-          return pending.length > 0 ? [...pending, ...serverItems] : serverItems
-        })
+      if (!res.ok) {
+        // No list came back, so we cannot say anything about the inbox: the
+        // list column renders the failure instead of "Inkorgen är tom".
+        setItemsLoadFailed(true)
+        return
       }
+      const serverItems: InboxItem[] = json.data?.items ?? []
+      // Preserve optimistic upload placeholders that haven't resolved to a
+      // server row yet. A refetch can now fire mid-upload (a realtime event
+      // from an unrelated booking), and a wholesale replace would briefly
+      // drop the in-flight placeholder. Placeholders carry a `temp-` id that
+      // never collides with a real row, and uploadFile() removes its own
+      // placeholder before its fetchItems(), so this never duplicates.
+      setItems((prev) => {
+        const pending = prev.filter((it) => it.isPlaceholder)
+        return pending.length > 0 ? [...pending, ...serverItems] : serverItems
+      })
+      setItemsLoadFailed(false)
     } catch (err) {
       console.error('[invoice-inbox] fetchItems failed:', err)
+      setItemsLoadFailed(true)
     } finally {
       setIsLoading(false)
     }
@@ -244,16 +323,27 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
       if (res.ok) {
         const { data } = await res.json()
         setInboxAddress(data)
+        setAddressLoadFailed(false)
+        return
       }
+      // 404 is the honest "no inbox provisioned yet" answer, so the activate
+      // button is the right thing to offer. Anything else (503 without an
+      // inbound domain, 500, an HTML error page) leaves us not knowing whether
+      // an address exists, and offering "Aktivera inkorgsadress" there is not
+      // just wrong copy: handleRotateAddress skips its confirm dialog when
+      // inboxAddress is null, so one click would silently retire a live address
+      // that suppliers and forwarding rules already point at.
+      setInboxAddress(null)
+      setAddressLoadFailed(res.status !== 404)
     } catch {
-      // 404 / 503 are expected when no address provisioned yet
+      setAddressLoadFailed(true)
     }
   }, [])
 
   useEffect(() => {
     fetchItems()
     fetchInboxAddress()
-    // Resolve the company's bookkeeping method — drives CTA hierarchy.
+    // Resolve the company's bookkeeping method: drives CTA hierarchy.
     fetch('/api/settings')
       .then((r) => (r.ok ? r.json() : null))
       .then((body) => {
@@ -266,9 +356,9 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
   }, [fetchItems, fetchInboxAddress])
 
   // Realtime: refetch when any invoice_inbox_items row changes for this
-  // company. The inbox is routinely resolved "out of band" — the in-app agent
+  // company. The inbox is routinely resolved "out of band": the in-app agent
   // sheet commits a staged create_supplier_invoice_from_inbox / book-direct
-  // operation, the /pending page approves one, or another tab books it — and
+  // operation, the /pending page approves one, or another tab books it, and
   // none of those paths call this component's fetchItems(). Without this, a
   // booked underlag stayed in "Att göra" until a manual reload (issue #600).
   // RLS scopes the channel to the user's company, so we never receive other
@@ -293,7 +383,7 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
   }, [fetchItems])
 
   // Read the onboarding-dismissed flag from localStorage after mount
-  // (SSR-safe — no window access during initial render).
+  // (SSR-safe: no window access during initial render).
   useEffect(() => {
     if (typeof window === 'undefined') return
     try {
@@ -301,7 +391,7 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
         window.localStorage.getItem('gnubok.inbox.onboarding.dismissed') === '1'
       )
     } catch {
-      // private browsing — keep default (show card)
+      // private browsing: keep default (show card)
     }
   }, [])
 
@@ -314,7 +404,7 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
     setOnboardingDismissed(true)
   }, [])
 
-  // Onboarding card visibility — derived from real progress so a user who
+  // Onboarding card visibility: derived from real progress so a user who
   // already has a working inbox flow never sees the guide. Once they finish
   // all three steps, the card auto-hides on next render.
   const hasInboxAddress = !!inboxAddress
@@ -325,8 +415,13 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
       !!it.matched_transaction_id ||
       !!it.created_journal_entry_id
   )
+  // The list read failed and left us with nothing: we do not know whether the
+  // inbox is empty. A failed refetch that still has rows on screen is not this.
+  const itemsUnknown = itemsLoadFailed && !hasAnyItem
+  // Never coach "ladda upp ditt första underlag" off a list we could not read:
+  // that step may well be done already.
   const showOnboarding =
-    !onboardingDismissed && !(hasInboxAddress && hasAnyItem && hasResolvedItem)
+    !onboardingDismissed && !itemsUnknown && !(hasInboxAddress && hasAnyItem && hasResolvedItem)
 
   // ── List filter + search (client-side over the fetched list) ─
 
@@ -344,7 +439,7 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
   }, [items])
 
   // Pills, in order. The error pill only appears when there's something errored
-  // (or it's the active filter) — keeps the happy-path inbox uncluttered.
+  // (or it's the active filter): keeps the happy-path inbox uncluttered.
   const pills = useMemo(() => {
     const list: { key: typeof filter; label: string; count: number }[] = [
       { key: 'todo', label: 'Att göra', count: statusCounts.todo },
@@ -361,7 +456,7 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
   const filteredItems = useMemo(() => {
     const term = searchTerm.trim().toLowerCase()
     return items.filter((item) => {
-      // Status filter. "todo" is the active inbox — everything except booked.
+      // Status filter. "todo" is the active inbox: everything except booked.
       const status = deriveInboxStatus(item)
       if (filter === 'todo' && status === 'booked') return false
       if (filter === 'linked' && status !== 'linked') return false
@@ -369,7 +464,7 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
       if (filter === 'error' && status !== 'error') return false
       // 'all' → no status narrowing
 
-      // Search filter — supplier name, email subject/from, placeholder filename
+      // Search filter: supplier name, email subject/from, placeholder filename
       if (term === '') return true
       const haystack = [
         item.extracted_data?.supplier?.name,
@@ -386,11 +481,58 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
 
   // ── Selection ──────────────────────────────────────────────
 
+  // Resolve the signed URL for a row's underlag. Every exit sets docState, so
+  // the preview pane always says which of the four situations it is in: no
+  // document, still loading, ready, or "we could not load it". The pane must
+  // never fall back to "Inget underlag bifogat" for a row that has a
+  // document_id, which is what the old silent catch produced.
+  const loadDocument = useCallback(async (itemId: string, documentId: string | null) => {
+    docRequestRef.current = itemId
+    setDocUrl(null)
+    setDocMime(null)
+    if (!documentId) {
+      setDocState('none')
+      return
+    }
+    setDocState('loading')
+    try {
+      const res = await fetchWithTimeout(
+        `/api/documents/${documentId}`,
+        { method: 'GET' },
+        { timeoutMs: DOCUMENT_FETCH_TIMEOUT_MS, description: `document ${documentId}` },
+      )
+      if (docRequestRef.current !== itemId) return
+      if (!res.ok) {
+        setDocState('error')
+        return
+      }
+      const { data } = await res.json()
+      if (docRequestRef.current !== itemId) return
+      const url: string | null = data?.download_url ?? null
+      if (!url) {
+        // The document row exists but no signed URL came back: still a load
+        // failure, not an absent underlag.
+        setDocState('error')
+        return
+      }
+      setDocUrl(url)
+      setDocMime(data?.mime_type ?? null)
+      setDocState('ready')
+    } catch {
+      // Timeout, offline, or an unparseable body. The document itself is
+      // untouched, so the retry in the preview pane is the whole recovery.
+      if (docRequestRef.current !== itemId) return
+      setDocState('error')
+    }
+  }, [])
+
   const handleSelect = useCallback(async (id: string) => {
     setSelectedId(id)
     setSelected(null)
     setDocUrl(null)
     setDocMime(null)
+    setDocState('none')
+    docRequestRef.current = id
     // Intentionally no auto-scroll: in the vertical-stack layout (below xl)
     // scrolling the preview into view pushes the list off-screen, and the
     // user has no obvious way back to pick another item. The row-highlight
@@ -402,27 +544,15 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
       if (!res.ok) throw new Error(json.error ?? 'Kunde inte hämta posten')
       const item = json.data as InboxItem
       setSelected(item)
-
-      if (item.document_id) {
-        try {
-          const docRes = await fetch(`/api/documents/${item.document_id}`)
-          if (docRes.ok) {
-            const { data } = await docRes.json()
-            setDocUrl(data.download_url ?? null)
-            setDocMime(data.mime_type ?? null)
-          }
-        } catch {
-          // Preview is optional
-        }
-      }
+      await loadDocument(id, item.document_id)
     } catch (err) {
       toast({
         title: 'Kunde inte ladda dokumentet',
-        description: err instanceof Error ? err.message : 'Försök igen.',
+        description: err instanceof Error ? getUserErrorMessage(err) : 'Försök igen.',
         variant: 'destructive',
       })
     }
-  }, [toast])
+  }, [toast, loadDocument])
 
   // ── Upload ─────────────────────────────────────────────────
 
@@ -433,8 +563,8 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
     file: File,
     options: { autoSelect: boolean } = { autoSelect: true },
   ) => {
-    // Optimistic placeholder — gives the user an immediate visual response
-    // for the 3–8s while extraction runs. Removed once the real row arrives.
+    // Optimistic placeholder: gives the user an immediate visual response
+    // for the 3-8s while extraction runs. Removed once the real row arrives.
     const tempId = `temp-${crypto.randomUUID()}`
     const placeholder: InboxItem = {
       id: tempId,
@@ -475,7 +605,7 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
         toast({
           title: 'Dokument uppladdat',
           description: pages
-            ? `Stort dokument (${pages} sidor) — AI-tolkning skippad. Du kan koppla det till en transaktion eller skapa leverantörsfaktura manuellt.`
+            ? `Stort dokument (${pages} sidor): AI-tolkning skippad. Du kan koppla det till en transaktion eller skapa leverantörsfaktura manuellt.`
             : 'AI-tolkning skippad. Du kan koppla dokumentet till en transaktion eller skapa leverantörsfaktura manuellt.',
         })
       } else {
@@ -494,7 +624,7 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
       }
       toast({
         title: 'Uppladdning misslyckades',
-        description: err instanceof Error ? err.message : 'Försök igen.',
+        description: err instanceof Error ? getUserErrorMessage(err) : 'Försök igen.',
         variant: 'destructive',
       })
     } finally {
@@ -502,14 +632,14 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
     }
   }, [fetchItems, handleSelect, toast])
 
-  // Sequential queue — running multiple extractions concurrently would
+  // Sequential queue: running multiple extractions concurrently would
   // hammer pdfjs on slow boxes. Per-file placeholder rows + the queue
   // counter on the upload button surface progress.
   const uploadFiles = useCallback(async (files: File[]) => {
     if (files.length === 0) return
     if (files.length === 1) {
       // Single-file drop: keep the historic behavior of jumping the detail
-      // pane to the new item. Skip the queue counter — it would just flash.
+      // pane to the new item. Skip the queue counter: it would just flash.
       await uploadFile(files[0], { autoSelect: true })
       return
     }
@@ -557,7 +687,7 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
     } catch (err) {
       toast({
         title: 'Kunde inte ta bort',
-        description: err instanceof Error ? err.message : 'Försök igen.',
+        description: err instanceof Error ? getUserErrorMessage(err) : 'Försök igen.',
         variant: 'destructive',
       })
     } finally {
@@ -575,6 +705,21 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
   }, [])
 
   const clearSelection = useCallback(() => setSelectedIds(new Set()), [])
+
+  // The selected rows, and how many of them can actually be bulk-booked
+  // (matched to a transaction and not yet booked). Drives the "Bokför valda"
+  // button enabled-state and feeds the bulk-book dialog.
+  const selectedItems = useMemo(
+    () => items.filter((it) => selectedIds.has(it.id)),
+    [items, selectedIds],
+  )
+  const bookableSelectedCount = useMemo(
+    () =>
+      selectedItems.filter(
+        (it) => it.matched_transaction_id && !it.created_journal_entry_id && !it.created_supplier_invoice_id,
+      ).length,
+    [selectedItems],
+  )
 
   const handleBulkDelete = useCallback(async () => {
     if (selectedIds.size === 0) return
@@ -601,7 +746,7 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
       const succeeded = deletable.length - failed
       const parts: string[] = []
       if (succeeded > 0) parts.push(`${succeeded} borttagna`)
-      if (skipped > 0) parts.push(`${skipped} kopplade till leverantörsfaktura — hoppade över`)
+      if (skipped > 0) parts.push(`${skipped} kopplade till leverantörsfaktura, hoppade över`)
       if (failed > 0) parts.push(`${failed} misslyckades`)
       toast({
         title: 'Bulkborttagning klar',
@@ -622,14 +767,17 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
 
   // ── Inbox address ──────────────────────────────────────────
 
-  const handleCopyAddress = useCallback(() => {
-    if (!inboxAddress) return
-    navigator.clipboard.writeText(inboxAddress.address).catch(() => {})
-    toast({ title: 'Adress kopierad' })
-  }, [inboxAddress, toast])
-
   const handleRotateAddress = useCallback(async () => {
-    if (inboxAddress && !confirm('Skapa en ny inkorgsadress? Den gamla slutar att fungera.')) return
+    // Confirm whenever an address may already exist: either we hold one, or the
+    // read failed and we cannot rule one out. Rotating retires the old address,
+    // and suppliers plus forwarding rules already point at it, so the one case
+    // that must never skip this dialog is the one where we are unsure.
+    if (
+      (inboxAddress || addressLoadFailed) &&
+      !confirm('Skapa en ny inkorgsadress? Den gamla slutar att fungera.')
+    ) {
+      return
+    }
     setIsRotating(true)
     try {
       const res = await fetch('/api/extensions/ext/invoice-inbox/inbox/rotate', {
@@ -638,17 +786,18 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
       const json = await res.json()
       if (!res.ok) throw new Error(json.error ?? 'Rotation misslyckades')
       setInboxAddress(json.data)
+      setAddressLoadFailed(false)
       toast({ title: 'Ny adress skapad', description: json.data.address })
     } catch (err) {
       toast({
         title: 'Rotation misslyckades',
-        description: err instanceof Error ? err.message : 'Försök igen.',
+        description: err instanceof Error ? getUserErrorMessage(err) : 'Försök igen.',
         variant: 'destructive',
       })
     } finally {
       setIsRotating(false)
     }
-  }, [toast, inboxAddress])
+  }, [toast, inboxAddress, addressLoadFailed])
 
   // ── Render ─────────────────────────────────────────────────
 
@@ -656,7 +805,7 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
 
   return (
     <div
-      className="min-h-[calc(100vh-1px)] xl:h-[calc(100vh-1px)] p-4 md:p-6"
+      className="min-h-[calc(100vh-1px)] md:min-h-full xl:h-full p-4 md:p-6"
       onDragOver={(e) => { e.preventDefault(); if (!isDragging) setIsDragging(true) }}
       onDragLeave={(e) => {
         // only clear when leaving the workspace itself, not children
@@ -664,40 +813,28 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
       }}
       onDrop={handleDrop}
     >
-    <div className="xl:h-full flex flex-col rounded-lg border bg-card xl:overflow-hidden shadow-sm">
+    <div className="xl:h-full flex flex-col rounded-lg border bg-card xl:overflow-hidden">
       {/* Top bar */}
       <header className="flex items-center justify-between gap-4 border-b px-4 py-2.5 flex-wrap">
         <div className="flex items-center gap-2 min-w-0">
           <Inbox className="h-4 w-4 text-muted-foreground shrink-0" />
           <h1 className="font-medium text-sm shrink-0">Dokumentinkorg</h1>
           {inboxAddress ? (
-            <>
-              <span className="text-muted-foreground text-xs shrink-0">·</span>
-              <code className="font-mono text-xs text-muted-foreground truncate min-w-0">
-                {inboxAddress.address}
-              </code>
-              <button
-                type="button"
-                className="text-muted-foreground hover:text-foreground shrink-0"
-                onClick={handleCopyAddress}
-                title="Kopiera adress"
+            <InboxAddressBar
+              address={inboxAddress.address}
+              onRotate={handleRotateAddress}
+              isRotating={isRotating}
+            />
+          ) : addressLoadFailed ? (
+            // We do not know whether an address exists, so we offer a retry
+            // rather than an activate button that would rotate a live address.
+            <div role="status" aria-live="polite" className="min-w-0">
+              <AttnLine
+                action={{ label: t('retry'), onClick: () => { void fetchInboxAddress() } }}
               >
-                <Copy className="h-3.5 w-3.5" />
-              </button>
-              <button
-                type="button"
-                className="text-muted-foreground hover:text-foreground shrink-0"
-                onClick={handleRotateAddress}
-                disabled={isRotating}
-                title="Rotera till ny adress"
-              >
-                {isRotating ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <RotateCcw className="h-3.5 w-3.5" />
-                )}
-              </button>
-            </>
+                {t('address_load_failed')}
+              </AttnLine>
+            </div>
           ) : (
             <Button
               variant="outline"
@@ -746,11 +883,11 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
 
       {/* Three-section body. Below xl (iPad portrait/landscape + phone) the
           sections stack vertically as a single scrollable feed. With the app
-          sidebar eating ~256px, even iPad landscape (1024–1180px viewport)
-          has only ~570px of workspace — too tight for 3 panes. At xl+ they
+          sidebar eating ~256px, even iPad landscape (1024-1180px viewport)
+          has only ~570px of workspace: too tight for 3 panes. At xl+ they
           sit side-by-side as three panes. */}
       <div className="xl:flex-1 grid grid-cols-1 xl:grid-cols-[280px_minmax(0,1fr)_340px] xl:min-h-0 xl:overflow-hidden">
-        {/* List — flows naturally below xl; bounded with internal scroll at xl+ */}
+        {/* List: flows naturally below xl; bounded with internal scroll at xl+ */}
         <aside className="border-b xl:border-b-0 xl:border-r bg-muted/20 pt-3 xl:overflow-y-auto xl:block">
           {items.length > 0 && (
             <div className="px-3 pb-3 space-y-2 border-b">
@@ -793,42 +930,90 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
             </div>
           )}
           {selectedIds.size > 0 && (
-            <div className="sticky top-0 z-10 flex items-center justify-between gap-2 border-b bg-background/95 backdrop-blur px-3 py-2 text-xs">
-              <span className="font-medium">{selectedIds.size} valda</span>
-              <div className="flex items-center gap-1">
+            <div className="sticky top-0 z-10 flex flex-col gap-3 border-b bg-background/95 backdrop-blur px-4 py-3">
+              {/* Count */}
+              <span className="text-xs text-muted-foreground tabular-nums">
+                <span className="font-medium text-foreground">{selectedIds.size}</span>{' '}
+                {selectedIds.size === 1 ? 'markerad' : 'markerade'}
+              </span>
+              {/* Primary action: the one solid button */}
+              <Button
+                variant="default"
+                size="sm"
+                className="h-8 w-full text-xs"
+                onClick={() => setBulkBookOpen(true)}
+                disabled={isBulkDeleting || bookableSelectedCount === 0}
+                title={
+                  bookableSelectedCount === 0
+                    ? 'Inget av de valda underlagen är matchat mot en banktransaktion'
+                    : undefined
+                }
+              >
+                <Check className="h-3.5 w-3.5 mr-1.5" />
+                Bokför valda
+              </Button>
+              {/* Secondary actions: outlined, so they read as buttons */}
+              <div className="flex items-center gap-2">
+                {identity.isVerified && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-8 flex-1 px-2 text-xs text-muted-foreground hover:text-foreground"
+                    onClick={() =>
+                      openAgentSheet({
+                        intentId: 'inbox.bulk-book',
+                        intentArgs: { item_ids: Array.from(selectedIds) },
+                        contextRef: 'inbox:bulk',
+                      })
+                    }
+                    disabled={isBulkDeleting}
+                  >
+                    <Sparkles className="h-3.5 w-3.5 mr-1.5" />
+                    Fråga assistenten
+                  </Button>
+                )}
                 <Button
-                  variant="ghost"
+                  variant="outline"
                   size="sm"
-                  className="h-7 text-xs"
-                  onClick={clearSelection}
-                  disabled={isBulkDeleting}
-                >
-                  Avmarkera
-                </Button>
-                <Button
-                  variant="destructive"
-                  size="sm"
-                  className="h-7 text-xs"
+                  className={cn(
+                    'h-8 px-2 text-xs text-muted-foreground hover:text-destructive hover:border-destructive/40',
+                    identity.isVerified ? 'flex-none' : 'flex-1'
+                  )}
                   onClick={handleBulkDelete}
                   disabled={isBulkDeleting}
                 >
                   {isBulkDeleting ? (
-                    <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                    <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
                   ) : (
-                    <Trash2 className="h-3 w-3 mr-1" />
+                    <Trash2 className="h-3.5 w-3.5 mr-1.5" />
                   )}
                   Ta bort
                 </Button>
               </div>
             </div>
           )}
-          {items.length === 0 ? (
+          {itemsUnknown ? (
+            // The list read failed. "Inkorgen är tom" would be a claim we
+            // cannot back: a mailed-in invoice may be sitting there unread.
+            <div className="p-6 text-center text-sm text-muted-foreground space-y-2">
+              <AlertTriangle className="h-5 w-5 mx-auto text-attn" />
+              <p>{t('items_load_failed')}</p>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 text-xs"
+                onClick={() => { void fetchItems() }}
+              >
+                {t('retry')}
+              </Button>
+            </div>
+          ) : !hasAnyItem ? (
             // On desktop the preview pane is always visible alongside this
             // column, so showing the onboarding card here would duplicate it.
-            // On mobile the layout is a master-detail toggle and the user is
-            // stuck on the list view until they pick a row — without a card
-            // here they'd have no way to reach the explainer at all. So:
-            // compact card on mobile only, quiet empty state on desktop.
+            // Below xl the panes stack into one feed, so the sibling preview
+            // and fields panes are hidden when the inbox is empty (see their
+            // classNames): this list is the only onboarding surface there.
+            // So: compact card on mobile only, quiet empty state on desktop.
             showOnboarding ? (
               <>
                 <div className="xl:hidden">
@@ -857,7 +1042,7 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
           ) : filteredItems.length === 0 ? (
             <div className="p-6 text-center text-xs text-muted-foreground">
               {filter === 'todo'
-                ? 'Inget att åtgärda — allt är bearbetat.'
+                ? 'Inget att åtgärda; allt är bearbetat.'
                 : 'Inga poster matchar filtret.'}
             </div>
           ) : (
@@ -877,12 +1062,24 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
           )}
         </aside>
 
-        {/* Document preview (hero) */}
+        {/* Document preview (hero). When the inbox is empty there is nothing
+            to preview and no row can be selected, so below xl (stacked feed)
+            this pane is hidden: the list's compact onboarding card is the
+            single onboarding surface, avoiding a duplicated card. */}
         <main
-          className="xl:overflow-hidden bg-muted/10 relative xl:block min-h-[55vh] xl:min-h-0"
+          className={cn(
+            'xl:overflow-hidden bg-muted/10 relative xl:block min-h-[55vh] xl:min-h-0',
+            !hasAnyItem && 'hidden xl:block'
+          )}
         >
           {selected ? (
-            <DocumentPreview docUrl={docUrl} docMime={docMime} isProcessing={!!selected.isPlaceholder} />
+            <DocumentPreview
+              docUrl={docUrl}
+              docMime={docMime}
+              isProcessing={!!selected.isPlaceholder}
+              loadState={docState}
+              onRetry={() => { void loadDocument(selected.id, selected.document_id) }}
+            />
           ) : showOnboarding ? (
             <div className="h-full flex items-center justify-center px-4 py-6">
               <OnboardingCard
@@ -898,7 +1095,9 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
           ) : (
             <EmptyPreview
               onUploadClick={() => fileInputRef.current?.click()}
-              onActivateInbox={inboxAddress ? null : handleRotateAddress}
+              // Only offer activation when we know there is nothing to retire:
+              // a failed address read is not a "you have no address yet".
+              onActivateInbox={inboxAddress || addressLoadFailed ? null : handleRotateAddress}
               isActivating={isRotating}
             />
           )}
@@ -911,9 +1110,14 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
 
         {/* Fields rail. Below xl it stacks below the preview as part of the
             single vertical feed (top border for separation). At xl+ it's the
-            third pane with a left border. */}
+            third pane with a left border. With an empty inbox no row can be
+            selected, so below xl it is hidden to keep the stacked empty state
+            to just the list column. */}
         <aside
-          className="border-t xl:border-t-0 xl:border-l xl:overflow-y-auto pt-4 xl:block pb-4"
+          className={cn(
+            'border-t xl:border-t-0 xl:border-l xl:overflow-y-auto pt-4 xl:block pb-4',
+            !hasAnyItem && 'hidden xl:block'
+          )}
         >
           {selected ? (
             <FieldsRail
@@ -921,6 +1125,7 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
               accountingMethod={accountingMethod}
               onDelete={() => handleDelete(selected.id)}
               onBookDirect={() => setBookDirectOpen(true)}
+              onCreateSupplierInvoice={() => setCreateSupplierInvoiceOpen(true)}
               onMatchTransaction={() => setMatchPickerOpen(true)}
               onUnmatchTransaction={async () => {
                 const targetId = selected.id
@@ -985,11 +1190,35 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
         open={bookDirectOpen}
         onOpenChange={setBookDirectOpen}
         item={selected}
+        docUrl={docUrl}
+        docMime={docMime}
         onSuccess={async () => {
           await Promise.all([fetchItems(), handleSelect(selected.id)])
         }}
       />
     )}
+    {selected && (
+      <NewSupplierInvoiceDialog
+        open={createSupplierInvoiceOpen}
+        onOpenChange={setCreateSupplierInvoiceOpen}
+        inboxItemId={selected.id}
+        onCreated={async () => {
+          // Stay in the inbox (the whole point of the modal): close, then
+          // refresh the list + the selected item so it shows as converted.
+          setCreateSupplierInvoiceOpen(false)
+          await Promise.all([fetchItems(), handleSelect(selected.id)])
+        }}
+      />
+    )}
+    <BulkBookInboxDialog
+      open={bulkBookOpen}
+      onOpenChange={setBulkBookOpen}
+      items={selectedItems}
+      onSuccess={async () => {
+        clearSelection()
+        await fetchItems()
+      }}
+    />
     {selected && (
       <TransactionMatchPicker
         open={matchPickerOpen}
@@ -1006,6 +1235,94 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
 }
 
 
+// ── Inbox address bar ────────────────────────────────────────
+// The address plus its copy and rotate controls. Owns the copy state so the
+// header can report an honest outcome: a clipboard write rejects for ordinary
+// reasons (insecure context, a blocking Permissions-Policy, a document that
+// lost focus) and the previous handler swallowed that and said "Adress
+// kopierad" anyway. The user then waits for supplier invoices at an address
+// they never captured, which is unrecoverable in the sense that matters: no
+// invoice ever arrives and nothing explains why.
+//
+// Treatment mirrors CopyBlock in components/settings/ApiKeysPanel.tsx: icon
+// swap for the state, one ochre AttnLine on failure, live region always
+// mounted. No toast on any path, so nothing here can be evicted by (or evict)
+// another toast under TOAST_LIMIT = 1.
+
+function InboxAddressBar({
+  address,
+  onRotate,
+  isRotating,
+}: {
+  address: string
+  onRotate: () => void
+  isRotating: boolean
+}) {
+  const t = useTranslations('inbox_workspace')
+  const [copyState, setCopyState] = useState<AddressCopyState>('idle')
+
+  async function handleCopy() {
+    // The clipboard write is the first await, so the click's user activation
+    // still holds when it runs.
+    const next = await copyInboxAddress(address)
+    setCopyState(next)
+    if (next === 'copied') setTimeout(() => setCopyState('idle'), 2000)
+  }
+
+  return (
+    <div className="flex flex-col min-w-0">
+      <div className="flex items-center gap-2 min-w-0">
+        <span className="text-muted-foreground text-xs shrink-0">·</span>
+        <code
+          className={cn(
+            'select-all font-mono text-xs text-muted-foreground min-w-0',
+            // With no clipboard, reading the address off the screen is the only
+            // way to get it: show it whole instead of ellipsised.
+            copyState === 'failed' ? 'break-all' : 'truncate',
+          )}
+        >
+          {address}
+        </code>
+        <button
+          type="button"
+          className="text-muted-foreground hover:text-foreground shrink-0"
+          onClick={handleCopy}
+          aria-label={t('copy_address')}
+          title={t('copy_address')}
+        >
+          {copyState === 'copied' ? (
+            <Check className="h-3.5 w-3.5 text-success" />
+          ) : copyState === 'failed' ? (
+            <AlertTriangle className="h-3.5 w-3.5 text-attn" />
+          ) : (
+            <Copy className="h-3.5 w-3.5" />
+          )}
+        </button>
+        <button
+          type="button"
+          className="text-muted-foreground hover:text-foreground shrink-0"
+          onClick={onRotate}
+          disabled={isRotating}
+          title="Rotera till ny adress"
+        >
+          {isRotating ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          ) : (
+            <RotateCcw className="h-3.5 w-3.5" />
+          )}
+        </button>
+      </div>
+      {/* Always mounted so the sentence is announced when it appears, not
+          merely inserted. */}
+      <div role="status" aria-live="polite">
+        {copyState === 'failed' && (
+          <AttnLine className="mt-1">{t('copy_address_failed')}</AttnLine>
+        )}
+      </div>
+    </div>
+  )
+}
+
 // ── List row ─────────────────────────────────────────────────
 
 function InboxRow({
@@ -1021,7 +1338,7 @@ function InboxRow({
   onClick: () => void
   isChecked: boolean
   onToggleChecked: () => void
-  /** True when bulk-select mode is active anywhere in the list — keeps the
+  /** True when bulk-select mode is active anywhere in the list: keeps the
       checkbox visible (otherwise it's hover-only on desktop). */
   anyChecked: boolean
 }) {
@@ -1084,10 +1401,10 @@ function InboxRow({
             <AlertTriangle className="h-3 w-3 text-destructive shrink-0" aria-label="Fel vid bearbetning" />
           )}
           {isLinkedToTransaction && (
-            <Link2 className="h-3 w-3 text-emerald-600 shrink-0" aria-label="Kopplad till transaktion" />
+            <Link2 className="h-3 w-3 text-success shrink-0" aria-label="Kopplad till transaktion" />
           )}
           {isBooked && (
-            <Check className="h-3 w-3 text-emerald-600 shrink-0" aria-label="Bokförd" />
+            <Check className="h-3 w-3 text-success shrink-0" aria-label="Bokförd" />
           )}
         </div>
         <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
@@ -1119,16 +1436,47 @@ export function DocumentPreview({
   docUrl,
   docMime,
   isProcessing = false,
+  loadState,
+  onRetry,
 }: {
   docUrl: string | null
   docMime: string | null
   isProcessing?: boolean
+  /** Omitted by callers that only ever hold a resolved URL. */
+  loadState?: DocumentLoadState
+  onRetry?: () => void
 }) {
+  const t = useTranslations('inbox_workspace')
+  const state: DocumentLoadState = loadState ?? (docUrl ? 'ready' : 'none')
+
   if (isProcessing) {
     return (
       <div className="h-full flex flex-col items-center justify-center gap-3 text-sm text-muted-foreground">
         <Loader2 className="h-6 w-6 animate-spin" />
         <span>Tolkar dokument med AI…</span>
+      </div>
+    )
+  }
+  if (state === 'loading') {
+    return (
+      <div className="h-full flex flex-col items-center justify-center gap-3 text-sm text-muted-foreground">
+        <Loader2 className="h-6 w-6 animate-spin" />
+        <span>{t('document_loading')}</span>
+      </div>
+    )
+  }
+  if (state === 'error' || (state === 'ready' && !docUrl)) {
+    // The row points at a stored document: say that it could not be shown, not
+    // that there is nothing attached.
+    return (
+      <div className="h-full flex flex-col items-center justify-center gap-3 px-6 text-center text-sm text-muted-foreground">
+        <AlertTriangle className="h-5 w-5 text-attn" />
+        <span>{t('document_load_failed')}</span>
+        {onRetry && (
+          <Button variant="outline" size="sm" className="h-7 text-xs" onClick={onRetry}>
+            {t('retry')}
+          </Button>
+        )}
       </div>
     )
   }
@@ -1144,7 +1492,7 @@ export function DocumentPreview({
     <div className="h-full w-full p-4 flex items-start justify-center overflow-hidden">
       {docMime?.startsWith('image/') ? (
         // Image: frame hugs the image, capped at the parent's visible box.
-        <div className="max-h-full max-w-3xl bg-background rounded-md border shadow-sm overflow-hidden flex">
+        <div className="max-h-full max-w-3xl bg-background rounded-md border overflow-hidden flex">
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
             src={docUrl}
@@ -1153,8 +1501,8 @@ export function DocumentPreview({
           />
         </div>
       ) : (
-        // PDF: iframe needs explicit height — frame fills the available pane.
-        <div className="h-full w-full max-w-3xl bg-background rounded-md border shadow-sm overflow-hidden">
+        // PDF: iframe needs explicit height, frame fills the available pane.
+        <div className="h-full w-full max-w-3xl bg-background rounded-md border overflow-hidden">
           <iframe src={docUrl} className="w-full h-full border-0" title="Underlag" />
         </div>
       )}
@@ -1196,7 +1544,7 @@ function OnboardingCard({
     {
       done: hasAnyItem,
       title: 'Ladda upp eller maila in ett underlag',
-      hint: 'accounted tolkar fakturan eller kvittot åt dig och fyller i fält automatiskt.',
+      hint: 'Accounted tolkar fakturan eller kvittot åt dig och fyller i fält automatiskt.',
     },
     {
       done: hasResolvedItem,
@@ -1211,7 +1559,7 @@ function OnboardingCard({
   return (
     <div
       className={cn(
-        'relative rounded-xl border bg-card shadow-sm',
+        'relative rounded-lg border bg-card',
         compact ? 'mx-3 my-3 p-4 text-xs' : 'max-w-md mx-auto p-6'
       )}
     >
@@ -1228,7 +1576,7 @@ function OnboardingCard({
         <div className="flex items-center gap-2 flex-wrap">
           <h2
             className={cn(
-              'font-display font-medium tracking-tight',
+              'font-display tracking-tight',
               compact ? 'text-sm' : 'text-lg'
             )}
           >
@@ -1239,19 +1587,9 @@ function OnboardingCard({
           </Badge>
         </div>
         <p className={cn('text-muted-foreground', compact ? 'text-[11px]' : 'text-xs')}>
-          Underlagen samlas här — från mail eller filuppladdning — och kan
-          matchas mot bankhändelser eller bokföras direkt.
-        </p>
-        <p className={cn('text-muted-foreground', compact ? 'text-[11px]' : 'text-xs')}>
-          Gratis under beta för Open-användare. Ingår senare i Pro-planen.{' '}
-          <a
-            href="https://www.gnubok.se/priser"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-primary hover:underline"
-          >
-            Se priser →
-          </a>
+          Underlagen samlas här (från mail eller filuppladdning) och kan
+          matchas mot bankhändelser eller bokföras direkt. Inkorgen är alltid
+          gratis; AI-tolkning av underlag ingår i abonnemanget.
         </p>
       </div>
 
@@ -1266,7 +1604,7 @@ function OnboardingCard({
             >
               <span className="shrink-0 mt-0.5">
                 {isDone ? (
-                  <Check className={cn('text-emerald-600', compact ? 'h-3.5 w-3.5' : 'h-4 w-4')} />
+                  <Check className={cn('text-success', compact ? 'h-3.5 w-3.5' : 'h-4 w-4')} />
                 ) : isCurrent ? (
                   <span
                     className={cn(
@@ -1306,7 +1644,7 @@ function OnboardingCard({
         })}
       </ol>
 
-      {/* CTA matches the current step. No CTA for step 3 — it requires the user to pick a row. */}
+      {/* CTA matches the current step. No CTA for step 3: it requires the user to pick a row. */}
       {currentStep === 0 && (
         <Button
           size={compact ? 'sm' : 'default'}
@@ -1400,6 +1738,7 @@ function FieldsRail({
   accountingMethod,
   onDelete,
   onBookDirect,
+  onCreateSupplierInvoice,
   onMatchTransaction,
   onUnmatchTransaction,
   onAskAssistant,
@@ -1411,6 +1750,7 @@ function FieldsRail({
   accountingMethod: AccountingMethod
   onDelete: () => void
   onBookDirect: () => void
+  onCreateSupplierInvoice: () => void
   onMatchTransaction: () => void
   onUnmatchTransaction: () => Promise<void>
   onAskAssistant?: (transactionId: string) => void
@@ -1419,10 +1759,11 @@ function FieldsRail({
   onRetryRequested: () => Promise<void>
 }) {
   const { toast } = useToast()
+  const hasAi = useCapability(CAPABILITY.ai)
   const data = item.extracted_data
   const isProcessed = !!item.created_supplier_invoice_id
   const isBookedDirectly = !isProcessed && !!item.created_journal_entry_id
-  // "Resolved" now means a journal entry exists — matched_transaction_id alone
+  // "Resolved" now means a journal entry exists: matched_transaction_id alone
   // is not resolved, it's the prerequisite for booking against that tx.
   const isLinkedToTransaction = !isProcessed && !isBookedDirectly && !!item.matched_transaction_id
   const isResolved = isProcessed || isBookedDirectly
@@ -1515,12 +1856,12 @@ function FieldsRail({
         </div>
       )}
 
-      {/* Hint only — creation happens on the leverantörsfaktura form via "Skapa & välj" */}
+      {/* Hint only: creation happens on the leverantörsfaktura form via "Skapa & välj" */}
       {showNoMatchHint && (
         <div className="border-b bg-muted/30 px-4 py-2 text-xs text-muted-foreground">
           Ingen leverantör matchade{' '}
           <span className="text-foreground font-medium">{extractedSupplierName}</span>
-          {' — leverantören skapas när du klickar Skapa leverantörsfaktura.'}
+          {': leverantören skapas när du klickar Skapa leverantörsfaktura.'}
         </div>
       )}
 
@@ -1549,6 +1890,24 @@ function FieldsRail({
               <Skeleton key={i} className="h-8 w-full" />
             ))}
           </div>
+        ) : !hasAnyExtractedField(data) && !hasAi ? (
+          // No fields were extracted (AI never ran) and the company doesn't have
+          // the AI capability. Show an upsell in place of the blank field list:
+          // upload and manual entry stay available via the actions below.
+          <div className="rounded-lg border border-border bg-secondary/40 px-4 py-3 text-left">
+            <div className="flex items-center gap-2 text-sm font-medium">
+              <Sparkles className="h-4 w-4" />
+              AI-tolkning ingår i abonnemanget
+            </div>
+            <p className="text-xs text-muted-foreground mt-1.5 leading-relaxed">
+              Uppgradera för att låta Accounted läsa av leverantör, belopp och
+              moms automatiskt. Du kan fortfarande fylla i fälten manuellt eller
+              koppla dokumentet till en transaktion nedan.
+            </p>
+            <Button size="sm" className="mt-3" asChild>
+              <Link href="/settings/billing">Uppgradera</Link>
+            </Button>
+          </div>
         ) : (
           <EditableFieldsList
             itemId={item.id}
@@ -1559,7 +1918,7 @@ function FieldsRail({
         )}
       </div>
 
-      {/* Actions — hidden while AI extraction is in flight */}
+      {/* Actions: hidden while AI extraction is in flight */}
       {!item.isPlaceholder && (
       <div className="border-t px-4 py-3 space-y-2">
         {isProcessed && item.created_supplier_invoice_id ? (
@@ -1579,7 +1938,7 @@ function FieldsRail({
         ) : isLinkedToTransaction && item.matched_transaction_id ? (
           <>
             {/* Matched-to-tx state: show the bridge to booking. The user
-                picks one of two actions — book themselves with the
+                picks one of two actions: book themselves with the
                 deterministic dialog, or hand off to the assistant. */}
             <div className="rounded-md border border-success/30 bg-success/5 px-3 py-2 text-xs">
               <div className="flex items-center gap-1.5 text-success font-medium mb-1">
@@ -1631,7 +1990,7 @@ function FieldsRail({
           <>
             {/* Unmatched state: the canonical next step is to find the bank
                 transaction this underlag belongs to. Two escape hatches sit
-                below it — "Skapa leverantörsfaktura" for users who want
+                below it: "Skapa leverantörsfaktura" for users who want
                 supplier-invoice tracking (accrual flow), and "Bokför som
                 verifikat" for underlag that aren't a supplier invoice at all
                 (bank fees, owner expenses, the underlag for a correction). The
@@ -1647,19 +2006,34 @@ function FieldsRail({
             >
               Matcha mot transaktion
             </Button>
-            <Link href={`/supplier-invoices/new?inbox_item_id=${item.id}`} className="block">
-              <Button variant="outline" size="sm" className="w-full">
-                Skapa leverantörsfaktura
-              </Button>
-            </Link>
-            <Button
-              variant="outline"
-              size="sm"
-              className="w-full"
-              onClick={onBookDirect}
-            >
-              Bokför som verifikat
-            </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="sm" className="w-full justify-between">
+                  Andra sätt att bokföra
+                  <ChevronDown className="h-3.5 w-3.5" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start" className="w-64">
+                <DropdownMenuItem
+                  onClick={onCreateSupplierInvoice}
+                  className="flex flex-col items-start gap-1"
+                >
+                  <span>Skapa leverantörsfaktura</span>
+                  <span className="text-xs text-muted-foreground">
+                    För leverantörsskulder du vill följa (periodisering).
+                  </span>
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={onBookDirect}
+                  className="flex flex-col items-start gap-1"
+                >
+                  <span>Bokför som verifikat</span>
+                  <span className="text-xs text-muted-foreground">
+                    För underlag som inte är en leverantörsfaktura (bankavgift, utlägg).
+                  </span>
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </>
         )}
         <Button
@@ -1670,11 +2044,11 @@ function FieldsRail({
           disabled={isDeleting || isResolved}
           title={
             isProcessed
-              ? 'Kopplad till leverantörsfaktura — kan inte tas bort'
+              ? 'Kopplad till leverantörsfaktura, kan inte tas bort'
               : isBookedDirectly
-                ? 'Bokförd — kan inte tas bort'
+                ? 'Bokförd, kan inte tas bort'
                 : isLinkedToTransaction
-                  ? 'Kopplad till transaktion — koppla loss innan borttagning'
+                  ? 'Kopplad till transaktion, koppla loss innan borttagning'
                   : undefined
           }
         >
@@ -1802,6 +2176,10 @@ export function EditableFieldsList({
   const [drafts, setDrafts] = useState<Record<FieldKey, string>>(() =>
     Object.fromEntries(FIELD_DEFS.map((f) => [f.key, readField(data, f.key)])) as Record<FieldKey, string>
   )
+  // Per-field provenance: a populated field starts "AI-filled" (its value came
+  // from the extraction) and flips to user-verified once the user edits it:
+  // mirrors the create form's AiFilledIndicator. Reset when switching items.
+  const [edited, setEdited] = useState<Partial<Record<FieldKey, boolean>>>({})
   const timersRef = useRef<Partial<Record<FieldKey, ReturnType<typeof setTimeout>>>>({})
   // Last-known server values per field. Used to detect when the server
   // normalises a value (currency upper-cased, whitespace trimmed) so we can
@@ -1818,6 +2196,7 @@ export function EditableFieldsList({
     ) as Record<FieldKey, string>
     setDrafts(seeded)
     lastServerRef.current = seeded
+    setEdited({})
     return () => {
       for (const t of Object.values(timersRef.current)) {
         if (t) clearTimeout(t)
@@ -1829,7 +2208,7 @@ export function EditableFieldsList({
 
   // Re-seed drafts when the server returns normalised values (e.g. uppercased
   // currency, trimmed strings). Only update fields where the local draft
-  // matches the previous server value — i.e. the user hasn't typed anything
+  // matches the previous server value, i.e. the user hasn't typed anything
   // newer that we'd otherwise clobber.
   useEffect(() => {
     let dirty = false
@@ -1894,7 +2273,7 @@ export function EditableFieldsList({
         toast({
           variant: 'destructive',
           title: 'Nätverksfel',
-          description: err instanceof Error ? err.message : 'Kunde inte spara',
+          description: err instanceof Error ? getUserErrorMessage(err) : 'Kunde inte spara',
         })
         setDrafts((prev) => ({ ...prev, [key]: readField(data, key) }))
       }
@@ -1905,6 +2284,7 @@ export function EditableFieldsList({
   const onChange = useCallback(
     (key: FieldKey, raw: string) => {
       setDrafts((prev) => ({ ...prev, [key]: raw }))
+      setEdited((prev) => (prev[key] ? prev : { ...prev, [key]: true }))
       const existing = timersRef.current[key]
       if (existing) clearTimeout(existing)
       timersRef.current[key] = setTimeout(() => {
@@ -1935,12 +2315,18 @@ export function EditableFieldsList({
     <div className="space-y-2">
       {FIELD_DEFS.map((f) => (
         <div key={f.key} className="flex flex-col gap-0.5">
-          <label
-            htmlFor={`field-${f.key}`}
-            className="text-[10px] uppercase tracking-wide text-muted-foreground/80"
-          >
-            {f.label}
-          </label>
+          <div className="flex items-center justify-between gap-2">
+            <label
+              htmlFor={`field-${f.key}`}
+              className="text-[10px] uppercase tracking-wide text-muted-foreground/80"
+            >
+              {f.label}
+            </label>
+            <AiFilledIndicator
+              active={drafts[f.key].trim() !== '' && !edited[f.key]}
+              title="Ifyllt av AI: kontrollera mot dokumentet"
+            />
+          </div>
           <Input
             id={`field-${f.key}`}
             type={f.type}
@@ -1949,7 +2335,7 @@ export function EditableFieldsList({
             onChange={(e) => onChange(f.key, e.target.value)}
             onBlur={() => onBlur(f.key)}
             disabled={disabled}
-            placeholder="—"
+            placeholder="-"
             className={cn(
               'h-8 text-sm border-transparent bg-transparent px-2 -mx-2 hover:border-border focus-visible:border-ring',
               drafts[f.key] === '' && 'text-muted-foreground/50 italic'
@@ -1977,7 +2363,7 @@ export function EditableFieldsList({
       )}
       {disabled && (
         <p className="text-[10px] text-muted-foreground/70 pt-2">
-          Posten är kopplad till en leverantörsfaktura — fälten kan inte ändras.
+          Posten är kopplad till en leverantörsfaktura: fälten kan inte ändras.
         </p>
       )}
     </div>

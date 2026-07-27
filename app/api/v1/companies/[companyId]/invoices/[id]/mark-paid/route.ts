@@ -1,7 +1,7 @@
 /**
  * POST /api/v1/companies/{companyId}/invoices/{id}/mark-paid
  *
- * Manually marks an invoice as paid — for payments received outside the
+ * Manually marks an invoice as paid: for payments received outside the
  * bank-sync flow.
  *
  * Accounting:
@@ -10,7 +10,7 @@
  *   - Kontantmetoden (cash): Debit 1930 / Credit 30xx + Credit 26xx. Revenue
  *     recognition happens here (no entry at :mark-sent under cash basis).
  *
- * Optional request body (all fields optional — empty POST = book full payment
+ * Optional request body (all fields optional: empty POST = book full payment
  * on today's date with default lines):
  *   - payment_date              ISO date; defaults to today
  *   - exchange_rate_difference  SEK adjustment for foreign-currency invoices
@@ -29,7 +29,7 @@
 import { z } from 'zod'
 import { ok } from '@/lib/api/v1/response'
 import { dryRunPreview } from '@/lib/api/v1/dry-run'
-import { registerEndpoint } from '@/lib/api/v1/registry'
+import { registerEndpoint, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
 import { v1ErrorResponse, v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
 import { MarkInvoicePaidSchema } from '@/lib/api/schemas'
@@ -38,12 +38,19 @@ import {
   createInvoicePaymentJournalEntry,
 } from '@/lib/bookkeeping/invoice-entries'
 import { createJournalEntry, findFiscalPeriod } from '@/lib/bookkeeping/engine'
+import { AccountsNotInChartError } from '@/lib/bookkeeping/errors'
+import { getErrorMessage } from '@/lib/errors/get-error-message'
 import { eventBus } from '@/lib/events'
 import { findDuplicatePaymentCandidatesForInvoice } from '@/lib/invoices/duplicate-payment-candidates'
+import { planInvoicePaymentForLines } from '@/lib/invoices/apply-invoice-payment'
+import { roundOre } from '@/lib/money'
 import type { CreateJournalEntryInput, EntityType, Invoice } from '@/types'
 
+// default_dimensions must stay in this projection: the fetched row feeds the
+// payment/cash JE generators, which re-propagate the bag onto every leg —
+// dropping the column here silently untags the payment voucher.
 const INVOICE_MARK_PAID_RESPONSE_COLUMNS =
-  'id, invoice_number, customer_id, invoice_date, due_date, delivery_date, status, currency, exchange_rate, exchange_rate_date, subtotal, subtotal_sek, vat_amount, vat_amount_sek, total, total_sek, vat_treatment, vat_rate, moms_ruta, your_reference, our_reference, notes, reverse_charge_text, credited_invoice_id, document_type, converted_from_id, paid_at, paid_amount, remaining_amount, created_at, updated_at'
+  'id, invoice_number, customer_id, invoice_date, due_date, delivery_date, status, currency, exchange_rate, exchange_rate_date, subtotal, subtotal_sek, vat_amount, vat_amount_sek, total, total_sek, vat_treatment, vat_rate, moms_ruta, your_reference, our_reference, notes, reverse_charge_text, credited_invoice_id, document_type, converted_from_id, paid_at, paid_amount, remaining_amount, default_dimensions, created_at, updated_at'
 
 const InvoiceMarkPaidResponse = z.object({
   id: z.string().uuid(),
@@ -69,13 +76,14 @@ registerEndpoint({
   useWhen:
     'A customer paid an invoice via a channel other than the synced bank account (cash, manual transfer, separate processor). Use dry-run to confirm the booking before committing.',
   doNotUseFor:
-    'Reverting a payment — the public API does not expose unmark-paid. Issue a credit note via POST /:id/credit to cancel the underlying invoice instead. Bank-matched payments — those flow through the transactions endpoints.',
+    'Reverting a payment: the public API does not expose unmark-paid. Issue a credit note via POST /:id/credit to cancel the underlying invoice instead. Bank-matched payments: those flow through the transactions endpoints.',
   pitfalls: [
     'Idempotency-Key is mandatory. Retried marks with the same key replay the cached response.',
     'Custom `lines` must balance (sum of debits = sum of credits, both > 0). Otherwise returns 400 INVOICE_PAID_LINES_UNBALANCED.',
     'For foreign-currency invoices, supply `exchange_rate_difference` (SEK delta vs the invoice\'s booked rate) to book the FX adjustment correctly. Omitting it on a non-SEK invoice will mis-book the FX gain/loss.',
+    'Custom `lines` are journal lines and therefore SEK, while `total` / `paid_amount` / `remaining_amount` are stored in the invoice currency. The route converts the line total via `invoice.exchange_rate`; a non-SEK invoice with no exchange_rate on file returns 400 MATCH_INVOICE_BOOKING_RATE_MISSING rather than silently treating the SEK amount as invoice currency.',
     'Cash basis (kontantmetoden) recognizes revenue HERE, not at :mark-sent. The dashboard tracks this via company_settings.accounting_method.',
-    'Duplicate-payment guard: if an unlinked inbound bank transaction looks like this payment, returns 409 INVOICE_PAID_LIKELY_DUPLICATE with candidate transactions. Retry with `force: true` to bypass — but the retry MUST use a fresh Idempotency-Key (the original is body-hash bound; reusing it returns 400 IDEMPOTENCY_KEY_REUSE). The guard is also evaluated under dry-run, so a successful dry-run does not guarantee a successful commit.',
+    'Duplicate-payment guard: if an unlinked inbound bank transaction looks like this payment, returns 409 INVOICE_PAID_LIKELY_DUPLICATE with candidate transactions. Retry with `force: true` to bypass, but the retry MUST use a fresh Idempotency-Key (the original is body-hash bound; reusing it returns 400 IDEMPOTENCY_KEY_REUSE). The guard is also evaluated under dry-run, so a successful dry-run does not guarantee a successful commit.',
   ],
   example: {
     request: { payment_date: '2026-05-12' },
@@ -99,7 +107,7 @@ registerEndpoint({
   reversible: false,
   dryRunSupported: true,
   request: { body: MarkInvoicePaidSchema },
-  response: { success: InvoiceMarkPaidResponse },
+  response: { success: dataEnvelope(InvoiceMarkPaidResponse) },
 })
 
 export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string }> }>(
@@ -172,7 +180,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
     const { data: invoice, error: fetchErr } = await ctx.supabase
       .from('invoices')
       .select(
-        `${INVOICE_MARK_PAID_RESPONSE_COLUMNS}, journal_entry_id, customer:customers(id, name, customer_type), items:invoice_items(id, sort_order, description, quantity, unit, unit_price, line_total, vat_rate, vat_amount)`,
+        `${INVOICE_MARK_PAID_RESPONSE_COLUMNS}, journal_entry_id, customer:customers(id, name, customer_type), items:invoice_items(id, sort_order, description, quantity, unit, unit_price, line_total, vat_rate, vat_amount, dimensions)`,
       )
       .eq('company_id', ctx.companyId!)
       .eq('id', invoiceId)
@@ -246,46 +254,94 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
     // The JE shape is driven by the invoice's actual booking state, not the
     // company's current accounting_method. An invoice that was booked at send
     // under accrual (Dr 1510) must be cleared at payment regardless of where
-    // the setting sits today — otherwise the receivable orphans and 30xx +
+    // the setting sits today: otherwise the receivable orphans and 30xx +
     // VAT double-count. Only true kontantmetoden invoices (never booked)
     // recognise revenue + VAT here.
     const invoiceAlreadyBooked = !!(typed as { journal_entry_id?: string | null }).journal_entry_id
     const useCashEntry = !invoiceAlreadyBooked && accountingMethod === 'cash'
 
     // Compute the would-be payment amount. Default path (no customLines):
-    // use remaining_amount, not total — protects against over-crediting AR
+    // use remaining_amount, not total: protects against over-crediting AR
     // when a concurrent partial payment slips through the pre-flight check
     // (pre-flight sees status='sent' but the race-guard UPDATE later sees
     // status='partially_paid' so a second full-total amount would be booked
-    // against an already-reduced AR balance).
+    // against an already-reduced AR balance). For legacy rows where
+    // remaining_amount was never written, derive it from total − paid_amount
+    // rather than the full total. This is the booking-currency amount (SEK for
+    // custom lines) used by the duplicate guard, the JE builder, and the event.
     const paymentAmount = customLines
       ? customLines.reduce((s, l) => s + l.debit_amount, 0)
-      : (typed.remaining_amount ?? typed.total)
+      : (typed.remaining_amount ?? typed.total - (typed.paid_amount ?? 0))
 
-    const isPartial =
-      customLines !== undefined &&
-      Math.abs(paymentAmount - (typed.remaining_amount ?? typed.total)) > 0.005 // same half-öre epsilon as above
+    // Unit contract: total / paid_amount / remaining_amount are stored in the
+    // INVOICE currency (total_sek carries the SEK view of total, and there is
+    // no remaining_amount_sek twin); custom lines are journal lines, so they
+    // are always SEK. The SEK amount therefore has to be converted before it is
+    // compared against, or subtracted from, the invoice-currency remaining. The
+    // default path (no lines) already pays the remaining in invoice currency
+    // and needs no rate at all.
+    const isForeignCurrency = !!typed.currency && typed.currency !== 'SEK'
+    const needsFxConversion = isForeignCurrency && customLines !== undefined
+    const fxRate: number | null =
+      typed.exchange_rate && typed.exchange_rate > 0 ? typed.exchange_rate : null
+    if (needsFxConversion && fxRate === null) {
+      // Never fall back to rate 1: that reads an 11 496,70 kr payment against a
+      // 1 000 EUR invoice as 11 496,70 EUR and corrupts the AR sub-ledger.
+      // Same code as buildInvoicePaymentClearingLines' refusal
+      // (MATCH_INVOICE_BOOKING_RATE_MISSING, lib/bookkeeping/invoice-payment-lines.ts):
+      // one condition, one code across every invoice-settlement surface.
+      ctx.log.warn('mark-paid rejected: foreign-currency invoice without exchange rate', {
+        invoiceId,
+        currency: typed.currency,
+      })
+      return v1ErrorResponseFromCode('MATCH_INVOICE_BOOKING_RATE_MISSING', ctx.log, {
+        requestId: ctx.requestId,
+        details: { invoice_id: invoiceId, currency: typed.currency },
+      })
+    }
+    const paymentAmountInInvoiceCurrency = needsFxConversion
+      ? roundOre(paymentAmount / fxRate!)
+      : paymentAmount
 
-    const newRemaining = Math.max(
-      0,
-      Math.round(((typed.remaining_amount ?? typed.total) - paymentAmount) * 100) / 100,
+    // Ledger math + overpayment guard via the shared planInvoicePayment helper:
+    // the single source of truth across all three mark-paid surfaces (this route,
+    // the dashboard route, and the agent commit path), so the paid/remaining/
+    // status math can never drift again. It is FX-agnostic by contract, so it
+    // gets the converted amount.
+    // Custom-line SEK settlements absorb a sub-krona öresavrundning residual
+    // (rounded "Att betala" vs the stored öre total), but ONLY when the lines
+    // actually carry the residual on 3740: otherwise the strict plan applies
+    // (sub-krona partials stay partial, overshoot rejects), mirroring the
+    // dashboard mark-paid flow. The default path pays the exact remaining, so
+    // absorption is a no-op there.
+    const payment = planInvoicePaymentForLines(
+      typed,
+      paymentAmountInInvoiceCurrency,
+      customLines,
+      typed.currency ?? 'SEK',
     )
-    // 0.005 epsilon = half an öre. After rounding to 2 decimals above,
-    // newRemaining is in steps of 0.01; values ≤ 0.005 only arise from
-    // floating-point artefacts (e.g. 0.0000000001 from a SEK 99.99 payment
-    // against a SEK 99.99 invoice). Treating those as 'paid' avoids
-    // permanently-partially_paid invoices on full payment.
-    const newStatus: 'paid' | 'partially_paid' = newRemaining <= 0.005 ? 'paid' : 'partially_paid'
-    const newPaidAmount =
-      Math.round(((typed.paid_amount ?? 0) + paymentAmount) * 100) / 100
+    if (!payment.ok) {
+      return v1ErrorResponseFromCode('MATCH_AMOUNT_EXCEEDS_REMAINING', ctx.log, {
+        requestId: ctx.requestId,
+        details: payment.details,
+      })
+    }
+    const { newPaidAmount, newRemaining, newStatus, isFullyPaid } = payment.plan
+    const isPartial = customLines !== undefined && !isFullyPaid
 
     // Duplicate-payment guard: surface a likely-matching unlinked inbound
     // bank transaction before booking (or before dry-run preview, so a
     // successful dry-run can't mask the warning). Skipped on partial
     // payments (paymentAmount < remaining is an explicit, deliberate action),
     // on force=true, and on invoices without a resolved customer name.
+    // Both sides in invoice currency: remaining_amount is stored that way, so
+    // the SEK custom-line total must be the converted one, never the raw SEK.
+    // The candidate lookup below takes the same converted figure: it scans
+    // transactions.amount, which is denominated in the BANK ROW's currency
+    // (not necessarily kronor), and bands each currency separately from the
+    // invoice's stored conversion.
     const remainingForGuard = typed.remaining_amount ?? typed.total
-    const paidRoundedGuard = Math.round(paymentAmount * 100) / 100
+    const paidRoundedGuard = Math.round(paymentAmountInInvoiceCurrency * 100) / 100
     const remainingRoundedGuard = Math.round(remainingForGuard * 100) / 100
     if (!force && paidRoundedGuard >= remainingRoundedGuard) {
       const customerName = typed.customer?.name
@@ -297,8 +353,15 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       } else {
         const candidates = await findDuplicatePaymentCandidatesForInvoice(ctx.supabase, {
           companyId: ctx.companyId!,
-          invoice: { invoice_number: typed.invoice_number, customer_name: customerName },
-          paymentAmount,
+          invoice: {
+            invoice_number: typed.invoice_number,
+            customer_name: customerName,
+            currency: typed.currency ?? null,
+            total: typed.total ?? null,
+            total_sek: typed.total_sek ?? null,
+            exchange_rate: typed.exchange_rate ?? null,
+          },
+          paymentAmount: paymentAmountInInvoiceCurrency,
           paymentDate,
         })
         if (candidates.length > 0) {
@@ -402,21 +465,31 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
         }
 
         if (!journalEntryId) {
-          warnings.push({
-            code: 'JOURNAL_ENTRY_NOT_POSTED',
-            message:
-              'Payment journal entry was not created (likely no open fiscal period). Verify the period and book manually if required.',
+          // Fail closed: a real invoice must produce a posted payment voucher.
+          // A null here (e.g. no open fiscal period) means nothing was booked,
+          // so flipping the invoice to paid/partially_paid would diverge the GL
+          // from the AR sub-ledger. Abort BEFORE the invoice update below:
+          // mirrors the v1 match-invoice strict mode.
+          ctx.log.error('mark-paid: no payment journal entry produced: aborting before state mutation', undefined, {
+            invoiceId,
+            companyId: ctx.companyId,
+          })
+          return v1ErrorResponseFromCode('INVOICE_PAID_BOOK_FAILED', ctx.log, {
+            requestId: ctx.requestId,
+            details: { reason: 'no_journal_entry_created' },
           })
         }
       } catch (err) {
-        ctx.log.error('mark-paid: journal entry creation failed', err as Error, {
+        if (err instanceof AccountsNotInChartError) {
+          return v1ErrorResponse(err, ctx.log, { requestId: ctx.requestId })
+        }
+        ctx.log.error('mark-paid: payment JE creation failed: aborting before state mutation', err as Error, {
           invoiceId,
           companyId: ctx.companyId,
         })
-        warnings.push({
-          code: 'JOURNAL_ENTRY_NOT_POSTED',
-          message:
-            'Payment was recorded but the journal entry posting failed. Check the engine logs; reconcile before period close.',
+        return v1ErrorResponseFromCode('INVOICE_PAID_BOOK_FAILED', ctx.log, {
+          requestId: ctx.requestId,
+          details: { reason: getErrorMessage(err, { context: 'invoice' }) },
         })
       }
     }
@@ -461,7 +534,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
     if (!updated) {
       // Race: status transitioned (concurrent mark-paid / credit) between
       // pre-flight and our update. Surface as 409.
-      ctx.log.warn('mark-paid: race — invoice status transitioned during request', {
+      ctx.log.warn('mark-paid: race: invoice status transitioned during request', {
         invoiceId,
         companyId: ctx.companyId,
       })

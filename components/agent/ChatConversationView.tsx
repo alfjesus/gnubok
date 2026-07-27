@@ -3,8 +3,10 @@
 import { useMemo } from 'react'
 import Link from 'next/link'
 import { ArrowLeft } from 'lucide-react'
-import AgentChat, { normalizeStoredMessages } from './AgentChat'
+import AgentChat, { attachStagedOperations, normalizeStoredMessages } from './AgentChat'
+import type { StoredStagedOperation } from '@/types'
 import AgentAvatar from './AgentAvatar'
+import ContextChip from './ContextChip'
 import SandboxAgentPreview from './SandboxAgentPreview'
 import { useAgentSheet } from './AgentSheetProvider'
 import { useCompanyOptional } from '@/contexts/CompanyContext'
@@ -15,6 +17,10 @@ interface Props {
   contextRef: string | null
   title: string
   rawMessages: { role: string; content: unknown; hidden?: boolean }[]
+  // Proposals this conversation staged that are still awaiting an answer, so
+  // the approval card reappears on resume instead of the proposal silently
+  // waiting out its expiry in Granskning.
+  stagedOperations?: StoredStagedOperation[]
 }
 
 // Full-page conversation view. Wraps AgentChat with a header that shows the
@@ -25,8 +31,12 @@ export default function ChatConversationView({
   contextRef,
   title,
   rawMessages,
+  stagedOperations,
 }: Props) {
-  const initialMessages = useMemo(() => normalizeStoredMessages(rawMessages), [rawMessages])
+  const initialMessages = useMemo(
+    () => attachStagedOperations(normalizeStoredMessages(rawMessages), stagedOperations ?? []),
+    [rawMessages, stagedOperations],
+  )
   const { identity } = useAgentSheet()
   const companyCtx = useCompanyOptional()
   const isSandbox = companyCtx?.isSandbox ?? false
@@ -50,10 +60,11 @@ export default function ChatConversationView({
           alt={identity.displayName ?? 'Assistent'}
         />
         <div className="min-w-0">
-          <h1 className="font-display text-lg tracking-tight truncate">{title}</h1>
-          {contextRef && (
-            <p className="text-xs text-muted-foreground truncate">{contextRef}</p>
-          )}
+          <h1 className="font-display text-lg leading-tight tracking-tight truncate">{title}</h1>
+          {/* Was printing context_ref raw, so the subtitle read
+              "invoice:5f3a-9c21-...": a database identifier, shown to an
+              accountant, under the title of their own conversation. */}
+          <ContextChip contextRef={contextRef} className="mt-0.5" />
         </div>
       </header>
 

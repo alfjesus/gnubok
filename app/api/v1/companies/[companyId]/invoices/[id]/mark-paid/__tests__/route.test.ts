@@ -48,6 +48,7 @@ import {
   createInvoiceCashEntry as mockedCash,
 } from '@/lib/bookkeeping/invoice-entries'
 import { POST as markPaid } from '../route'
+import { eventBus } from '@/lib/events'
 
 const mockValidate = validateApiKey as ReturnType<typeof vi.fn>
 const mockServiceClient = createServiceClientNoCookies as ReturnType<typeof vi.fn>
@@ -137,6 +138,7 @@ const PAID_INVOICE = {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  eventBus.clear()
   mockValidate.mockResolvedValue({
     userId: USER_ID,
     companyId: COMPANY_ID,
@@ -160,6 +162,9 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
       }),
     )
 
+    const paidHandler = vi.fn()
+    eventBus.on('invoice.paid', paidHandler)
+
     const res = await markPaid(
       makeRequest(
         `https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/mark-paid`,
@@ -175,6 +180,11 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
     expect(body.data.journal_entry_id).toBe('jjjjjjjj-jjjj-4jjj-8jjj-jjjjjjjjjjjj')
     expect(mockPayment).toHaveBeenCalled()
     expect(mockCash).not.toHaveBeenCalled()
+    // invoice.paid must fire so registered webhooks fan out (issue #825).
+    expect(paidHandler).toHaveBeenCalledTimes(1)
+    expect(paidHandler).toHaveBeenCalledWith(
+      expect.objectContaining({ companyId: COMPANY_ID, userId: USER_ID, paymentAmount: 12500 }),
+    )
   })
 
   it('uses the cash-basis booking when accounting_method=cash', async () => {
@@ -227,7 +237,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
     expect(res.status).toBe(200)
 
     const invoiceSelects = calls.filter((c) => c.table === 'invoices' && c.method === 'select')
-    // Pre-flight select must fetch journal_entry_id — invoiceAlreadyBooked
+    // Pre-flight select must fetch journal_entry_id: invoiceAlreadyBooked
     // routing reads it; omitting it silently forces the cash path.
     expect(invoiceSelects.length).toBeGreaterThanOrEqual(2)
     expect(String(invoiceSelects[0].args[0])).toContain('journal_entry_id')
@@ -260,7 +270,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
     )
 
     expect(res.status).toBe(200)
-    // Already-booked → clearing entry (Dr 1930 / Cr 1510), NOT a cash entry —
+    // Already-booked → clearing entry (Dr 1930 / Cr 1510), NOT a cash entry:
     // a cash entry here would re-recognise revenue + VAT (double-booking).
     expect(mockPayment).toHaveBeenCalled()
     expect(mockCash).not.toHaveBeenCalled()
@@ -327,6 +337,80 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
     expect(res.status).toBe(400)
     const body = await res.json()
     expect(body.error.code).toBe('INVOICE_PAID_LINES_UNBALANCED')
+  })
+
+  it('returns 400 MATCH_AMOUNT_EXCEEDS_REMAINING when custom lines overpay the invoice', async () => {
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        invoices: { data: SENT_INVOICE, error: null },
+        company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
+      }),
+    )
+
+    // 15000 paid against a 12500 remaining → shared planInvoicePayment guard
+    // rejects BEFORE any journal entry is booked.
+    const res = await markPaid(
+      makeRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/mark-paid`,
+        {
+          lines: [
+            { account_number: '1930', debit_amount: 15000, credit_amount: 0 },
+            { account_number: '1510', debit_amount: 0, credit_amount: 15000 },
+          ],
+        },
+      ),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error.code).toBe('MATCH_AMOUNT_EXCEEDS_REMAINING')
+    expect(mockPayment).not.toHaveBeenCalled()
+  })
+
+  it('absorbs an öresavrundning overshoot on SEK custom lines (rounded "Att betala")', async () => {
+    // Invoice stored with öre (1234.75); the PDF shows 1235.00 and the customer
+    // pays that. The 3740 line carries the residual and the invoice settles in
+    // full instead of being rejected as an overpayment.
+    const ORE_INVOICE = {
+      ...SENT_INVOICE,
+      subtotal: 987.8,
+      vat_amount: 246.95,
+      total: 1234.75,
+      remaining_amount: 1234.75,
+    }
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        invoices: [
+          { data: ORE_INVOICE, error: null },
+          { data: { ...ORE_INVOICE, status: 'paid', remaining_amount: 0, paid_amount: 1234.75 }, error: null },
+        ],
+        company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
+        transactions: { data: [], error: null },
+      }),
+    )
+
+    const res = await markPaid(
+      makeRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/mark-paid`,
+        {
+          payment_date: '2026-05-12',
+          lines: [
+            { account_number: '1930', debit_amount: 1235, credit_amount: 0 },
+            { account_number: '1510', debit_amount: 0, credit_amount: 1234.75 },
+            { account_number: '3740', debit_amount: 0, credit_amount: 0.25 },
+          ],
+        },
+      ),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.data.status).toBe('paid')
+    expect(body.data.remaining_amount).toBe(0)
   })
 
   it('returns 400 INVOICE_PAID_NOT_PAYABLE for draft invoices', async () => {
@@ -547,5 +631,226 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
     )
 
     expect(res.status).toBe(403)
+  })
+
+  it('returns 401 when no bearer token is supplied', async () => {
+    mockServiceClient.mockReturnValue(makeFlexibleSupabase({}))
+
+    const res = await markPaid(
+      new Request(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/mark-paid`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Idempotency-Key': 'idem4041-4041-4abc-8def-1234567890ab',
+          },
+        },
+      ),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    expect(res.status).toBe(401)
+    expect(mockPayment).not.toHaveBeenCalled()
+  })
+
+  // ------------------------------------------------------------------
+  // Foreign-currency unit handling.
+  // total / paid_amount / remaining_amount are stored in the INVOICE currency;
+  // custom lines are journal lines and therefore SEK.
+  // ------------------------------------------------------------------
+
+  const EUR_INVOICE = {
+    ...SENT_INVOICE,
+    currency: 'EUR',
+    exchange_rate: 11.4967,
+    subtotal: 800,
+    vat_amount: 200,
+    total: 1000,
+    total_sek: 11496.7,
+    remaining_amount: 1000,
+    paid_amount: 0,
+  }
+
+  it('converts a SEK custom-line payment to invoice currency on a EUR invoice (partial)', async () => {
+    // 5 748,35 kr against a 1 000 EUR invoice at 11,4967 is exactly 500 EUR: a
+    // genuine partial. Comparing the raw SEK total against the invoice-currency
+    // remaining read it as a full settlement and let the duplicate-payment
+    // guard 409 it on the matching bank row below.
+    const calls: RecordedCall[] = []
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase(
+        {
+          company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+          invoices: [
+            { data: EUR_INVOICE, error: null },
+            {
+              data: { ...EUR_INVOICE, status: 'partially_paid', remaining_amount: 500, paid_amount: 500 },
+              error: null,
+            },
+          ],
+          company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
+          transactions: {
+            data: [
+              {
+                id: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+                date: '2026-05-10',
+                amount: 5748.35,
+                description: 'Inbetalning Acme AB',
+                merchant_name: 'Acme AB',
+                reference: null,
+              },
+            ],
+            error: null,
+          },
+        },
+        calls,
+      ),
+    )
+
+    const res = await markPaid(
+      makeRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/mark-paid`,
+        {
+          payment_date: '2026-05-12',
+          lines: [
+            { account_number: '1930', debit_amount: 5748.35, credit_amount: 0 },
+            { account_number: '1510', debit_amount: 0, credit_amount: 5748.35 },
+          ],
+        },
+      ),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    expect(res.status).toBe(200)
+
+    // The persisted ledger math is the assertion that matters: both values in
+    // EUR, never 5 748,35 and never a negative remainder.
+    const update = calls.find((c) => c.table === 'invoices' && c.method === 'update')
+    expect(update).toBeDefined()
+    expect(update!.args[0]).toMatchObject({
+      status: 'partially_paid',
+      paid_amount: 500,
+      remaining_amount: 500,
+    })
+    // The guard compares in invoice currency now, so this stays a partial and
+    // the transactions scan never runs: the matching bank row above would
+    // otherwise have 409'd a perfectly valid partial payment.
+    expect(calls.some((c) => c.table === 'transactions')).toBe(false)
+  })
+
+  it('still runs the duplicate guard when the converted SEK lines settle a EUR invoice in full', async () => {
+    // The complement of the test above: 11 496,70 kr at 11,4967 is exactly the
+    // 1 000 EUR remaining, so this IS a full settlement and the advisory must
+    // still fire. Converting for the comparison must not disable the guard on
+    // foreign-currency invoices.
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        invoices: { data: EUR_INVOICE, error: null },
+        company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
+        transactions: {
+          // In kronor: the candidate lookup scans transactions.amount, which is SEK.
+          data: [
+            {
+              id: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+              date: '2026-05-10',
+              amount: 11496.7,
+              description: 'Inbetalning Acme AB',
+              merchant_name: 'Acme AB',
+              reference: null,
+            },
+          ],
+          error: null,
+        },
+      }),
+    )
+
+    const res = await markPaid(
+      makeRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/mark-paid`,
+        {
+          payment_date: '2026-05-12',
+          lines: [
+            { account_number: '1930', debit_amount: 11496.7, credit_amount: 0 },
+            { account_number: '1510', debit_amount: 0, credit_amount: 11496.7 },
+          ],
+        },
+      ),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    expect(res.status).toBe(409)
+    const body = await res.json()
+    expect(body.error.code).toBe('INVOICE_PAID_LIKELY_DUPLICATE')
+    expect(body.error.details.candidates[0].id).toBe('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee')
+  })
+
+  it('returns 400 MATCH_INVOICE_BOOKING_RATE_MISSING when a EUR invoice carries no exchange rate', async () => {
+    // 11 496,70 kr against a 1 000 EUR invoice with no rate on file. Defaulting
+    // the rate to 1 would read the payment as 11 496,70 EUR.
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        invoices: { data: { ...EUR_INVOICE, exchange_rate: null, total_sek: null }, error: null },
+        company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
+      }),
+    )
+
+    const res = await markPaid(
+      makeRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/mark-paid`,
+        {
+          payment_date: '2026-05-12',
+          lines: [
+            { account_number: '1930', debit_amount: 11496.7, credit_amount: 0 },
+            { account_number: '1510', debit_amount: 0, credit_amount: 11496.7 },
+          ],
+        },
+      ),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    // Same code the bank-match path throws for the same condition
+    // (lib/bookkeeping/invoice-payment-lines.ts).
+    expect(body.error.code).toBe('MATCH_INVOICE_BOOKING_RATE_MISSING')
+    expect(body.error.details.currency).toBe('EUR')
+    expect(mockPayment).not.toHaveBeenCalled()
+  })
+
+  it('still pays a rate-less EUR invoice in full when no custom lines are supplied', async () => {
+    // The default path pays remaining_amount, already in invoice currency: no
+    // conversion happens, so no rate is required and nothing is rejected.
+    const calls: RecordedCall[] = []
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase(
+        {
+          company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+          invoices: [
+            { data: { ...EUR_INVOICE, exchange_rate: null, total_sek: null }, error: null },
+            {
+              data: { ...EUR_INVOICE, exchange_rate: null, status: 'paid', remaining_amount: 0, paid_amount: 1000 },
+              error: null,
+            },
+          ],
+          company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
+        },
+        calls,
+      ),
+    )
+
+    const res = await markPaid(
+      makeRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/mark-paid`,
+        { payment_date: '2026-05-12' },
+      ),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    expect(res.status).toBe(200)
+    const update = calls.find((c) => c.table === 'invoices' && c.method === 'update')
+    expect(update!.args[0]).toMatchObject({ status: 'paid', paid_amount: 1000, remaining_amount: 0 })
   })
 })

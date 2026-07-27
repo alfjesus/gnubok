@@ -4,17 +4,25 @@ import { useState, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { useLocale, useTranslations } from 'next-intl'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
-import { Sun, Moon, Monitor, LogOut, Languages, ExternalLink } from 'lucide-react'
+import { Sun, Moon, Monitor, LogOut, ExternalLink } from 'lucide-react'
 import { useTheme } from 'next-themes'
 import { createClient } from '@/lib/supabase/client'
 import { SecuritySettings } from '@/components/settings/SecuritySettings'
+import { InstallAppSection } from '@/components/settings/InstallAppSection'
 import { CalendarFeedSettings } from '@/components/settings/CalendarFeedSettings'
 import { AccountDangerZone } from '@/components/settings/AccountDangerZone'
+import {
+  SettingsGroup,
+  SettingsInput,
+  SettingsRow,
+  SettingsRowEnd,
+  SettingsSectionHeader,
+  SettingsSeg,
+} from '@/components/settings/SettingsRows'
 import { ENABLED_EXTENSION_IDS } from '@/lib/extensions/_generated/enabled-extensions'
 import { useSettings } from '@/components/settings/useSettings'
-import { clearRecaptIdentity } from '@/lib/recapt'
+import { resetAnalyticsIdentity } from '@/lib/analytics/reset'
 import { useToast } from '@/components/ui/use-toast'
 import { SUPPORTED_LOCALES, type Locale } from '@/i18n/config'
 
@@ -29,12 +37,61 @@ export function AccountSettingsContent() {
   const activeLocale = useLocale() as Locale
   const tCommon = useTranslations('common')
   const tSettings = useTranslations('settings')
+  const tNav = useTranslations('settings_nav')
+  const tIntro = useTranslations('settings_intro')
   const [savingLocale, setSavingLocale] = useState(false)
+  const [fullName, setFullName] = useState('')
+  const [initialName, setInitialName] = useState('')
+  const [nameLoading, setNameLoading] = useState(true)
+  const [savingName, setSavingName] = useState(false)
 
   useEffect(() => { setMounted(true) }, [])
 
+  // Pre-fill the name field from profiles.full_name. Self-contained client
+  // fetch: mirrors BankIdSettings.
+  useEffect(() => {
+    let active = true
+    ;(async () => {
+      const { data: { user } } = await supabase.auth.getUser()
+      if (!user) { if (active) setNameLoading(false); return }
+      const { data } = await supabase
+        .from('profiles')
+        .select('full_name')
+        .eq('id', user.id)
+        .maybeSingle()
+      if (!active) return
+      setFullName(data?.full_name ?? '')
+      setInitialName(data?.full_name ?? '')
+      setNameLoading(false)
+    })()
+    return () => { active = false }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  async function handleSaveName() {
+    const trimmed = fullName.trim()
+    if (!trimmed || trimmed === initialName || savingName) return
+    setSavingName(true)
+    try {
+      const res = await fetch('/api/user/profile', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ full_name: trimmed }),
+      })
+      if (!res.ok) throw new Error('Could not save')
+      setFullName(trimmed)
+      setInitialName(trimmed)
+      toast({ title: tSettings('name_saved') })
+      router.refresh()
+    } catch {
+      toast({ title: tSettings('name_save_failed'), variant: 'destructive' })
+    } finally {
+      setSavingName(false)
+    }
+  }
+
   async function handleLogout() {
-    clearRecaptIdentity()
+    resetAnalyticsIdentity()
     await supabase.auth.signOut()
     router.push('/login')
   }
@@ -66,129 +123,141 @@ export function AccountSettingsContent() {
     en: tCommon('language_english'),
   }
 
+  const nameUnchanged = !fullName.trim() || fullName.trim() === initialName
+
   return (
-    <div className="space-y-8">
-      {/* Appearance */}
-      <section className="space-y-4">
-        <h2 className="text-sm font-medium uppercase tracking-wider text-muted-foreground">
-          {tSettings('section_appearance')}
-        </h2>
-        {mounted && (
-          <div className="flex gap-3">
-            {([
-              { value: 'light', labelKey: 'theme_light', icon: Sun },
-              { value: 'dark', labelKey: 'theme_dark', icon: Moon },
-              { value: 'system', labelKey: 'theme_system', icon: Monitor },
-            ] as const).map(({ value, labelKey, icon: Icon }) => (
-              <button
-                key={value}
-                type="button"
-                onClick={() => setTheme(value)}
-                className={`flex items-center gap-2 rounded-lg border-2 px-4 py-2.5 text-sm font-medium transition-colors ${
-                  theme === value
-                    ? 'border-primary bg-primary/5'
-                    : 'border-border hover:border-primary/40'
-                }`}
-              >
-                <Icon className="h-4 w-4 text-muted-foreground" />
-                {tCommon(labelKey)}
-              </button>
-            ))}
-          </div>
-        )}
-      </section>
+    <div>
+      <SettingsSectionHeader title={tNav('account')} intro={tIntro('account')} />
 
-      {/* Language */}
-      <section className="space-y-4 border-t border-border pt-8">
-        <h2 className="text-sm font-medium uppercase tracking-wider text-muted-foreground">
-          {tSettings('section_language')}
-        </h2>
-        <p className="text-sm text-muted-foreground max-w-md">
-          {tSettings('language_description')}
-        </p>
-        <div className="flex gap-3">
-          {SUPPORTED_LOCALES.map((value) => (
-            <button
-              key={value}
-              type="button"
-              onClick={() => handleLocaleChange(value)}
-              disabled={savingLocale}
-              className={`flex items-center gap-2 rounded-lg border-2 px-4 py-2.5 text-sm font-medium transition-colors disabled:opacity-50 ${
-                activeLocale === value
-                  ? 'border-primary bg-primary/5'
-                  : 'border-border hover:border-primary/40'
-              }`}
+      {/* Profile: name, appearance, language, install-as-app */}
+      <SettingsGroup label={tSettings('group_profile')}>
+        <SettingsRow
+          label={tSettings('name_label')}
+          htmlFor="full_name"
+          help={tSettings('name_description')}
+          align="baseline"
+        >
+          <SettingsInput
+            id="full_name"
+            value={fullName}
+            onChange={(e) => setFullName(e.target.value)}
+            placeholder={tSettings('name_placeholder')}
+            disabled={nameLoading || savingName}
+            maxLength={100}
+          />
+          <SettingsRowEnd>
+            <Button
+              size="sm"
+              onClick={handleSaveName}
+              disabled={nameLoading || savingName || nameUnchanged}
             >
-              <Languages className="h-4 w-4 text-muted-foreground" />
-              {localeLabels[value]}
-            </button>
-          ))}
-        </div>
-      </section>
+              {savingName ? tCommon('saving') : tCommon('save')}
+            </Button>
+          </SettingsRowEnd>
+        </SettingsRow>
 
-      {/* Security */}
-      <div className="border-t border-border pt-8">
-        <SecuritySettings />
-      </div>
+        <SettingsRow label={tSettings('section_appearance')}>
+          {mounted && (
+            <SettingsSeg
+              value={theme ?? 'system'}
+              onChange={setTheme}
+              aria-label={tSettings('section_appearance')}
+              options={[
+                {
+                  value: 'light',
+                  label: (
+                    <span className="inline-flex items-center gap-1.5">
+                      <Sun className="h-3.5 w-3.5" />
+                      {tCommon('theme_light')}
+                    </span>
+                  ),
+                },
+                {
+                  value: 'dark',
+                  label: (
+                    <span className="inline-flex items-center gap-1.5">
+                      <Moon className="h-3.5 w-3.5" />
+                      {tCommon('theme_dark')}
+                    </span>
+                  ),
+                },
+                {
+                  value: 'system',
+                  label: (
+                    <span className="inline-flex items-center gap-1.5">
+                      <Monitor className="h-3.5 w-3.5" />
+                      {tCommon('theme_system')}
+                    </span>
+                  ),
+                },
+              ]}
+            />
+          )}
+        </SettingsRow>
 
-      {/* Calendar feed */}
-      {hasCalendarExtension && (
-        <div className="border-t border-border pt-8">
-          <CalendarFeedSettings />
-        </div>
-      )}
+        <SettingsRow
+          label={tSettings('section_language')}
+          help={tSettings('language_description')}
+        >
+          <SettingsSeg
+            value={activeLocale}
+            onChange={(next) => void handleLocaleChange(next)}
+            disabled={savingLocale}
+            aria-label={tSettings('section_language')}
+            options={SUPPORTED_LOCALES.map((value) => ({
+              value,
+              label: localeLabels[value],
+            }))}
+          />
+        </SettingsRow>
 
-      {/* Logout */}
-      <section className="border-t border-border pt-8">
-        <Card>
-          <CardHeader>
-            <CardTitle>{tCommon('account_settings')}</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="flex items-center justify-between p-4 border rounded-lg">
-              <div>
-                <p className="font-medium">{tCommon('logout')}</p>
-                <p className="text-sm text-muted-foreground">{tCommon('logout_description')}</p>
-              </div>
-              <Button variant="outline" onClick={handleLogout}>
-                <LogOut className="mr-2 h-4 w-4" />
-                {tCommon('logout')}
-              </Button>
-            </div>
-          </CardContent>
-        </Card>
-      </section>
+        {/* Install as app: renders nothing when already running installed */}
+        <InstallAppSection />
+      </SettingsGroup>
 
-      {/* Privacy & agreements — surface the otherwise-unlinked DPA + privacy policy */}
-      <section className="border-t border-border pt-8">
-        <Card>
-          <CardHeader>
-            <CardTitle>{tSettings('legal_title')}</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-2">
-            <Link
-              href="/privacy"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="flex items-center justify-between rounded-lg border p-4 transition-colors hover:bg-secondary/60"
-            >
-              <span className="font-medium">{tSettings('legal_privacy')}</span>
-              <ExternalLink className="h-4 w-4 text-muted-foreground" />
-            </Link>
-            <Link
-              href="/dpa"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="flex items-center justify-between rounded-lg border p-4 transition-colors hover:bg-secondary/60"
-            >
-              <span className="font-medium">{tSettings('legal_dpa')}</span>
-              <ExternalLink className="h-4 w-4 text-muted-foreground" />
-            </Link>
-          </CardContent>
-        </Card>
-      </section>
+      {/* Security: BankID, password, 2FA (renders its own group) */}
+      <SecuritySettings />
 
-      {/* Delete account — only for non-sandbox */}
+      {/* Calendar feed (extension-gated) */}
+      {hasCalendarExtension && <CalendarFeedSettings />}
+
+      {/* Privacy & agreements: surface the otherwise-unlinked DPA + privacy policy */}
+      <SettingsGroup label={tSettings('legal_title')}>
+        <SettingsRow label={tSettings('legal_privacy')}>
+          <SettingsRowEnd>
+            <Button variant="outline" size="sm" asChild>
+              <Link href="/privacy" target="_blank" rel="noopener noreferrer">
+                <ExternalLink className="mr-2 h-3.5 w-3.5" />
+                {tCommon('open')}
+              </Link>
+            </Button>
+          </SettingsRowEnd>
+        </SettingsRow>
+        <SettingsRow label={tSettings('legal_dpa')}>
+          <SettingsRowEnd>
+            <Button variant="outline" size="sm" asChild>
+              <Link href="/dpa" target="_blank" rel="noopener noreferrer">
+                <ExternalLink className="mr-2 h-3.5 w-3.5" />
+                {tCommon('open')}
+              </Link>
+            </Button>
+          </SettingsRowEnd>
+        </SettingsRow>
+      </SettingsGroup>
+
+      {/* Sign out */}
+      <SettingsGroup>
+        <SettingsRow label={tCommon('logout')} help={tCommon('logout_description')}>
+          <SettingsRowEnd>
+            <Button variant="outline" size="sm" onClick={handleLogout}>
+              <LogOut className="mr-2 h-3.5 w-3.5" />
+              {tCommon('logout')}
+            </Button>
+          </SettingsRowEnd>
+        </SettingsRow>
+      </SettingsGroup>
+
+      {/* Delete account: only for non-sandbox */}
       {!settings?.is_sandbox && <AccountDangerZone />}
     </div>
   )

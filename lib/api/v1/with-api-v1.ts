@@ -13,9 +13,12 @@
  *      the token when one is supplied.
  *   4. When the URL contains `companyId`, verifies the API key's user has
  *      access to that company via `company_members`. Multi-company keys are
- *      supported transparently — the URL is the source of truth.
- *   5. Resolves `Idempotency-Key` (header) and replays cached responses.
- *   6. Resolves the dry-run flag (`?dry_run=true` query OR `X-Dry-Run` header).
+ *      supported transparently: the URL is the source of truth.
+ *   5. Resolves the dry-run flag (`?dry_run=true` query OR `X-Dry-Run` header).
+ *   6. Resolves `Idempotency-Key` (header) and replays cached responses. The
+ *      dry-run flag is part of the cache identity and dry-run responses are
+ *      never cached, so a simulation can never be replayed in place of the
+ *      real write that follows it.
  *   7. Invokes the handler with a typed RouteContext.
  *   8. Stamps `X-Request-Id`, `Gnubok-Version`, `X-RateLimit-Limit` on the
  *      response.
@@ -46,11 +49,12 @@ import {
 // Per CLAUDE.md: any route that emits events via eventBus must call
 // ensureInitialized() at module level to wire extension event handlers
 // (email, cloud-backup, push-notifications, etc.). Calling it here in the
-// wrapper guarantees every v1 route gets the init at import time — a single
+// wrapper guarantees every v1 route gets the init at import time: a single
 // source of truth so future routes can't forget. The function itself is
 // idempotent (guarded by a module-level boolean).
 ensureInitialized()
 import { resolveRequiredScope } from '@/lib/auth/scopes'
+import { getEndpointByConcretePath } from './registry'
 import {
   checkIdempotencyKey,
   hashRequest,
@@ -64,10 +68,14 @@ import { API_V1_VERSION, API_V1_VERSION_HEADER } from './version'
 
 const IDEMPOTENCY_HEADER = 'Idempotency-Key'
 const DRY_RUN_HEADER = 'X-Dry-Run'
-const REQUIRES_IDEMPOTENCY = new Set(['POST', 'PATCH', 'DELETE'])
+// Every state-changing method. PUT is included even though most v1 writes are
+// POST/PATCH: the set drives THREE behaviors (test-key dry-run forcing,
+// idempotency replay, requireIdempotencyKey enforcement), and omitting PUT
+// would let test keys write through PUT routes for real.
+const REQUIRES_IDEMPOTENCY = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
 
 export interface ApiV1Context {
-  /** Stable id for this HTTP request — appears in logs, error envelope, X-Request-Id. */
+  /** Stable id for this HTTP request: appears in logs, error envelope, X-Request-Id. */
   requestId: string
   /** Logger pre-bound with { requestId, userId, companyId?, operation, apiKeyId? }. */
   log: Logger
@@ -79,7 +87,11 @@ export interface ApiV1Context {
   apiKeyName: string | undefined
   /** Scopes granted to the calling key. */
   scopes: ApiKeyScope[]
-  /** test|live — handlers branch on this to short-circuit external providers in test mode. */
+  /**
+   * test|live. Test keys are simulation-only: the wrapper forces `dryRun` on
+   * for every write, so handlers never need to special-case `mode`; they just
+   * honor `dryRun` as usual.
+   */
   mode: ApiKeyMode
   /** Service-role Supabase client (no cookies). All queries MUST filter by company_id. */
   supabase: SupabaseClient
@@ -99,7 +111,7 @@ interface ApiV1Options {
   /** Override the required scope (e.g. for ad-hoc endpoints not in the catalogue). */
   requireScope?: ApiKeyScope
   /**
-   * When true, idempotency is enforced — POST/PATCH/DELETE without an
+   * When true, idempotency is enforced: POST/PATCH/DELETE without an
    * `Idempotency-Key` header return 400. Default false; can be flipped on
    * per-route once the integrator audience is sophisticated enough.
    */
@@ -125,7 +137,7 @@ function generateRequestId(): string {
  * enforced (no service-role privilege escalation) so even an accidental DB
  * call from a public handler is constrained to anon-accessible rows.
  *
- * Fails closed at first-call if the required env vars are missing — better
+ * Fails closed at first-call if the required env vars are missing: better
  * to surface the misconfiguration on the first request than silently 500
  * deeper in the handler.
  */
@@ -180,8 +192,8 @@ function extractForensicContext(request: Request, log: Logger): { ip: string | u
   if (raw && !ip) {
     // x-forwarded-for / x-real-ip carried a non-empty payload we couldn't parse.
     // Surface as a warn so spoofed / unexpected proxy values are visible in
-    // security monitoring instead of silently dropped. Never log the raw value
-    // — that would defeat the truncation step.
+    // security monitoring instead of silently dropped. Never log the raw value:
+    // that would defeat the truncation step.
     log.warn('unparseable forwarded-for header dropped', { headerLength: raw.length })
   }
   const userAgent = request.headers.get('user-agent') ?? undefined
@@ -189,15 +201,56 @@ function extractForensicContext(request: Request, log: Logger): { ip: string | u
 }
 
 function isDryRun(request: Request, url: URL): boolean {
-  if (url.searchParams.get('dry_run') === 'true') return true
+  // Case-insensitive on BOTH surfaces. The header was always lowercased, but
+  // the query flag used to require exactly 'true', so '?dry_run=True'
+  // committed for real while the caller believed it previewed: the worst
+  // possible parse of a preview flag. Any other value ('1', 'yes', 'false')
+  // stays non-dry-run, unchanged.
+  const queryVal = url.searchParams.get('dry_run')
+  if (queryVal !== null && queryVal.toLowerCase() === 'true') return true
   const headerVal = request.headers.get(DRY_RUN_HEADER)
   if (headerVal && headerVal.toLowerCase() === 'true') return true
   return false
 }
 
+/**
+ * Canonical idempotency hash for a v1 request.
+ *
+ * `dryRun` is part of the identity of the request. The documented commit flow
+ * (see `dry-run.ts`) is "re-issue the exact same request without
+ * `dry_run=true`, same Idempotency-Key", so a simulation and the real write
+ * that follows it share method, path and body. Hashing only those three made
+ * the two indistinguishable: the preview got cached under the commit's hash
+ * and the commit replayed it, returning 200 with `{ dry_run: true, preview }`
+ * while writing nothing.
+ *
+ * The flag is only added to the hashed object when it is TRUE, so an ordinary
+ * (non-dry-run) write hashes byte-identically to previous releases. Idempotency
+ * rows live for 24h; folding `dry_run: false` in unconditionally would make
+ * every key in flight across this deploy fail the `request_hash` comparison and
+ * answer a legitimate retry with IDEMPOTENCY_KEY_REUSE.
+ *
+ * Both the cache lookup and the cache store go through this function: if the
+ * two hash inputs ever drift apart, a stored response can never be found
+ * again, which is a subtler failure than the one this fixes.
+ */
+function buildRequestHash(input: {
+  method: string
+  path: string
+  body: unknown
+  dryRun: boolean
+}): string {
+  return hashRequest({
+    method: input.method,
+    path: input.path,
+    body: input.body,
+    ...(input.dryRun ? { dry_run: true } : {}),
+  })
+}
+
 async function readBodyForHash(request: Request): Promise<{ body: unknown; cloned: Request }> {
   // We need the body to hash it, but the handler also needs it. Read from a
-  // CLONE for the hash and pass the original through to the handler — that
+  // CLONE for the hash and pass the original through to the handler: that
   // way the handler's `await request.json()` still works regardless of how
   // the runtime implements stream teeing.
   const reader = request.clone()
@@ -245,7 +298,7 @@ export function withApiV1<P extends DynamicParams = { params: Promise<Record<str
 
       // 2. Public endpoints: invoke handler with an anon context. If a Bearer
       //    token IS supplied we opportunistically validate it so rate-limiting
-      //    and key attribution are applied — but a missing or invalid token
+      //    and key attribution are applied, but a missing or invalid token
       //    does NOT block the request (the route is, by definition, public).
       //    Falling back to the anon client when unauthenticated keeps the
       //    least-privilege guarantee: an accidental DB call from a public
@@ -278,7 +331,7 @@ export function withApiV1<P extends DynamicParams = { params: Promise<Record<str
               supabase: createServiceClientNoCookies(),
             }
           }
-          // Invalid token on a public route is silently downgraded to anon —
+          // Invalid token on a public route is silently downgraded to anon:
           // do not surface 401 since the route doesn't require auth at all.
         }
         const response = await handler(request, publicCtx, params)
@@ -319,7 +372,19 @@ export function withApiV1<P extends DynamicParams = { params: Promise<Record<str
       }
 
       // 5. Resolve URL companyId and verify access.
-      const resolvedParams = (await params.params) as Record<string, string | string[] | undefined>
+      //
+      // Next.js 16 invokes a route handler with `{ params: undefined }` for a
+      // STATIC route (no `[segment]` in the path): see app-route module.js
+      // `handlerContext = { params: context.params ? ... : undefined }`. The
+      // only authenticated static route on this surface is `/api/v1/companies`,
+      // so awaiting `params.params` blindly null-derefs there (`undefined` has
+      // no `.companyId`) and the catch below turns it into a 500 for every
+      // valid key. Dynamic routes still pass a real `Promise<{ companyId }>`.
+      // Guard the await and default to an empty param set.
+      const resolvedParams = ((await params?.params) ?? {}) as Record<
+        string,
+        string | string[] | undefined
+      >
       const rawCompanyId = resolvedParams.companyId
       const companyId = typeof rawCompanyId === 'string' ? rawCompanyId : undefined
 
@@ -353,6 +418,28 @@ export function withApiV1<P extends DynamicParams = { params: Promise<Record<str
       const idempotencyKey = request.headers.get(IDEMPOTENCY_HEADER)
       const isMutation = REQUIRES_IDEMPOTENCY.has(request.method)
 
+      // Test keys are simulation-only: every write is forced to dry-run so
+      // nothing persists (the credential bakes in `?dry_run=true`). A mutating
+      // endpoint that can't be simulated (dryRunSupported=false, or unregistered)
+      // would otherwise write for real: block it outright so a test key can
+      // never touch real data. Reads pass through unchanged (real data, no write).
+      let forceDryRun = false
+      if (auth.mode === 'test' && isMutation) {
+        const endpoint = getEndpointByConcretePath(request.method, path)
+        if (!endpoint || !endpoint.dryRunSupported) {
+          userLog.warn('test key blocked from non-simulatable endpoint', {
+            path,
+            method: request.method,
+            ...forensic,
+          })
+          return await v1ErrorResponseFromCode('TEST_KEY_WRITE_BLOCKED', userLog, {
+            requestId,
+            details: { path, method: request.method },
+          })
+        }
+        forceDryRun = true
+      }
+
       if (options.requireIdempotencyKey && isMutation && !idempotencyKey) {
         userLog.warn('missing idempotency key on mutating request')
         return await v1ErrorResponseFromCode('VALIDATION_ERROR', userLog, {
@@ -363,14 +450,20 @@ export function withApiV1<P extends DynamicParams = { params: Promise<Record<str
         })
       }
 
-      // 7. If idempotency-key supplied, check for cached response.
+      // 7. Dry-run resolution. Test keys force it on regardless of the flag.
+      //    Resolved BEFORE the idempotency lookup because it feeds the request
+      //    hash: a preview and its follow-up commit must never share a cache
+      //    entry.
+      const dryRun = isDryRun(request, url) || forceDryRun
+
+      // 8. If idempotency-key supplied, check for cached response.
       let bodyForHash: unknown = null
       let workingRequest = request
       if (idempotencyKey && isMutation && companyId) {
         const { body, cloned } = await readBodyForHash(request)
         bodyForHash = body
         workingRequest = cloned
-        const reqHash = hashRequest({ method: request.method, path, body })
+        const reqHash = buildRequestHash({ method: request.method, path, body, dryRun })
         try {
           const hit = await checkIdempotencyKey(supabase, auth.userId, companyId, idempotencyKey, reqHash)
           if (hit) {
@@ -391,9 +484,6 @@ export function withApiV1<P extends DynamicParams = { params: Promise<Record<str
         }
       }
 
-      // 8. Dry-run resolution.
-      const dryRun = isDryRun(workingRequest, url)
-
       const ctx: ApiV1Context = {
         requestId,
         log: userLog.child({ companyId }),
@@ -411,11 +501,27 @@ export function withApiV1<P extends DynamicParams = { params: Promise<Record<str
       // 9. Invoke handler.
       const response = await handler(workingRequest, ctx, params)
 
+      // Signal test mode on every test-key response so integrators can see the
+      // request was simulation-only without inspecting the body.
+      if (ctx.mode === 'test') {
+        response.headers.set('X-Gnubok-Mode', 'test')
+      }
+
       // 10. Persist idempotency cache (best-effort).
-      if (idempotencyKey && isMutation && companyId && response.status < 500) {
+      //
+      //     Never cache a dry-run: the response describes a write that did not
+      //     happen, and caching it under a real Idempotency-Key is exactly how
+      //     the documented "preview, then commit with the same key" flow used
+      //     to lose the commit. A simulation has nothing worth replaying.
+      if (idempotencyKey && isMutation && companyId && !dryRun && response.status < 500) {
         try {
           const body = await response.clone().json().catch(() => ({}))
-          const reqHash = hashRequest({ method: request.method, path, body: bodyForHash })
+          const reqHash = buildRequestHash({
+            method: request.method,
+            path,
+            body: bodyForHash,
+            dryRun,
+          })
           const status: 'success' | 'error' = response.status >= 400 ? 'error' : 'success'
           await storeIdempotencyResponse(
             supabase,
@@ -440,8 +546,15 @@ export function withApiV1<P extends DynamicParams = { params: Promise<Record<str
 
       return stampHeaders(response, requestId)
     } catch (err) {
-      log.error('op failed', err as Error, { durationMs: Date.now() - start })
-      return await v1ErrorResponse(err, log, { requestId })
+      // Resolve the envelope first so the log level can follow the mapped
+      // status — thrown 4xx domain errors are expected outcomes (warn), only
+      // 5xx are runtime errors. v1ErrorResponse logs the error itself at the
+      // same threshold.
+      const response = await v1ErrorResponse(err, log, { requestId })
+      const meta = { durationMs: Date.now() - start, status: response.status }
+      if (response.status < 500) log.warn('op failed', err as Error, meta)
+      else log.error('op failed', err as Error, meta)
+      return response
     }
   }
 }
@@ -451,7 +564,7 @@ function stampHeaders(response: Response, requestId: string): Response {
   if (!response.headers.get(API_V1_VERSION_HEADER)) {
     response.headers.set(API_V1_VERSION_HEADER, API_V1_VERSION)
   }
-  // Apply security headers to every wrapped v1 response — same set as the
+  // Apply security headers to every wrapped v1 response: same set as the
   // public discovery routes PLUS X-Robots-Tag noai so authenticated payloads
   // are excluded from AI training sets (Claude, ChatGPT, Perplexity, Google
   // -Extended respect this; others won't).

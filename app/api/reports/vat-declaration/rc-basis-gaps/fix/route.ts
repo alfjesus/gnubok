@@ -5,6 +5,7 @@ import { validateBody } from '@/lib/api/validate'
 import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
 import { correctEntry } from '@/lib/core/bookkeeping/storno-service'
 import type { CreateJournalEntryLineInput, JournalEntryLine } from '@/types'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 /**
  * POST /api/reports/vat-declaration/rc-basis-gaps/fix
@@ -42,7 +43,7 @@ function pickBasisAccount(
   // EU services 4535/4536/4537, EU goods 4515/4516/4517,
   // non-EU services 4531/4532/4533, domestic services 4425/4426/4427,
   // domestic goods 4415/4416/4417.
-  // Non-EU goods is NOT reverse charge — it's import VAT (ruta 50/60-62 via
+  // Non-EU goods is NOT reverse charge: it's import VAT (ruta 50/60-62 via
   // 4545-4547), a separate flow that doesn't belong on this correction path.
   if (supplierType === 'eu_business' && supplyType === 'service') return { account: ['4535', '4536', '4537'][rateIdx] }
   if (supplierType === 'eu_business' && supplyType === 'goods') return { account: ['4515', '4516', '4517'][rateIdx] }
@@ -175,8 +176,9 @@ export const POST = withRouteContext(
       log.error('rc-basis-gap fix failed', err as Error, { entryId })
       return errorResponseFromCode('VAT_REPORT_GENERATION_FAILED', log, {
         requestId,
-        details: { reason: err instanceof Error ? err.message : 'unknown' },
+        details: { reason: err instanceof Error ? getUserErrorMessage(err) : 'unknown' },
       })
     }
   },
+  { requireWrite: true },
 )

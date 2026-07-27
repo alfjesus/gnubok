@@ -4,6 +4,9 @@ import { createExtensionContext } from '@/lib/extensions/context-factory'
 import { registerSupplierInvoiceHandler } from '@/lib/bookkeeping/handlers/supplier-invoice-handler'
 import { registerEventLogHandler } from '@/lib/events/handlers/event-log-handler'
 import { registerWebhookHandler } from '@/lib/webhooks/handler'
+import { registerObservabilitySink } from '@/lib/observability'
+import { postHogSink } from '@/lib/analytics/posthog-observability'
+import { isAnalyticsEnabled } from '@/lib/analytics/enabled'
 import { createLogger } from '@/lib/logger'
 
 const log = createLogger('init')
@@ -33,7 +36,7 @@ const REQUIRED_EXTENSION_VARS: ReadonlyArray<readonly string[]> = [
 function validateEnvironment(): void {
   // During builds (CI, Docker, Vercel), env vars may be absent or set to
   // placeholder sentinels. Skip validation so Next.js page collection
-  // doesn't fail — real validation happens at runtime.
+  // doesn't fail: real validation happens at runtime.
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
   if (!supabaseUrl || supabaseUrl.startsWith('__')) return
 
@@ -63,13 +66,20 @@ function validateEnvironment(): void {
  * Ensure the system is initialized (extensions loaded, context factory wired,
  * core event handlers registered).
  * Called from API routes that emit events.
- * Idempotent — safe to call multiple times.
+ * Idempotent: safe to call multiple times.
  */
 export function ensureInitialized(): void {
   if (initialized) return
 
   validateEnvironment()
   setContextFactory(createExtensionContext)
+  // Turns lib/observability from a no-op into PostHog Error Tracking. Gated,
+  // so with no token (core, CI, self-hosted) the sink stays the no-op and
+  // PostHog is never constructed and never contacted. Note the SDK is still
+  // BUNDLED in those builds: the imports are static, so the bytes ship even
+  // though nothing initialises. Making that a true zero would mean dynamic
+  // imports at every posthog call site, which is a deliberate non-goal here.
+  if (isAnalyticsEnabled()) registerObservabilitySink(postHogSink)
   registerSupplierInvoiceHandler()
   registerEventLogHandler()
   registerWebhookHandler()

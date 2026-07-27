@@ -1,13 +1,8 @@
-import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
-import { requireCompanyId } from '@/lib/company/context'
+import { withRouteContext } from '@/lib/api/with-route-context'
 import { validateQuery } from '@/lib/api/validate'
 import { AccountBalancesQuerySchema } from '@/lib/api/schemas'
 import { getOpeningBalances } from '@/lib/reports/opening-balances'
-import { fetchAllRows } from '@/lib/supabase/fetch-all'
-import { createLogger } from '@/lib/logger'
-
-const log = createLogger('api.bookkeeping.account-balances')
 
 /**
  * Per-account saldo as of a date. Used by the journal-entry form to show
@@ -24,21 +19,17 @@ const log = createLogger('api.bookkeeping.account-balances')
  * companies behave identically. The opening-balance entry is excluded from
  * period activity to avoid double-counting its lines.
  */
-export async function GET(request: Request) {
-  const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
+export const GET = withRouteContext('bookkeeping.account_balances', async (request, ctx) => {
+  const { supabase, companyId, log } = ctx
 
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const params = validateQuery(request, AccountBalancesQuerySchema)
+  const params = validateQuery(request, AccountBalancesQuerySchema, {
+    log,
+    operation: 'bookkeeping.account_balances',
+  })
   if (!params.success) return params.response
   const { accounts, as_of } = params.data
 
-  const companyId = await requireCompanyId(supabase, user.id)
-
-  // Find the fiscal period containing as_of (any state — we want a reference
+  // Find the fiscal period containing as_of (any state: we want a reference
   // saldo even for closed/locked periods).
   const { data: period, error: periodError } = await supabase
     .from('fiscal_periods')
@@ -98,45 +89,32 @@ export async function GET(request: Request) {
 
   // Sum activity from period_start through as_of, excluding the OB entry
   // (its lines are already in openingBalances).
-  let lines: Array<{ account_number: string; debit_amount: number; credit_amount: number }>
-  try {
-    lines = await fetchAllRows<{
-      account_number: string
-      debit_amount: number
-      credit_amount: number
-    }>(({ from, to }) => {
-      let query = supabase
-        .from('journal_entry_lines')
-        .select(
-          'account_number, debit_amount, credit_amount, journal_entries!inner(company_id, status, entry_date)'
-        )
-        .eq('journal_entries.company_id', companyId)
-        .in('account_number', accounts)
-        .in('journal_entries.status', ['posted', 'reversed'])
-        .gte('journal_entries.entry_date', period.period_start)
-        .lte('journal_entries.entry_date', as_of)
+  const { data: activityRows, error: activityError } = await supabase.rpc(
+    'get_account_period_activity',
+    {
+      p_company_id: companyId,
+      p_start: period.period_start,
+      p_end: as_of,
+      p_accounts: accounts,
+      p_exclude_journal_entry_id: obEntryId,
+    },
+  )
 
-      if (obEntryId) {
-        query = query.neq('journal_entry_id', obEntryId)
-      }
-
-      return query.range(from, to)
-    })
-  } catch (err) {
+  if (activityError) {
     log.error('period activity lookup failed', {
       companyId,
       period_id: period.id,
-      error: err instanceof Error ? err.message : String(err),
+      error: activityError.message,
     })
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 
   const periodActivity = new Map<string, { debit: number; credit: number }>()
-  for (const line of lines) {
-    const existing = periodActivity.get(line.account_number) || { debit: 0, credit: 0 }
-    existing.debit += Number(line.debit_amount) || 0
-    existing.credit += Number(line.credit_amount) || 0
-    periodActivity.set(line.account_number, existing)
+  for (const row of activityRows ?? []) {
+    periodActivity.set(row.account_number, {
+      debit: Number(row.debit) || 0,
+      credit: Number(row.credit) || 0,
+    })
   }
 
   return NextResponse.json({
@@ -158,4 +136,4 @@ export async function GET(request: Request) {
       }
     }),
   })
-}
+})

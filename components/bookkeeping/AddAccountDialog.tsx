@@ -18,6 +18,7 @@ import { Loader2, AlertTriangle } from 'lucide-react'
 import { isStandardBASAccount } from '@/lib/bookkeeping/bas-reference'
 import { classifyAccount } from '@/lib/bookkeeping/account-classifier'
 import type { BASAccount } from '@/types'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 interface AddAccountDialogProps {
   open: boolean
@@ -37,7 +38,9 @@ export function AddAccountDialog({
   const [accountNumber, setAccountNumber] = useState('')
   const [accountName, setAccountName] = useState('')
   const [description, setDescription] = useState('')
-  const [defaultVatCode, setDefaultVatCode] = useState('')
+  // "Standard moms": the moms-sats a booking line defaults to when this konto is
+  // picked. 'none' = no default. SelectItem values are stringified decimals.
+  const [defaultVatRate, setDefaultVatRate] = useState('none')
   const [sruCode, setSruCode] = useState('')
   const [normalBalance, setNormalBalance] = useState<'debit' | 'credit'>('debit')
   const [isSaving, setIsSaving] = useState(false)
@@ -84,14 +87,21 @@ export function AddAccountDialog({
           account_type: derived?.account_type || 'expense',
           normal_balance: normalBalance,
           description: description || null,
-          default_vat_code: defaultVatCode || null,
+          default_vat_rate: defaultVatRate === 'none' ? null : parseFloat(defaultVatRate),
           sru_code: sruCode || null,
         }),
       })
 
       if (!response.ok) {
-        const data = await response.json()
-        throw new Error(data.error || 'Kunde inte skapa kontot')
+        // Map the response itself, not `new Error(data.error)`: the route
+        // answers thrown errors with the canonical envelope
+        // `{ error: { code, message } }`, and the Error constructor would
+        // stringify that object to "[object Object]", throwing away the
+        // route's own Swedish reason. Passing the parsed body plus the status
+        // resolves all three shapes (envelope, bare string, no body).
+        const body = await response.json().catch(() => null)
+        setError(getUserErrorMessage(body, { statusCode: response.status }))
+        return
       }
 
       const { data: createdAccount } = await response.json() as { data: BASAccount }
@@ -100,12 +110,12 @@ export function AddAccountDialog({
       setAccountNumber('')
       setAccountName('')
       setDescription('')
-      setDefaultVatCode('')
+      setDefaultVatRate('none')
       setSruCode('')
       onCreated(createdAccount)
       onOpenChange(false)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Något gick fel')
+      setError(err instanceof Error ? getUserErrorMessage(err) : 'Något gick fel')
     } finally {
       setIsSaving(false)
     }
@@ -197,12 +207,19 @@ export function AddAccountDialog({
 
           <div className="grid grid-cols-2 gap-4">
             <div className="space-y-2">
-              <Label>Momskod <span className="text-muted-foreground">(valfritt)</span></Label>
-              <Input
-                value={defaultVatCode}
-                onChange={(e) => setDefaultVatCode(e.target.value)}
-                placeholder="T.ex. MP1"
-              />
+              <Label>Standard moms <span className="text-muted-foreground">(valfritt)</span></Label>
+              <Select value={defaultVatRate} onValueChange={setDefaultVatRate}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">Ingen standard</SelectItem>
+                  <SelectItem value="0">Ingen moms</SelectItem>
+                  <SelectItem value="0.25">25 %</SelectItem>
+                  <SelectItem value="0.12">12 %</SelectItem>
+                  <SelectItem value="0.06">6 %</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
             <div className="space-y-2">
               <Label>SRU-kod <span className="text-muted-foreground">(valfritt)</span></Label>

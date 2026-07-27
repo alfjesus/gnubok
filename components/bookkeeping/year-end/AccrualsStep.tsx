@@ -12,6 +12,7 @@ import { ArrowRight, Loader2, Plus, Trash2 } from 'lucide-react'
 import { formatCurrency } from '@/lib/utils'
 import { useToast } from '@/components/ui/use-toast'
 import type { AccrualsProposal } from '@/lib/bokslut/accruals/types'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 interface AccrualsStepProps {
   periodId: string
@@ -56,7 +57,7 @@ export function AccrualsStep({ periodId, onBack, onContinue }: AccrualsStepProps
         const body = await res.json()
         if (cancelled) return
         if (!res.ok) {
-          setError(body?.error?.message ?? 'Kunde inte ladda periodiseringar')
+          setError(getUserErrorMessage(body?.error) ?? 'Kunde inte ladda periodiseringar')
           return
         }
         setProposal(body.data as AccrualsProposal)
@@ -140,7 +141,7 @@ export function AccrualsStep({ periodId, onBack, onContinue }: AccrualsStepProps
       })
       const body = await res.json()
       if (!res.ok) {
-        setError(body?.error?.message ?? 'Kunde inte bokföra periodiseringarna')
+        setError(getUserErrorMessage(body?.error) ?? 'Kunde inte bokföra periodiseringarna')
         return
       }
       const created = body.data?.created?.length ?? 0
@@ -152,7 +153,7 @@ export function AccrualsStep({ periodId, onBack, onContinue }: AccrualsStepProps
       })
       onContinue()
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Okänt fel')
+      setError(err instanceof Error ? getUserErrorMessage(err) : 'Okänt fel')
     } finally {
       setPosting(false)
     }
@@ -188,7 +189,7 @@ export function AccrualsStep({ periodId, onBack, onContinue }: AccrualsStepProps
           <CardTitle className="text-base">Periodiseringar</CardTitle>
           <p className="text-sm text-muted-foreground">
             Förutbetalda kostnader (17xx) och upplupna kostnader (29xx). Posteringarna
-            ska vändas på första dagen av nästa räkenskapsår — datumet visas per
+            ska vändas på första dagen av nästa räkenskapsår: datumet visas per
             verifikation. Automatisk omvändning är planerad till en kommande version.
           </p>
         </CardHeader>
@@ -272,8 +273,8 @@ export function AccrualsStep({ periodId, onBack, onContinue }: AccrualsStepProps
       )}
 
       <div className="flex justify-between">
-        <Button variant="outline" onClick={onBack} disabled={posting}>
-          Tillbaka
+        <Button variant="outline" size="sm" onClick={onBack} disabled={posting}>
+          ← Tillbaka
         </Button>
         <Button onClick={handleCommit} disabled={posting}>
           {posting ? (
@@ -308,7 +309,7 @@ function ManualEntryEditor({
           {entry.kind === 'manual_prepaid_expense' && 'Förutbetald kostnad'}
           {entry.kind === 'manual_accrued_expense' && 'Upplupen kostnad'}
         </p>
-        <Button variant="ghost" size="sm" onClick={onRemove} className="h-7 px-2">
+        <Button variant="ghost" size="sm" aria-label="Ta bort post" onClick={onRemove} className="h-7 px-2">
           <Trash2 className="h-3.5 w-3.5" />
         </Button>
       </div>
@@ -334,8 +335,8 @@ function ManualEntryEditor({
                 onChange({ liabilityAccount: e.target.value as '2991' | '2992' })
               }
             >
-              <option value="2992">2992 — Revision</option>
-              <option value="2991">2991 — Bokslut</option>
+              <option value="2992">2992: Revision</option>
+              <option value="2991">2991: Bokslut</option>
             </select>
           </div>
         )}

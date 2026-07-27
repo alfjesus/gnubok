@@ -1,26 +1,42 @@
-import { createClient } from '@/lib/supabase/server'
+import { withRouteContext } from '@/lib/api/with-route-context'
 import { NextResponse } from 'next/server'
-import { generateIncomeStatement } from '@/lib/reports/income-statement'
+import {
+  generateIncomeStatement,
+  buildIncomeStatementFromRows,
+} from '@/lib/reports/income-statement'
 import { generateTrialBalance } from '@/lib/reports/trial-balance'
-import { generateARLedger } from '@/lib/reports/ar-ledger'
-import { generateMonthlyBreakdown } from '@/lib/reports/monthly-breakdown'
+import { generateARLedger, type ARLedgerReport } from '@/lib/reports/ar-ledger'
+import {
+  generateMonthlyBreakdown,
+  assembleMonthlyBreakdown,
+  type MonthlyBreakdown,
+} from '@/lib/reports/monthly-breakdown'
+import {
+  fetchKpiAggregates,
+  buildOpeningBalances,
+  buildTrialBalanceRows,
+} from '@/lib/reports/kpi-aggregates'
+import { fetchAllRows } from '@/lib/supabase/fetch-all'
 import {
   calculateCashPosition,
   calculateGrossMargin,
   calculateExpenseRatio,
   calculateAvgPaymentDays,
+  calculateVatLiability,
+  aggregateTopSuppliers,
+  fetchTopSupplierInvoices,
+  type KpiSupplierInvoiceRow,
 } from '@/lib/reports/kpi'
 import { mergeWithDefaults } from '@/lib/reports/kpi-definitions'
-import { requireCompanyId } from '@/lib/company/context'
-import type { KPIReport, KPIPreferences } from '@/types'
+import { parseDimensionFilterParams } from '@/lib/reports/dimension-filter'
+import type {
+  KPIReport,
+  KPIPreferences,
+  IncomeStatementReport,
+  TrialBalanceRow,
+} from '@/types'
 
-export async function GET(request: Request) {
-  const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
-  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-
-  const companyId = await requireCompanyId(supabase, user.id)
-
+export const GET = withRouteContext('report.kpi', async (request, { supabase, companyId }) => {
   const { searchParams } = new URL(request.url)
   const periodId = searchParams.get('period_id')
   if (!periodId) {
@@ -38,47 +54,146 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: 'Fiscal period not found' }, { status: 404 })
   }
 
-  // Load user preferences for account overrides
-  const { data: prefsData } = await supabase
-    .from('extension_data')
-    .select('value')
-    .eq('company_id', companyId)
-    .eq('extension_id', 'core/kpi')
-    .eq('key', 'preferences')
-    .single()
+  // Dimension filter applies to the P&L-side KPIs only (net result, revenue/
+  // expenses, months, expense composition). Balance-side KPIs (cash, VAT,
+  // receivables) and supplier/invoice aggregates stay company-wide: a
+  // dimension-scoped "cash position" would be silently wrong, not filtered.
+  // The KPI view hides those tiles when a filter is active.
+  const dimFilter = parseDimensionFilterParams(searchParams)
+  if (!dimFilter.ok) {
+    return NextResponse.json({ error: dimFilter.error }, { status: 400 })
+  }
+  const dimensions = dimFilter.dimensions
 
-  const preferences = mergeWithDefaults(
-    (prefsData?.value as Partial<KPIPreferences>) ?? {}
-  )
-
-  const [
-    incomeStatement,
-    trialBalanceResult,
-    arLedger,
-    monthlyBreakdown,
-    paidInvoicesResult,
-    topSuppliersResult,
-  ] = await Promise.all([
-    generateIncomeStatement(supabase, companyId, periodId),
-    generateTrialBalance(supabase, companyId, periodId),
-    generateARLedger(supabase, companyId),
-    generateMonthlyBreakdown(supabase, companyId, periodId),
+  // The company-wide queries both paths share. Factories, not promises, so
+  // each Promise.all issues them inside its own single round-trip wave.
+  const prefsQuery = () =>
+    supabase
+      .from('extension_data')
+      .select('value')
+      .eq('company_id', companyId)
+      .eq('extension_id', 'core/kpi')
+      .eq('key', 'preferences')
+      .single()
+  const paidInvoicesQuery = () =>
     supabase
       .from('invoices')
       .select('invoice_date, paid_at')
       .eq('company_id', companyId)
       .eq('status', 'paid')
-      .not('paid_at', 'is', null),
-    supabase
-      .from('supplier_invoices')
-      .select('supplier_id, total_sek, total, supplier:suppliers(id, name)')
-      .eq('company_id', companyId)
-      .gte('invoice_date', period.period_start)
-      .lte('invoice_date', period.period_end)
-      .neq('status', 'credited'),
-  ])
+      .not('paid_at', 'is', null)
+  // Paginated: awaiting the bare query capped the rows at PostgREST's 1000
+  // default and silently corrupted the supplier totals for large companies.
+  const topSuppliersQuery = () =>
+    fetchTopSupplierInvoices(supabase, companyId, period.period_start, period.period_end)
 
-  // Cash position — use account overrides if set
+  let prefsValue: unknown
+  let incomeStatement: IncomeStatementReport
+  let trialBalanceResult: { rows: TrialBalanceRow[] }
+  let arLedger: ARLedgerReport
+  let monthlyBreakdown: MonthlyBreakdown
+  let paidInvoicesResult: { data: Array<{ invoice_date: string; paid_at: string }> | null }
+  let topSuppliersResult: { data: unknown[] | null; error: unknown }
+  let filteredTrialBalance: { rows: TrialBalanceRow[] } | null
+
+  if (dimensions) {
+    // Dimension-filtered path: the legacy generators, unchanged. The second,
+    // dimension-scoped TB feeds the expense composition (classes 4-7, P&L)
+    // without touching the unfiltered TB the balance-side KPIs read.
+    const [prefsRes, is, tb, ar, mb, paid, sup, filteredTb] = await Promise.all([
+      prefsQuery(),
+      generateIncomeStatement(supabase, companyId, periodId, { dimensions }),
+      generateTrialBalance(supabase, companyId, periodId),
+      generateARLedger(supabase, companyId),
+      generateMonthlyBreakdown(supabase, companyId, periodId, { dimensions }),
+      paidInvoicesQuery(),
+      topSuppliersQuery(),
+      generateTrialBalance(supabase, companyId, periodId, { dimensions }),
+    ])
+    prefsValue = prefsRes.data?.value
+    incomeStatement = is
+    trialBalanceResult = tb
+    arLedger = ar
+    monthlyBreakdown = mb
+    paidInvoicesResult = paid
+    topSuppliersResult = sup
+    filteredTrialBalance = filteredTb
+  } else {
+    // Hot path (no dimension filter): one Promise.all round trip. The
+    // get_kpi_report_aggregates RPC replaces three full journal-line scans
+    // (unfiltered TB, income-statement TB, monthly breakdown) with a single
+    // SQL pass; the pure builders below reproduce the legacy merge/rounding.
+    const obEntryId: string | null = period.opening_balance_entry_id ?? null
+    const [agg, priorResult, accounts, prefsRes, ar, paid, sup] = await Promise.all([
+      fetchKpiAggregates(supabase, companyId, periodId, obEntryId),
+      // Opening balances without an OB entry fall back to the server-side
+      // prior-period aggregate, exactly like getOpeningBalances.
+      obEntryId
+        ? Promise.resolve(null)
+        : supabase.rpc('compute_prior_opening_balances', {
+            p_company_id: companyId,
+            p_period_start: period.period_start,
+          }),
+      fetchAllRows<{
+        account_number: string
+        account_name: string
+        account_class: number
+      }>(({ from, to }) =>
+        supabase
+          .from('chart_of_accounts')
+          .select('account_number, account_name, account_class')
+          .eq('company_id', companyId)
+          .order('account_number', { ascending: true })
+          .range(from, to)
+      ),
+      prefsQuery(),
+      generateARLedger(supabase, companyId),
+      paidInvoicesQuery(),
+      topSuppliersQuery(),
+    ])
+
+    if (priorResult?.error) {
+      // Mirrors the fallback branch of lib/reports/opening-balances.ts.
+      throw new Error(priorResult.error.message)
+    }
+
+    const accountMap = new Map<string, { name: string; class: number }>()
+    for (const acc of accounts) {
+      accountMap.set(acc.account_number, {
+        name: acc.account_name,
+        class: acc.account_class,
+      })
+    }
+
+    const openingBalances = buildOpeningBalances(
+      agg,
+      obEntryId ? null : (priorResult?.data ?? [])
+    )
+    trialBalanceResult = { rows: buildTrialBalanceRows(openingBalances, agg.tb, accountMap) }
+    const rowsExYearEnd = buildTrialBalanceRows(openingBalances, agg.tb_ex_year_end, accountMap)
+    incomeStatement = buildIncomeStatementFromRows(rowsExYearEnd)
+    monthlyBreakdown = assembleMonthlyBreakdown(
+      period.period_start,
+      period.period_end,
+      agg.monthly.map((m) => ({
+        year: m.year,
+        month0: m.month - 1,
+        income: m.income,
+        expenses: m.expenses,
+      }))
+    )
+    prefsValue = prefsRes.data?.value
+    arLedger = ar
+    paidInvoicesResult = paid
+    topSuppliersResult = sup
+    filteredTrialBalance = null
+  }
+
+  const preferences = mergeWithDefaults(
+    (prefsValue as Partial<KPIPreferences>) ?? {}
+  )
+
+  // Cash position: use account overrides if set
   const cashOverrides = preferences.accountOverrides['cashPosition']
   let cashPosition: number
   if (cashOverrides && cashOverrides.length > 0) {
@@ -92,28 +207,11 @@ export async function GET(request: Request) {
     cashPosition = calculateCashPosition(trialBalanceResult.rows)
   }
 
-  // VAT liability — use account overrides if set
-  const vatOverrides = preferences.accountOverrides['vatLiability']
-  let vatLiability: number
-  if (vatOverrides && vatOverrides.length > 0) {
-    const outputVat = trialBalanceResult.rows
-      .filter((r) => vatOverrides.includes(r.account_number) && r.account_number.startsWith('26') && !r.account_number.startsWith('264'))
-      .reduce((sum, r) => sum + (r.closing_credit - r.closing_debit), 0)
-    const inputVat = trialBalanceResult.rows
-      .filter((r) => vatOverrides.includes(r.account_number) && r.account_number.startsWith('264'))
-      .reduce((sum, r) => sum + (r.closing_debit - r.closing_credit), 0)
-    vatLiability = Math.round((outputVat - inputVat) * 100) / 100
-  } else {
-    const vatOutputAccounts = ['2611', '2621', '2631']
-    const vatInputAccounts = ['2641', '2645']
-    const outputVat = trialBalanceResult.rows
-      .filter((r) => vatOutputAccounts.includes(r.account_number))
-      .reduce((sum, r) => sum + (r.closing_credit - r.closing_debit), 0)
-    const inputVat = trialBalanceResult.rows
-      .filter((r) => vatInputAccounts.includes(r.account_number))
-      .reduce((sum, r) => sum + (r.closing_debit - r.closing_credit), 0)
-    vatLiability = Math.round((outputVat - inputVat) * 100) / 100
-  }
+  // VAT liability: use account overrides if set
+  const vatLiability = calculateVatLiability(
+    trialBalanceResult.rows,
+    preferences.accountOverrides['vatLiability']
+  )
 
   // Avg payment days from paid invoices
   const paidInvoices = (paidInvoicesResult.data ?? []).map((inv) => ({
@@ -125,7 +223,7 @@ export async function GET(request: Request) {
   // normal balance, so amount = closing_debit - closing_credit. Negative
   // values (rare reclassifications) are clamped to 0 so the donut renders
   // sensibly.
-  const expenseComposition = trialBalanceResult.rows.reduce(
+  const expenseComposition = (filteredTrialBalance ?? trialBalanceResult).rows.reduce(
     (acc, r) => {
       if (r.account_class < 4 || r.account_class > 7) return acc
       const amount = r.closing_debit - r.closing_credit
@@ -139,40 +237,31 @@ export async function GET(request: Request) {
     { class4: 0, class5: 0, class6: 0, class7: 0 }
   )
 
-  // Top suppliers by spend within the fiscal period. Sum total_sek to avoid
-  // mixing currencies. Drop FX invoices without a SEK conversion (total_sek
-  // null) — they would otherwise inflate a supplier's total with raw
-  // foreign-currency amounts.
-  type SupplierInvoiceRow = {
-    supplier_id: string | null
-    total_sek: number | null
-    total: number | null
-    supplier: { id: string; name: string } | { id: string; name: string }[] | null
-  }
+  // Top expense accounts (classes 4-7) for the period: the concept's
+  // "Största kostnaderna" list. Same debit-normal reading as the class
+  // composition above.
+  const topExpenseAccounts = (filteredTrialBalance ?? trialBalanceResult).rows
+    .filter((r) => r.account_class >= 4 && r.account_class <= 7)
+    .map((r) => ({
+      account_number: r.account_number,
+      account_name: r.account_name,
+      total: Math.round((r.closing_debit - r.closing_credit) * 100) / 100,
+    }))
+    .filter((r) => r.total > 0)
+    .sort((a, b) => b.total - a.total)
+    .slice(0, 5)
+
+  // Top suppliers by spend within the fiscal period, in SEK. The per-row SEK
+  // resolution and the FX exclusion count both live in aggregateTopSuppliers,
+  // which the xlsx export calls with the same query, so the two reports cannot
+  // disagree about the same company.
   if (topSuppliersResult.error) {
     // Surface the failure rather than silently rendering an empty chart that
     // matches the legitimate "no supplier invoices" empty state.
     console.error('[kpi] topSuppliersResult error:', topSuppliersResult.error)
   }
-  const supplierTotals = new Map<string, { name: string; total: number }>()
-  for (const row of (topSuppliersResult.data ?? []) as SupplierInvoiceRow[]) {
-    if (!row.supplier_id) continue
-    const supplier = Array.isArray(row.supplier) ? row.supplier[0] : row.supplier
-    if (!supplier?.name) continue
-    const amount = row.total_sek ?? null
-    if (amount == null) continue
-    const existing = supplierTotals.get(row.supplier_id)
-    if (existing) existing.total += amount
-    else supplierTotals.set(row.supplier_id, { name: supplier.name, total: amount })
-  }
-  const topSuppliers = Array.from(supplierTotals.entries())
-    .map(([supplier_id, v]) => ({
-      supplier_id,
-      supplier_name: v.name,
-      total: Math.round(v.total * 100) / 100,
-    }))
-    .sort((a, b) => b.total - a.total)
-    .slice(0, 7)
+  const { suppliers: topSuppliers, unconvertedFxCount: topSuppliersUnconvertedFxCount } =
+    aggregateTopSuppliers((topSuppliersResult.data ?? []) as KpiSupplierInvoiceRow[])
 
   const report: KPIReport = {
     netResult: incomeStatement.net_result,
@@ -194,8 +283,10 @@ export async function GET(request: Request) {
       class6: Math.round(expenseComposition.class6 * 100) / 100,
       class7: Math.round(expenseComposition.class7 * 100) / 100,
     },
+    topExpenseAccounts,
     topSuppliers,
+    topSuppliersUnconvertedFxCount,
   }
 
   return NextResponse.json({ data: report })
-}
+})

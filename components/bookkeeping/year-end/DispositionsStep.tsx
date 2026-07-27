@@ -8,7 +8,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { ArrowRight, AlertTriangle, Loader2 } from 'lucide-react'
+import { ArrowRight, AlertTriangle, CheckCircle2, Loader2 } from 'lucide-react'
 import { formatCurrency } from '@/lib/utils'
 import { useToast } from '@/components/ui/use-toast'
 import { DepreciationPanel } from './DepreciationPanel'
@@ -17,7 +17,9 @@ import type {
   DispositionsProposal,
   ProposedDisposition,
   DispositionKind,
+  TaxAdjustmentSnapshot,
 } from '@/lib/bokslut/types'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 interface DispositionsStepProps {
   periodId: string
@@ -30,11 +32,17 @@ interface UiState {
   selections: Record<string, { accept: boolean; overrideAmount?: number; lockedSkip: boolean }>
 }
 
+interface TaxAdjustmentDraft {
+  nonDeductibleExpenses: string
+  nonTaxableIncome: string
+  detectedAccounts: { '6992': boolean; '8423': boolean }
+}
+
 /**
  * Phase 2 bokslutsdispositioner step. Fetches proposals from the dispositions
  * API, lets the user adjust amounts (or skip) per proposal, then POSTs the
  * accepted ones. Mandatory p-fond reversals (cohort ≥ 6 years old) cannot be
- * skipped — checkbox stays disabled-on.
+ * skipped: checkbox stays disabled-on.
  *
  * EF companies get an empty `proposals` array from the server, so this step
  * renders a short pass-through note and lets the user continue.
@@ -47,6 +55,9 @@ export function DispositionsStep({ periodId, onBack, onContinue }: DispositionsS
   const [ui, setUi] = useState<UiState>({ selections: {} })
   const [posting, setPosting] = useState(false)
   const [postError, setPostError] = useState<string | null>(null)
+  const [savingAdjustments, setSavingAdjustments] = useState(false)
+  const [adjustmentError, setAdjustmentError] = useState<string | null>(null)
+  const [taxAdjustmentDraft, setTaxAdjustmentDraft] = useState<TaxAdjustmentDraft>(emptyTaxDraft)
 
   // ---- Fetch proposals ----
   const loadProposals = useCallback(async () => {
@@ -58,30 +69,65 @@ export function DispositionsStep({ periodId, onBack, onContinue }: DispositionsS
       )
       const body = await res.json()
       if (!res.ok) {
-        setFetchError(body?.error?.message ?? 'Kunde inte ladda dispositioner')
+        setFetchError(getUserErrorMessage(body?.error) ?? 'Kunde inte ladda dispositioner')
         return
       }
       const data = body.data as DispositionsProposal
       setProposal(data)
-      const selections: UiState['selections'] = {}
-      data.proposals.forEach((p, index) => {
-        // Key must match the render loop and buildPostItems, which both pass
-        // the array index — omitting it here defaulted every non-ateforing
-        // key to ":0", so only the first proposal card ever rendered.
-        const key = proposalKey(p, index)
-        selections[key] = {
-          accept: true,
-          overrideAmount: p.amount,
-          lockedSkip: Boolean(p.required),
-        }
-      })
-      setUi({ selections })
+      setUi(createUiState(data))
+      setTaxAdjustmentDraft(createTaxAdjustmentDraft(data.taxAdjustments))
     } catch {
       setFetchError('Kunde inte ladda dispositioner')
     } finally {
       setLoading(false)
     }
   }, [periodId])
+
+  const handleSaveAdjustments = useCallback(async () => {
+    setSavingAdjustments(true)
+    setAdjustmentError(null)
+    try {
+      const res = await fetch(
+        `/api/bookkeeping/fiscal-periods/${periodId}/bokslutsdispositioner`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            manualAdjustments: {
+              nonDeductibleExpenses: parseNonNegativeAmount(
+                taxAdjustmentDraft.nonDeductibleExpenses,
+              ),
+              nonTaxableIncome: parseNonNegativeAmount(taxAdjustmentDraft.nonTaxableIncome),
+            },
+            detectedAccounts: taxAdjustmentDraft.detectedAccounts,
+          }),
+        },
+      )
+      const body = await res.json()
+      if (!res.ok) {
+        setAdjustmentError(
+          getUserErrorMessage(body?.error) ?? 'Kunde inte spara skattemässiga justeringar',
+        )
+        return
+      }
+      const data = body.data as DispositionsProposal
+      setProposal(data)
+      setUi(createUiState(data))
+      setTaxAdjustmentDraft(createTaxAdjustmentDraft(data.taxAdjustments))
+      toast({
+        title: 'Skatteunderlaget är uppdaterat',
+        description: 'Bolagsskatten har räknats om utan att ändra periodiseringsfonden.',
+      })
+    } catch (err) {
+      setAdjustmentError(
+        err instanceof Error
+          ? getUserErrorMessage(err)
+          : 'Kunde inte spara skattemässiga justeringar',
+      )
+    } finally {
+      setSavingAdjustments(false)
+    }
+  }, [periodId, taxAdjustmentDraft, toast])
 
   useEffect(() => {
     void loadProposals()
@@ -90,12 +136,16 @@ export function DispositionsStep({ periodId, onBack, onContinue }: DispositionsS
   // ---- POST accepted dispositions ----
   const handleCommit = useCallback(async () => {
     if (!proposal) return
+    if (proposal.completedDispositions?.some((item) => item.status === 'needs_correction')) {
+      setPostError('Rätta den bokförda bolagsskatten och ladda om sidan innan du fortsätter.')
+      return
+    }
     setPosting(true)
     setPostError(null)
     try {
       const items = buildPostItems(proposal, ui)
       if (items.length === 0) {
-        // Nothing selected — just move on
+        // Nothing selected: just move on
         onContinue()
         return
       }
@@ -106,7 +156,7 @@ export function DispositionsStep({ periodId, onBack, onContinue }: DispositionsS
       })
       const body = await res.json()
       if (!res.ok) {
-        setPostError(body?.error?.message ?? 'Kunde inte bokföra dispositioner')
+        setPostError(getUserErrorMessage(body?.error) ?? 'Kunde inte bokföra dispositioner')
         return
       }
       const created = body.data?.created ?? []
@@ -118,7 +168,7 @@ export function DispositionsStep({ periodId, onBack, onContinue }: DispositionsS
       })
       onContinue()
     } catch (err) {
-      setPostError(err instanceof Error ? err.message : 'Okänt fel')
+      setPostError(err instanceof Error ? getUserErrorMessage(err) : 'Okänt fel')
     } finally {
       setPosting(false)
     }
@@ -149,6 +199,10 @@ export function DispositionsStep({ periodId, onBack, onContinue }: DispositionsS
 
   if (!proposal) return null
 
+  const hasCorrectionRequired = proposal.completedDispositions?.some(
+    (item) => item.status === 'needs_correction',
+  ) ?? false
+
   // EF: depreciation can apply (skattemässig hanteras separat); replace the
   // AB-only dispositioner with a NE-bilaga declaration section.
   if (proposal.entityType !== 'aktiebolag') {
@@ -162,32 +216,11 @@ export function DispositionsStep({ periodId, onBack, onContinue }: DispositionsS
           fiscalYear={fiscalYear}
         />
         <div className="flex justify-between">
-          <Button variant="outline" onClick={onBack}>Tillbaka</Button>
-          <Button onClick={onContinue}>
-            Fortsätt <ArrowRight className="ml-1 h-4 w-4" />
+          <Button variant="outline" size="sm" onClick={onBack}>
+            ← Tillbaka
           </Button>
-        </div>
-      </div>
-    )
-  }
-
-  if (proposal.proposals.length === 0) {
-    return (
-      <div className="space-y-6">
-        <DepreciationPanel periodId={periodId} onPosted={() => void loadProposals()} />
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-base">Inga dispositioner föreslagna</CardTitle>
-          </CardHeader>
-          <CardContent className="text-sm text-muted-foreground">
-            Bolaget har varken pensionskostnader, periodiseringsfonder att hantera, vinst att skatta
-            på, eller skattemässiga avskrivningar att boka.
-          </CardContent>
-        </Card>
-        <div className="flex justify-between">
-          <Button variant="outline" onClick={onBack}>Tillbaka</Button>
-          <Button onClick={onContinue}>
-            Fortsätt <ArrowRight className="ml-1 h-4 w-4" />
+          <Button variant="outline" size="sm" onClick={onContinue}>
+            Nästa: Förhandsgranska →
           </Button>
         </div>
       </div>
@@ -209,6 +242,60 @@ export function DispositionsStep({ periodId, onBack, onContinue }: DispositionsS
           </p>
         </CardHeader>
       </Card>
+
+      {proposal.taxAdjustments && (
+        <TaxAdjustmentsCard
+          snapshot={proposal.taxAdjustments}
+          draft={taxAdjustmentDraft}
+          taxProposal={proposal.proposals.find((item) => item.kind === 'bolagsskatt')}
+          saving={savingAdjustments}
+          error={adjustmentError}
+          onChange={setTaxAdjustmentDraft}
+          onSave={() => void handleSaveAdjustments()}
+        />
+      )}
+
+      {(proposal.completedDispositions ?? []).map((completed) => (
+        <Card key={`completed-${completed.kind}`}>
+          <CardHeader>
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <CardTitle className="text-base">{completed.label}</CardTitle>
+                <Badge
+                  variant={completed.status === 'booked' ? 'success' : 'warning'}
+                  className="mt-2 gap-1"
+                >
+                  {completed.status === 'booked' ? (
+                    <CheckCircle2 className="h-3.5 w-3.5" />
+                  ) : (
+                    <AlertTriangle className="h-3.5 w-3.5" />
+                  )}
+                  {completed.status === 'booked' ? 'Redan bokförd' : 'Behöver rättas'}
+                </Badge>
+              </div>
+              <p className="font-display text-2xl tabular-nums shrink-0">
+                {formatCurrency(completed.amount)}
+              </p>
+            </div>
+          </CardHeader>
+          {completed.warnings.length > 0 && (
+            <CardContent className="space-y-2">
+              {completed.warnings.map((warning) => (
+                <p key={warning} className="text-sm text-warning-foreground">{warning}</p>
+              ))}
+            </CardContent>
+          )}
+        </Card>
+      ))}
+
+      {proposal.proposals.length === 0
+        && (proposal.completedDispositions ?? []).length === 0 && (
+          <Card>
+            <CardContent className="p-6 text-sm text-muted-foreground">
+              Inga bokslutsdispositioner behöver bokföras utifrån det aktuella underlaget.
+            </CardContent>
+          </Card>
+        )}
 
       {proposal.proposals.map((p, i) => {
         const key = proposalKey(p, i)
@@ -237,10 +324,10 @@ export function DispositionsStep({ periodId, onBack, onContinue }: DispositionsS
       )}
 
       <div className="flex justify-between">
-        <Button variant="outline" onClick={onBack} disabled={posting}>
-          Tillbaka
+        <Button variant="outline" size="sm" onClick={onBack} disabled={posting}>
+          ← Tillbaka
         </Button>
-        <Button onClick={handleCommit} disabled={posting}>
+        <Button onClick={handleCommit} disabled={posting || hasCorrectionRequired}>
           {posting ? (
             <>
               <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Bokför…
@@ -252,6 +339,136 @@ export function DispositionsStep({ periodId, onBack, onContinue }: DispositionsS
           )}
         </Button>
       </div>
+    </div>
+  )
+}
+
+function TaxAdjustmentsCard({
+  snapshot,
+  draft,
+  taxProposal,
+  saving,
+  error,
+  onChange,
+  onSave,
+}: {
+  snapshot: TaxAdjustmentSnapshot
+  draft: TaxAdjustmentDraft
+  taxProposal?: ProposedDisposition
+  saving: boolean
+  error: string | null
+  onChange: (draft: TaxAdjustmentDraft) => void
+  onSave: () => void
+}) {
+  const detected = snapshot.items.filter(
+    (item) => item.source === 'detected' && item.accountNumber && item.amount > 0,
+  )
+  const computation = taxProposal?.computation
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">Skattemässiga justeringar</CardTitle>
+        <p className="text-sm text-muted-foreground">
+          Återläggningar påverkar skatten och INK2, men skapar ingen egen verifikation och ändrar
+          inte en redan bokförd periodiseringsfond.
+        </p>
+      </CardHeader>
+      <CardContent className="space-y-5">
+        {detected.length > 0 && (
+          <div className="space-y-3">
+            <Label>Upptäckt i bokföringen</Label>
+            {detected.map((item) => {
+              const account = item.accountNumber as '6992' | '8423'
+              return (
+                <div key={item.sourceKey} className="flex items-center justify-between gap-4">
+                  <div className="flex items-center gap-3">
+                    <Checkbox
+                      id={`tax-adjustment-${account}`}
+                      checked={draft.detectedAccounts[account]}
+                      onCheckedChange={(checked) =>
+                        onChange({
+                          ...draft,
+                          detectedAccounts: {
+                            ...draft.detectedAccounts,
+                            [account]: Boolean(checked),
+                          },
+                        })
+                      }
+                    />
+                    <Label htmlFor={`tax-adjustment-${account}`} className="cursor-pointer">
+                      Konto {account}: {item.description}
+                    </Label>
+                  </div>
+                  <span className="tabular-nums font-medium">{formatCurrency(item.amount)}</span>
+                </div>
+              )
+            })}
+          </div>
+        )}
+
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="space-y-2">
+            <Label htmlFor="manual-non-deductible">Ytterligare ej avdragsgilla kostnader</Label>
+            <Input
+              id="manual-non-deductible"
+              type="number"
+              min="0"
+              step="0.01"
+              value={draft.nonDeductibleExpenses}
+              onChange={(event) =>
+                onChange({ ...draft, nonDeductibleExpenses: event.target.value })
+              }
+            />
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="manual-non-taxable">Ej skattepliktiga intäkter</Label>
+            <Input
+              id="manual-non-taxable"
+              type="number"
+              min="0"
+              step="0.01"
+              value={draft.nonTaxableIncome}
+              onChange={(event) => onChange({ ...draft, nonTaxableIncome: event.target.value })}
+            />
+          </div>
+        </div>
+
+        {computation && (
+          <div className="rounded-lg bg-muted/50 p-4 text-sm space-y-1">
+            <CalculationRow label="Resultat efter dispositioner" amount={numberValue(computation.resultBeforeTax)} />
+            <CalculationRow label="Ej avdragsgilla kostnader" amount={numberValue(computation.nonDeductibleExpenses)} prefix="+" />
+            <CalculationRow label="Ej skattepliktiga intäkter" amount={numberValue(computation.nonTaxableIncome)} prefix="-" />
+            <CalculationRow label="Skattemässigt resultat" amount={numberValue(computation.taxableResultClamped)} strong />
+            <CalculationRow label="Bolagsskatt 20,6 %" amount={numberValue(computation.taxAmount)} strong />
+          </div>
+        )}
+
+        {error && <p className="text-sm text-destructive">{error}</p>}
+        <Button type="button" variant="outline" onClick={onSave} disabled={saving}>
+          {saving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+          Spara och räkna om
+        </Button>
+      </CardContent>
+    </Card>
+  )
+}
+
+function CalculationRow({
+  label,
+  amount,
+  prefix = '',
+  strong = false,
+}: {
+  label: string
+  amount: number
+  prefix?: string
+  strong?: boolean
+}) {
+  return (
+    <div className={`flex justify-between gap-4 ${strong ? 'font-medium' : ''}`}>
+      <span>{label}</span>
+      <span className="tabular-nums">{prefix}{formatCurrency(amount)}</span>
     </div>
   )
 }
@@ -337,7 +554,7 @@ function ProposalCard({
 }
 
 function isOverridable(kind: DispositionKind): boolean {
-  // Bolagsskatt and SLP are derived from posted entries — overriding the amount
+  // Bolagsskatt and SLP are derived from posted entries: overriding the amount
   // would silently break the journal posting (the calculator would still
   // recompute server-side). p-fond avsättning and överavskrivningar take a
   // desired amount as input, so editing is meaningful. p-fond återföring is
@@ -347,7 +564,7 @@ function isOverridable(kind: DispositionKind): boolean {
 }
 
 function proposalKey(p: ProposedDisposition, index = 0): string {
-  // For återföring there can be multiple cards (one per cohort) — disambiguate
+  // For återföring there can be multiple cards (one per cohort): disambiguate
   // by including the line account in the key. For other kinds, the kind is unique.
   if (p.kind === 'periodiseringsfond_ateforing') {
     return `${p.kind}:${p.lines[0]?.account_number ?? index}`
@@ -362,7 +579,7 @@ interface PostItem {
 
 function buildPostItems(proposal: DispositionsProposal, ui: UiState): PostItem[] {
   const items: PostItem[] = []
-  // Group återföring entries — server expects a single item with a `returns`
+  // Group återföring entries: server expects a single item with a `returns`
   // map keyed by cohort account.
   const ateforingReturns: Record<string, number> = {}
   for (const p of proposal.proposals) {
@@ -372,7 +589,7 @@ function buildPostItems(proposal: DispositionsProposal, ui: UiState): PostItem[]
 
     switch (p.kind) {
       case 'bolagsskatt':
-        items.push({ kind: 'bolagsskatt', manualAdjustments: {} })
+        items.push({ kind: 'bolagsskatt' })
         break
       case 'sarskild_loneskatt':
         items.push({ kind: 'sarskild_loneskatt' })
@@ -395,7 +612,7 @@ function buildPostItems(proposal: DispositionsProposal, ui: UiState): PostItem[]
         })
         break
       case 'uppskjuten_skatt':
-        // K3 only — server recomputes the amount; client just signals intent.
+        // K3 only: server recomputes the amount; client just signals intent.
         items.push({ kind: 'uppskjuten_skatt' })
         break
     }
@@ -404,4 +621,54 @@ function buildPostItems(proposal: DispositionsProposal, ui: UiState): PostItem[]
     items.push({ kind: 'periodiseringsfond_ateforing', returns: ateforingReturns })
   }
   return items
+}
+
+const emptyTaxDraft: TaxAdjustmentDraft = {
+  nonDeductibleExpenses: '0',
+  nonTaxableIncome: '0',
+  detectedAccounts: { '6992': false, '8423': false },
+}
+
+function createUiState(proposal: DispositionsProposal): UiState {
+  const selections: UiState['selections'] = {}
+  proposal.proposals.forEach((item, index) => {
+    const key = proposalKey(item, index)
+    selections[key] = {
+      accept: true,
+      overrideAmount: item.amount,
+      lockedSkip: Boolean(item.required),
+    }
+  })
+  return { selections }
+}
+
+function createTaxAdjustmentDraft(
+  snapshot: TaxAdjustmentSnapshot | undefined,
+): TaxAdjustmentDraft {
+  if (!snapshot) return emptyTaxDraft
+  const manualNonDeductible = snapshot.items.find(
+    (item) => item.sourceKey === 'manual:non_deductible_expenses',
+  )
+  const manualNonTaxable = snapshot.items.find(
+    (item) => item.sourceKey === 'manual:non_taxable_income',
+  )
+  const account6992 = snapshot.items.find((item) => item.sourceKey === 'account:6992')
+  const account8423 = snapshot.items.find((item) => item.sourceKey === 'account:8423')
+  return {
+    nonDeductibleExpenses: String(manualNonDeductible?.amount ?? 0),
+    nonTaxableIncome: String(manualNonTaxable?.amount ?? 0),
+    detectedAccounts: {
+      '6992': Boolean(account6992?.included),
+      '8423': Boolean(account8423?.included),
+    },
+  }
+}
+
+function parseNonNegativeAmount(value: string): number {
+  const parsed = Number(value.replace(',', '.'))
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0
+}
+
+function numberValue(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0
 }

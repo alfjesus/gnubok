@@ -3,10 +3,16 @@
  *
  * Implements the calculation and validation logic for Sweden's tax deduction
  * for household services (RUT) and home renovation (ROT). As of 2026:
- *   - ROT: 30% of labor cost, max 50 000 kr per person per year.
- *   - RUT: 50% of labor cost, max 75 000 kr per person per year.
+ *   - ROT: 30% of labor cost INCLUDING VAT, max 50 000 kr per person per year.
+ *   - RUT: 50% of labor cost INCLUDING VAT, max 75 000 kr per person per year.
  *
- * The deduction applies to labor only — material costs and travel time are
+ * The base is arbetskostnaden inklusive moms per HUSFL (2009:194) 6-9 §§:
+ * Skatteverkets own worked example is 18 000 kr arbetskostnad = 22 500 kr
+ * inkl. moms (25%), ROT 30% = 6 750 kr. Callers must therefore pass the
+ * line's VAT rate; a missing/null rate is treated as 0% (momsfri labor),
+ * where inkl. and exkl. coincide.
+ *
+ * The deduction applies to labor only: material costs and travel time are
  * NOT eligible. In this v1 we treat the entire invoice item amount as labor
  * when the user flags it ROT/RUT; the user is expected to either invoice
  * labor on its own row or split materials onto a non-flagged row. A future
@@ -14,10 +20,10 @@
  *
  * We CAN'T verify that the customer has remaining yearly headroom (they may
  * have claimed elsewhere). We surface a warning when the per-invoice total
- * already exceeds the statutory max — the customer must then handle the
+ * already exceeds the statutory max: the customer must then handle the
  * excess outside of fakturamodellen.
  *
- * All functions are pure and deterministic. No I/O, no DB calls — easy to
+ * All functions are pure and deterministic. No I/O, no DB calls: easy to
  * unit-test and easy to embed in the API validator and the live total
  * preview in the invoice editor.
  */
@@ -28,18 +34,77 @@ export const ROT_PERCENT = 0.30
 /** Percentage of eligible amount deducted for RUT (household services). 2026 rule. */
 export const RUT_PERCENT = 0.50
 
-/** Maximum yearly ROT deduction per person, in kr. 2026 rule. */
+/**
+ * Maximum yearly ROT deduction per person. 2026 rule.
+ *
+ * SEK. The statutory ceiling is a kronor amount, so it may only ever be
+ * compared against a SEK figure: an invoice-currency total must go through
+ * `deductionToSek()` first.
+ */
 export const ROT_MAX = 50000
 
-/** Maximum yearly RUT deduction per person, in kr. 2026 rule. */
+/** Maximum yearly RUT deduction per person. SEK, same caveat as ROT_MAX. 2026 rule. */
 export const RUT_MAX = 75000
 
 export type DeductionType = 'rot' | 'rut'
 
+/**
+ * The invoice's money context: what currency its amounts are denominated in
+ * and the booking rate that turns them into kronor.
+ */
+export interface DeductionCurrencyContext {
+  /** ISO 4217 code of the invoice. Missing/null is treated as SEK. */
+  currency?: string | null
+  /** SEK per unit of `currency`. Required as soon as `currency` isn't SEK. */
+  exchangeRate?: number | null
+}
+
+/**
+ * Build the invoice-currency → SEK converter for a deduction context, or
+ * null when the invoice is in a foreign currency and carries no usable
+ * booking rate.
+ *
+ * The conversion is the SAME one the ledger leg applies before it debits BAS
+ * 1513 (`generateRotRutLines` in lib/bookkeeping/invoice-entries.ts): per
+ * amount, `Math.round(amount * rate * 100) / 100`. Sharing it is what keeps
+ * the begäran om utbetalning and the 1513 receivable from disagreeing about
+ * what the Skatteverket claim is worth.
+ *
+ * A null return means "cannot be expressed in kronor". Callers must then
+ * refuse to compare or emit: substituting the raw foreign number for a kronor
+ * amount is how a 625 EUR deduction ends up being asked for as "625 kr"
+ * against a 7 125 kr receivable that can never clear.
+ */
+export function deductionSekConverter(
+  money?: DeductionCurrencyContext,
+): ((amount: number) => number) | null {
+  const currency = (money?.currency ?? 'SEK').toUpperCase()
+  if (currency === 'SEK') return (amount) => amount
+  const rate = money?.exchangeRate
+  if (typeof rate !== 'number' || !Number.isFinite(rate) || rate <= 0) return null
+  return (amount) => Math.round(amount * rate * 100) / 100
+}
+
+/**
+ * One-shot form of `deductionSekConverter`: null on the same "foreign
+ * currency, no usable booking rate" condition.
+ */
+export function deductionToSek(
+  amount: number,
+  money?: DeductionCurrencyContext,
+): number | null {
+  const toSek = deductionSekConverter(money)
+  return toSek ? toSek(amount) : null
+}
+
 /** Skatteverket work codes used by Husavdragstjänsten. Maps a free-text */
-/** "what the worker did" label to the official code the Skatteverket file */
-/** will need. v1 stores both — the label is shown on the PDF; the code is */
-/** stored as `work_type` for the future submission file. */
+/** "what the worker did" label to the official code. The code drives which */
+/** element the begäran-om-utbetalning file (Begaran.xsd V6) reports the */
+/** hours under: see WORK_TYPE_ELEMENTS in lib/invoices/rot-rut-file.ts. */
+/** The lists mirror the XSD exactly: rot work types are the seven */
+/** ArendeUtfortArbeteRotTYPE elements (IT-tjänster is a RUT service and was */
+/** removed from the rot list 2026-07); rut covers all thirteen */
+/** ArendeUtfortArbeteRutTYPE elements incl. the two schablontjänster. */
 export const ROT_WORK_TYPES = [
   { code: 'BYGG', label: 'Byggnadsarbete' },
   { code: 'EL', label: 'Elarbete' },
@@ -48,20 +113,24 @@ export const ROT_WORK_TYPES = [
   { code: 'MURNING', label: 'Murnings- och putsarbete' },
   { code: 'MALNING', label: 'Mål- och tapetseringsarbete' },
   { code: 'VVS', label: 'VVS-arbete' },
-  { code: 'IT', label: 'IT-tjänster i hemmet' },
 ] as const
 
 export const RUT_WORK_TYPES = [
-  { code: 'STAD', label: 'Städning, tvätt och vård av kläder' },
-  { code: 'KLAD', label: 'Klädvård i hemmet' },
+  { code: 'STAD', label: 'Städning' },
+  { code: 'KLAD', label: 'Kläd- och textilvård' },
+  { code: 'SNOSKOTTNING', label: 'Snöskottning' },
   { code: 'TRADGARD', label: 'Trädgårdsarbete' },
   { code: 'BARNPASS', label: 'Barnpassning' },
   { code: 'PERSONLIG_OMS', label: 'Personlig omsorg' },
-  { code: 'FLYTT', label: 'Flytthjälp' },
-  { code: 'REPARATION', label: 'Reparation av vitvaror' },
+  { code: 'FLYTT', label: 'Flyttjänster' },
   { code: 'IT', label: 'IT-tjänster i hemmet' },
-  { code: 'MOBLERING', label: 'Möblering och tillsyn av bostad' },
-  { code: 'TRANSPORT', label: 'Transport till och från återvinning' },
+  { code: 'REPARATION', label: 'Reparation av vitvaror' },
+  { code: 'MOBLERING', label: 'Möblering' },
+  { code: 'TILLSYN', label: 'Tillsyn av bostad' },
+  // Schablontjänster: reported as utförd/ej utförd in the Skatteverket file,
+  // never with hours or material.
+  { code: 'TRANSPORT', label: 'Transport till försäljning (schablon)' },
+  { code: 'TVATT', label: 'Tvätt vid tvättinrättning (schablon)' },
 ] as const
 
 export interface ItemForDeduction {
@@ -71,6 +140,13 @@ export interface ItemForDeduction {
   quantity: number
   /** 'rot' | 'rut' | null. Drives whether the deduction kicks in at all. */
   deduction_type?: DeductionType | null
+  /**
+   * The line's VAT rate in percent (25, 12, 6, 0). The statutory deduction
+   * base is the labor cost INCLUDING VAT (HUSFL 6-9 §§), so every caller
+   * that knows the rate must pass it. null/undefined means 0% (momsfri
+   * labor), where inkl. and exkl. moms coincide.
+   */
+  vat_rate?: number | null
   /**
    * Optional. Reserved for a future iteration where the eligible portion of
    * the row is just the labor hours × hourly rate. v1 ignores this and
@@ -82,18 +158,27 @@ export interface ItemForDeduction {
 
 /**
  * Compute the deduction amount for a single invoice item. Returns 0 when
- * the item has no deduction_type. The result is always >= 0 and <= line
- * total (no over-deduction even if percentages are tweaked).
+ * the item has no deduction_type. The base is the line total INCLUDING VAT
+ * (HUSFL 6-9 §§: 30% av arbetskostnaden inklusive moms for ROT, 50% for
+ * RUT). The per-line VAT is reproduced with the exact rounding the write
+ * path stores on invoice_items.vat_amount (Math.round(lineTotal * rate /
+ * 100 * 100) / 100 in build-invoice-write.ts), so the deduction and the
+ * stored VAT can never disagree by an öre. The result is always >= 0 and
+ * <= line total incl. VAT (no over-deduction even if percentages are
+ * tweaked).
  */
 export function computeDeduction(item: ItemForDeduction): number {
   if (!item.deduction_type) return 0
   const lineTotal = item.unit_price * item.quantity
   if (lineTotal <= 0) return 0
+  const rate = item.vat_rate ?? 0
+  const lineVat = rate > 0 ? Math.round(lineTotal * rate / 100 * 100) / 100 : 0
+  const lineTotalInclVat = lineTotal + lineVat
   const percent = item.deduction_type === 'rot' ? ROT_PERCENT : RUT_PERCENT
-  const raw = lineTotal * percent
-  // Cap at line total — defensive against future rule changes that would
-  // push percent past 1.0.
-  const capped = Math.min(raw, lineTotal)
+  const raw = lineTotalInclVat * percent
+  // Cap at line total incl. VAT: defensive against future rule changes that
+  // would push percent past 1.0.
+  const capped = Math.min(raw, lineTotalInclVat)
   return Math.round(capped * 100) / 100
 }
 
@@ -148,11 +233,17 @@ export interface ValidationResult {
  * The function takes invoice-level metadata as separate arguments rather
  * than reading them off the items array so callers can compose it from
  * either a HTTP request body or the form state without restructuring.
+ *
+ * `money` carries the invoice's currency (and, when known, its booking rate).
+ * ROT_MAX / RUT_MAX are kronor ceilings, so the comparison is only meaningful
+ * against a SEK figure. Omitting the argument means "SEK", which is what
+ * every pre-existing caller was implicitly asserting.
  */
 export function validateInvoice(
   items: ValidateInvoiceItem[],
   personnummerProvided: boolean,
   housingDesignationProvided: boolean,
+  money?: DeductionCurrencyContext,
 ): ValidationResult {
   const errors: string[] = []
   const warnings: string[] = []
@@ -172,18 +263,49 @@ export function validateInvoice(
 
   const { rot, rut } = computeDeductionTotalsByKind(items)
 
-  if (rot > ROT_MAX) {
+  // computeDeductionTotalsByKind works in invoice currency; the ceilings are
+  // kronor. Convert before comparing, and never label a foreign figure "kr".
+  const currencyLabel = (money?.currency ?? 'SEK').toUpperCase()
+  const toSek = deductionSekConverter(money)
+  const advice = 'Kunden behöver kontrollera sitt återstående utrymme själv.'
+
+  // Warning-text amounts: sv-SE digits, always two decimals, same convention
+  // as maxText below.
+  const svAmount = (n: number): string =>
+    n.toLocaleString('sv-SE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+
+  const pushCapWarning = (kind: 'ROT' | 'RUT', amount: number, max: number): void => {
+    if (amount <= 0) return
+    const maxText = `${max.toLocaleString('sv-SE')} kr`
+
+    if (currencyLabel === 'SEK') {
+      if (amount <= max) return
+      warnings.push(
+        `${kind}-avdraget på denna faktura (${svAmount(amount)} kr) överstiger årsmaximum ${maxText}. ` + advice,
+      )
+      return
+    }
+
+    if (!toSek) {
+      // No booking rate: we cannot know whether the ceiling is breached.
+      // Saying so beats both silence and a fabricated kronor comparison.
+      warnings.push(
+        `${kind}-avdraget på denna faktura (${svAmount(amount)} ${currencyLabel}) kan inte stämmas av mot ` +
+          `årsmaximum ${maxText}: fakturan saknar växelkurs. ` + advice,
+      )
+      return
+    }
+
+    const amountSek = toSek(amount)
+    if (amountSek <= max) return
     warnings.push(
-      `ROT-avdraget på denna faktura (${rot.toFixed(2)} kr) överstiger årsmaximum ${ROT_MAX.toLocaleString('sv-SE')} kr. ` +
-        'Kunden behöver kontrollera sitt återstående utrymme själv.',
+      `${kind}-avdraget på denna faktura (${svAmount(amount)} ${currencyLabel} = ${svAmount(amountSek)} kr) ` +
+        `överstiger årsmaximum ${maxText}. ` + advice,
     )
   }
-  if (rut > RUT_MAX) {
-    warnings.push(
-      `RUT-avdraget på denna faktura (${rut.toFixed(2)} kr) överstiger årsmaximum ${RUT_MAX.toLocaleString('sv-SE')} kr. ` +
-        'Kunden behöver kontrollera sitt återstående utrymme själv.',
-    )
-  }
+
+  pushCapWarning('ROT', rot, ROT_MAX)
+  pushCapWarning('RUT', rut, RUT_MAX)
 
   return { errors, warnings }
 }

@@ -23,13 +23,29 @@ function formatAmount(amount: number): string {
   return amount.toLocaleString('sv-SE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 }
 
+// Supplier invoices carry their own currency; "kr" is only correct for SEK.
+function amountWithCurrency(amount: number, currency?: string | null): string {
+  return `${formatAmount(amount)} ${!currency || currency === 'SEK' ? 'kr' : currency}`
+}
+
+interface SupplierCurrencyStats {
+  currency: string
+  total_outstanding: number
+  total_paid: number
+}
+
+interface SupplierStats {
+  invoice_count: number
+  by_currency: SupplierCurrencyStats[]
+}
+
 export default function SupplierDetailPage() {
   const { canWrite } = useCanWrite()
   const params = useParams()
   const router = useRouter()
   const { toast } = useToast()
   const t = useTranslations('supplier_detail')
-  const [supplier, setSupplier] = useState<Supplier & { stats?: { total_outstanding: number; total_paid: number; invoice_count: number } } | null>(null)
+  const [supplier, setSupplier] = useState<Supplier & { stats?: SupplierStats } | null>(null)
   const [invoices, setInvoices] = useState<SupplierInvoice[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [isEditOpen, setIsEditOpen] = useState(false)
@@ -55,10 +71,12 @@ export default function SupplierDetailPage() {
   }
 
   async function fetchInvoices() {
-    const res = await fetch(`/api/supplier-invoices?status=all`)
+    const res = await fetch(
+      `/api/supplier-invoices?status=all&supplier_id=${encodeURIComponent(String(params.id))}`,
+    )
     const { data } = await res.json()
     if (data) {
-      setInvoices(data.filter((inv: SupplierInvoice) => inv.supplier_id === params.id))
+      setInvoices(data as SupplierInvoice[])
     }
   }
 
@@ -152,7 +170,7 @@ export default function SupplierDetailPage() {
             <ArrowLeft className="h-5 w-5" />
           </Button>
           <div>
-            <h1 className="font-display text-2xl md:text-3xl font-medium tracking-tight">{supplier.name}</h1>
+            <h1 className="font-display text-2xl leading-8 tracking-tight">{supplier.name}</h1>
             <p className="text-muted-foreground">
               {supplierTypeLabels[supplier.supplier_type]}
               {supplier.org_number && t('org_number_inline', { number: supplier.org_number })}
@@ -189,7 +207,11 @@ export default function SupplierDetailPage() {
             <CardTitle className="text-sm text-muted-foreground">{t('outstanding')}</CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="font-display text-2xl font-medium tabular-nums">{formatAmount(supplier.stats?.total_outstanding || 0)} kr</p>
+            {(supplier.stats?.by_currency?.length ? supplier.stats.by_currency : [{ currency: supplier.default_currency || 'SEK', total_outstanding: 0, total_paid: 0 }]).map((row) => (
+              <p key={row.currency} className="font-display text-2xl tabular-nums">
+                {amountWithCurrency(row.total_outstanding, row.currency)}
+              </p>
+            ))}
           </CardContent>
         </Card>
         <Card>
@@ -197,7 +219,11 @@ export default function SupplierDetailPage() {
             <CardTitle className="text-sm text-muted-foreground">{t('total_paid')}</CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="font-display text-2xl font-medium tabular-nums">{formatAmount(supplier.stats?.total_paid || 0)} kr</p>
+            {(supplier.stats?.by_currency?.length ? supplier.stats.by_currency : [{ currency: supplier.default_currency || 'SEK', total_outstanding: 0, total_paid: 0 }]).map((row) => (
+              <p key={row.currency} className="font-display text-2xl tabular-nums">
+                {amountWithCurrency(row.total_paid, row.currency)}
+              </p>
+            ))}
           </CardContent>
         </Card>
         <Card>
@@ -205,7 +231,7 @@ export default function SupplierDetailPage() {
             <CardTitle className="text-sm text-muted-foreground">{t('invoice_count')}</CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="font-display text-2xl font-medium tabular-nums">{supplier.stats?.invoice_count || 0}</p>
+            <p className="font-display text-2xl tabular-nums">{supplier.stats?.invoice_count || 0}</p>
           </CardContent>
         </Card>
       </div>
@@ -244,7 +270,7 @@ export default function SupplierDetailPage() {
       <Card>
         <CardHeader className="flex flex-row items-center justify-between">
           <CardTitle className="text-lg">{t('invoices_section_title')}</CardTitle>
-          <Link href="/supplier-invoices/new">
+          <Link href="/supplier-invoices?new=1">
             <Button size="sm">
               <FileText className="mr-2 h-4 w-4" />
               {t('new_invoice')}
@@ -283,8 +309,8 @@ export default function SupplierDetailPage() {
                       </TableCell>
                       <TableCell className="tabular-nums">{formatDate(inv.invoice_date)}</TableCell>
                       <TableCell className="tabular-nums">{formatDate(inv.due_date)}</TableCell>
-                      <TableCell className="text-right tabular-nums">{formatAmount(inv.total)} kr</TableCell>
-                      <TableCell className="text-right tabular-nums">{formatAmount(inv.remaining_amount)} kr</TableCell>
+                      <TableCell className="text-right tabular-nums">{amountWithCurrency(inv.total, inv.currency)}</TableCell>
+                      <TableCell className="text-right tabular-nums">{amountWithCurrency(inv.remaining_amount, inv.currency)}</TableCell>
                       <TableCell>
                         <Badge variant={statusVariants[inv.status] || 'secondary'}>
                           {statusLabels[inv.status] || inv.status}
@@ -309,11 +335,11 @@ export default function SupplierDetailPage() {
                   </div>
                   <div className="flex items-center justify-between text-sm">
                     <span className="text-muted-foreground tabular-nums">{formatDate(inv.invoice_date)} → {formatDate(inv.due_date)}</span>
-                    <span className="font-mono">{formatAmount(inv.total)} kr</span>
+                    <span className="font-mono">{amountWithCurrency(inv.total, inv.currency)}</span>
                   </div>
                   {Number(inv.remaining_amount) > 0 && Number(inv.remaining_amount) !== Number(inv.total) && (
                     <div className="text-xs text-muted-foreground text-right">
-                      {t('remaining_inline', { amount: formatAmount(inv.remaining_amount) })}
+                      {t('remaining_inline', { amount: amountWithCurrency(inv.remaining_amount, inv.currency) })}
                     </div>
                   )}
                 </div>

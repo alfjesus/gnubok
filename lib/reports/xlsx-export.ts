@@ -14,7 +14,7 @@ import * as XLSX from 'xlsx'
  *
  * Bolding the header row would require `xlsx-style` or `cellStyles: true` which
  * is not supported in the base `xlsx` distribution we ship. Instead we freeze
- * the first row so the headers stay visible while scrolling — visually distinct
+ * the first row so the headers stay visible while scrolling: visually distinct
  * without depending on optional packages.
  *
  * Column widths are computed automatically from the maximum content length per
@@ -23,7 +23,7 @@ import * as XLSX from 'xlsx'
  */
 
 export type CellValue = string | number | Date | null | undefined
-export type ColumnFormat = 'text' | 'currency' | 'date' | 'integer' | 'percent'
+export type ColumnFormat = 'text' | 'currency' | 'decimal' | 'date' | 'integer' | 'percent'
 
 export interface ColumnSpec {
   /** Human-readable header label rendered in row 1. */
@@ -47,6 +47,9 @@ export interface SheetSpec<TRow> {
 }
 
 const CURRENCY_FORMAT = '#,##0.00 " kr"'
+// Money amount WITHOUT the " kr" suffix: for columns whose currency varies per
+// row (e.g. article prices with a separate Valuta column).
+const DECIMAL_FORMAT = '#,##0.00'
 const DATE_FORMAT = 'yyyy-mm-dd'
 const INTEGER_FORMAT = '#,##0'
 const PERCENT_FORMAT = '0.00%'
@@ -55,6 +58,8 @@ function formatToZ(format: ColumnFormat): string | undefined {
   switch (format) {
     case 'currency':
       return CURRENCY_FORMAT
+    case 'decimal':
+      return DECIMAL_FORMAT
     case 'date':
       return DATE_FORMAT
     case 'integer':
@@ -84,6 +89,12 @@ function displayLength(value: CellValue, format: ColumnFormat): number {
           .replace(/\B(?=(\d{3})+(?!\d))/g, ' ')
         return formatted.length + 3 + (value < 0 ? 1 : 0) // +3 for " kr"
       }
+      case 'decimal': {
+        const formatted = Math.abs(value)
+          .toFixed(2)
+          .replace(/\B(?=(\d{3})+(?!\d))/g, ' ')
+        return formatted.length + (value < 0 ? 1 : 0)
+      }
       case 'integer': {
         const formatted = Math.round(value).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ' ')
         return formatted.length + (value < 0 ? 1 : 0)
@@ -109,7 +120,7 @@ function displayLength(value: CellValue, format: ColumnFormat): number {
 // single type parameter. Per-sheet type safety still applies inside each
 // `SheetSpec<TRow>` declaration.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unused-vars
-export function reportToWorkbook<_T = unknown>(spec: ReadonlyArray<SheetSpec<any>>): Buffer {
+export function reportToWorkbook<_T = unknown>(spec: ReadonlyArray<SheetSpec<any>>, options: { bookType?: 'xlsx' | 'csv' } = {}): Buffer {
   if (spec.length === 0) {
     throw new Error('reportToWorkbook: at least one sheet spec is required')
   }
@@ -151,7 +162,7 @@ export function reportToWorkbook<_T = unknown>(spec: ReadonlyArray<SheetSpec<any
     }
 
     // Auto-size columns based on max content length per column. Header counts
-    // too — a short numeric column with a long header still needs to fit the
+    // too: a short numeric column with a long header still needs to fit the
     // label. Min 8, max 60 chars to avoid degenerate widths.
     const colWidths = sheet.columns.map((col, colIdx) => {
       let maxLen = col.header.length
@@ -176,13 +187,19 @@ export function reportToWorkbook<_T = unknown>(spec: ReadonlyArray<SheetSpec<any
     XLSX.utils.book_append_sheet(workbook, worksheet, truncatedName)
   }
 
-  // `XLSX.write` with `type: 'buffer'` returns a Node Buffer.
-  const out = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' }) as Buffer
+  // `XLSX.write` with `type: 'buffer'` returns a Node Buffer. `bookType: 'csv'`
+  // emits only the first sheet (CSV is single-sheet): fine for the flat,
+  // single-sheet register exports that use this option.
+  const bookType = options.bookType ?? 'xlsx'
+  const out = XLSX.write(workbook, { type: 'buffer', bookType }) as Buffer
   return out
 }
 
+/** UTF-8 byte-order mark (U+FEFF) so Excel opens CSV exports with åäö intact. */
+export const UTF8_BOM = '\uFEFF'
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Column helpers — small declarative builders so route files read cleanly.
+// Column helpers: small declarative builders so route files read cleanly.
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function textColumn(header: string): ColumnSpec {
@@ -191,6 +208,11 @@ export function textColumn(header: string): ColumnSpec {
 
 export function currencyColumn(header: string): ColumnSpec {
   return { header, format: 'currency' }
+}
+
+/** Two-decimal amount without the " kr" suffix: pair with a per-row currency column. */
+export function decimalColumn(header: string): ColumnSpec {
+  return { header, format: 'decimal' }
 }
 
 export function dateColumn(header: string): ColumnSpec {
@@ -247,4 +269,21 @@ export function xlsxFilename(reportSlug: string, companyName: string, period: st
   const periodCompact = (period || '').replace(/-/g, '')
   const parts = [reportSlug, companySlug, periodCompact].filter(Boolean)
   return `${parts.join('-')}.xlsx`
+}
+
+/**
+ * Build a download filename `<slug>-<companySlug>-<dateYYYYMMDD>.<ext>`.
+ * Like `xlsxFilename` but with a caller-chosen extension (`'xlsx'` | `'csv'`),
+ * for register exports that offer both formats.
+ */
+export function exportFilename(
+  slug: string,
+  companyName: string,
+  date: string,
+  ext: 'xlsx' | 'csv',
+): string {
+  const companySlug = slugifyCompanyName(companyName)
+  const dateCompact = (date || '').replace(/-/g, '')
+  const parts = [slug, companySlug, dateCompact].filter(Boolean)
+  return `${parts.join('-')}.${ext}`
 }

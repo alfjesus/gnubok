@@ -13,6 +13,7 @@ import { withRouteContext } from '@/lib/api/with-route-context'
 import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
 import { resolveSekAmount } from '@/lib/bookkeeping/currency-utils'
 import { buildSupplierPaymentClearingLines } from '@/lib/bookkeeping/supplier-payment-lines'
+import { resolveSettlementAccount } from '@/lib/bookkeeping/settlement-account'
 import { ORE_TOLERANCE } from '@/lib/money'
 import type { SupplierInvoice, SupplierInvoiceItem } from '@/types'
 
@@ -50,7 +51,9 @@ export const GET = withRouteContext(
       // amount_sek is needed for the cash-method preview: a foreign-currency
       // settlement is translated at the payment-date rate (the SEK that left
       // the bank), mirroring the committed verifikat from the POST handler.
-      .select('id, date, amount, currency, amount_sek')
+      // cash_account_id resolves which BAS account this bank line actually
+      // settles from, mirroring the POST handler's settlement-account lookup.
+      .select('id, date, amount, currency, amount_sek, cash_account_id')
       .eq('id', transactionId)
       .eq('company_id', companyId)
       .single()
@@ -70,16 +73,77 @@ export const GET = withRouteContext(
 
     const { data: settings } = await supabase
       .from('company_settings')
-      .select('accounting_method, last_supplier_payment_account')
+      .select('accounting_method')
       .eq('company_id', companyId)
       .single()
 
     const accountingMethod = settings?.accounting_method || 'accrual'
-    const paymentAccount =
-      (settings as { last_supplier_payment_account?: string } | null)?.last_supplier_payment_account || '1930'
+
+    // Same resolution as the POST handler: credit the cash account this
+    // transaction is actually linked to, never the sticky
+    // last_supplier_payment_account (that setting reflects the manual
+    // mark-paid/private-funds flow, not a real matched bank transaction).
+    const paymentAccount = await resolveSettlementAccount(
+      supabase,
+      companyId!,
+      transaction.cash_account_id,
+      log,
+    )
 
     const siAlreadyBooked = !!(invoice as { registration_journal_entry_id?: string | null }).registration_journal_entry_id
     const useCashEntry = !siAlreadyBooked && accountingMethod === 'cash'
+
+    const si = invoice as SupplierInvoice & { items?: SupplierInvoiceItem[] }
+
+    // Amount resolution, byte-identical to the POST handler: same inputs, same
+    // `Math.round(x * 100) / 100` form. This preview is what the user approves
+    // in the dialog, so any divergence here means one number is approved and a
+    // different one is booked.
+    const txAmountAbs = Math.abs(transaction.amount)
+    const remainingInvoiceCurrency = si.remaining_amount ?? si.total
+    // In the INVOICE's currency: a cross-currency match settles whatever
+    // remains rather than reading the bank figure as invoice currency.
+    const paymentAmountInvoiceCurrency =
+      transaction.currency === si.currency ? txAmountAbs : remainingInvoiceCurrency
+    // SEK that actually left the bank, when known. SEK bank line → the absolute
+    // amount; foreign line with a stored amount_sek → that value; foreign line
+    // WITHOUT amount_sek → unknown (null). The raw foreign amount must never
+    // stand in: that is what renders 19 USD as 19 kr.
+    const bankSekStored =
+      transaction.currency === 'SEK'
+        ? txAmountAbs
+        : transaction.amount_sek != null
+          ? Math.abs(transaction.amount_sek)
+          : null
+    const invoiceFxRate = si.exchange_rate ?? null
+    // SEK the invoice was booked at for this payment portion; null when the
+    // invoice is foreign and carries no exchange_rate.
+    const bookedSek =
+      si.currency === 'SEK'
+        ? paymentAmountInvoiceCurrency
+        : invoiceFxRate && invoiceFxRate > 0
+          ? Math.round(paymentAmountInvoiceCurrency * invoiceFxRate * 100) / 100
+          : null
+    const actualBankSek = bankSekStored ?? bookedSek
+    if (actualBankSek == null) {
+      // Neither side yields a SEK figure (foreign bank line without amount_sek
+      // paying a foreign invoice without exchange_rate). The POST handler
+      // refuses this row with the same code, so refuse here instead of
+      // previewing a 1:1 number that can never be committed.
+      return errorResponseFromCode('SI_FX_RATE_MISSING', log, {
+        requestId,
+        details: {
+          transaction_currency: transaction.currency,
+          invoice_currency: si.currency,
+        },
+      })
+    }
+    const originalBookedSek = bookedSek ?? actualBankSek
+    const exchangeRateDifference =
+      Math.round((originalBookedSek - actualBankSek) * 100) / 100
+    const fullSettlement =
+      transaction.currency !== si.currency ||
+      txAmountAbs >= remainingInvoiceCurrency - 0.005
 
     const lines: PreviewLine[] = []
     let entryType: 'clearing' | 'cash' = 'clearing'
@@ -90,29 +154,34 @@ export const GET = withRouteContext(
 
     if (useCashEntry) {
       entryType = 'cash'
-      const si = invoice as SupplierInvoice & { items?: SupplierInvoiceItem[] }
       const items = si.items ?? []
 
-      // Kontantmetoden books the expense AT PAYMENT at the payment-date rate
-      // (the SEK that actually left the bank), so translate this preview the
-      // same way the committed verifikat does. The bank SEK is only known when
-      // the transaction is in SEK or carries a stored amount_sek; for a foreign
-      // transaction without it we fall back to the invoice's own rate (the raw
-      // foreign amount must never be used — that would render 19 USD as 19 kr).
-      const bankSek =
-        transaction.currency === 'SEK'
-          ? Math.abs(transaction.amount)
-          : transaction.amount_sek != null
-            ? Math.abs(transaction.amount_sek)
-            : null
+      // Kontantmetoden books the expense AT PAYMENT at the payment-date rate.
+      // The POST handler passes createSupplierInvoiceCashEntry a settledBankSek
+      // override only for a full foreign settlement whose rate actually moved;
+      // the builder then derives its rate as settledBankSek / invoice.total and
+      // otherwise keeps the invoice's stored rate. Mirror that derivation
+      // exactly (createSupplierInvoiceCashEntry's `effectiveRate`).
+      const settledBankSek =
+        exchangeRateDifference !== 0 && fullSettlement ? actualBankSek : undefined
       const cashRate =
-        bankSek != null && si.currency !== 'SEK' && si.total > 0
-          ? bankSek / si.total
+        settledBankSek != null && settledBankSek > 0 && si.currency !== 'SEK' && si.total > 0
+          ? settledBankSek / si.total
           : si.exchange_rate
+      // The builder routes every leg through toSekOrThrow, which refuses a
+      // foreign invoice with no usable rate rather than posting it as if
+      // 1 EUR = 1 SEK. Refuse the same rows here so the dialog can't display
+      // amounts the commit will reject.
+      if (si.currency !== 'SEK' && !(cashRate != null && cashRate > 0)) {
+        return errorResponseFromCode('SI_FX_RATE_MISSING', log, {
+          requestId,
+          details: { invoice_currency: si.currency },
+        })
+      }
 
       // Mirror createSupplierInvoiceCashEntry: per-item expense debit + VAT
       // debit + bank credit. We only need a faithful preview, not exact
-      // account-mapping fidelity — show one aggregate expense line per item
+      // account-mapping fidelity: show one aggregate expense line per item
       // (or a single fallback line if items are missing).
       let totalAmountSek = 0
       let totalVatSek = 0
@@ -132,7 +201,7 @@ export const GET = withRouteContext(
         }
       } else {
         // Pass null for the pre-computed SEK so cashRate (payment-date rate)
-        // drives the translation — resolveSekAmount would otherwise prefer the
+        // drives the translation: resolveSekAmount would otherwise prefer the
         // invoice-rate *_sek columns and ignore the rate.
         const subSek = resolveSekAmount(si.subtotal, null, si.currency, cashRate)
         const vatSek = resolveSekAmount(si.vat_amount, null, si.currency, cashRate)
@@ -163,16 +232,13 @@ export const GET = withRouteContext(
       })
     } else {
       // Clearing: Dr 2440 / Cr 1930 (or chosen payment account).
-      const si = invoice as SupplierInvoice
       const isPureSek = transaction.currency === 'SEK' && si.currency === 'SEK'
       if (isPureSek) {
-        // Shared builder so the previewed lines — including any 3740
-        // öresavrundning row — are byte-identical to what the POST commits.
-        const remainingSek = si.remaining_amount ?? si.total
-        const bankSek = Math.abs(transaction.amount)
+        // Shared builder so the previewed lines (including any 3740
+        // öresavrundning row) are byte-identical to what the POST commits.
         const { lines: clearingLines, oreDiffSek } = buildSupplierPaymentClearingLines({
-          apSek: remainingSek,
-          bankSek,
+          apSek: remainingInvoiceCurrency,
+          bankSek: txAmountAbs,
           paymentAccount,
         })
         for (const l of clearingLines) {
@@ -186,29 +252,49 @@ export const GET = withRouteContext(
         oreRounding = oreDiffSek !== 0
         // Full settlement when the öre residual is absorbed or the bank covers
         // the whole remaining; a ≥1 kr short payment leaves a partial.
-        isFullyPaid = oreRounding || bankSek >= remainingSek - ORE_TOLERANCE
+        isFullyPaid = oreRounding || txAmountAbs >= remainingInvoiceCurrency - ORE_TOLERANCE
       } else {
-        const amountSek = resolveSekAmount(
-          Math.abs(transaction.amount),
-          null,
-          transaction.currency,
-          null,
-        )
-        const total = resolveSekAmount(si.total, si.total_sek, si.currency, si.exchange_rate)
-        const amount = Math.round(Math.min(amountSek, total) * 100) / 100
+        // Foreign leg under faktureringsmetoden. createSupplierInvoicePaymentEntry
+        // clears 2440 at the SEK the leverantörsskuld was BOOKED at and credits
+        // the bank with the SEK that actually moved, booking the difference as
+        // kursvinst (3960) or kursförlust (7960). The old preview showed a single
+        // min(bankSEK, invoiceSEK) figure on both legs and no FX line, so the
+        // bank credit the user approved differed from the committed one by
+        // exactly the kursdifferens (and, with no conversion inputs at all,
+        // showed the raw foreign amount as kronor).
         lines.push({
           account_number: '2440',
-          debit_amount: amount,
+          debit_amount: Math.round(originalBookedSek * 100) / 100,
           credit_amount: 0,
           description: 'Kvittning leverantörsskuld',
         })
         lines.push({
           account_number: paymentAccount,
           debit_amount: 0,
-          credit_amount: amount,
+          credit_amount: Math.round(actualBankSek * 100) / 100,
           description: 'Utbetalning från bank',
         })
-        isFullyPaid = amount >= total - ORE_TOLERANCE
+        if (exchangeRateDifference > 0) {
+          lines.push({
+            account_number: '3960',
+            debit_amount: 0,
+            credit_amount: Math.round(Math.abs(exchangeRateDifference) * 100) / 100,
+            description: 'Valutakursvinst',
+          })
+        } else if (exchangeRateDifference < 0) {
+          lines.push({
+            account_number: '7960',
+            debit_amount: Math.round(Math.abs(exchangeRateDifference) * 100) / 100,
+            credit_amount: 0,
+            description: 'Valutakursförlust',
+          })
+        }
+        // Mirrors planSupplierPayment without öre absorption (the accrual FX
+        // path never absorbs): a cross-currency match is clamped to the
+        // remaining balance and therefore always settles in full; a
+        // same-currency foreign match settles when the bank amount covers it.
+        isFullyPaid =
+          paymentAmountInvoiceCurrency >= remainingInvoiceCurrency - ORE_TOLERANCE
       }
     }
 

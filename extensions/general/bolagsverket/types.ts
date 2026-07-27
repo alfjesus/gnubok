@@ -5,7 +5,7 @@
  *
  * NOTE: the official OpenAPI 2.0 servicespecifikationer are still pending
  * manual download (dev_docs/bokslut/INDEX.md checklist → api/). When they
- * land, reconcile these types against the specs — the specs win on conflict
+ * land, reconcile these types against the specs: the specs win on conflict
  * (GUIDE §5.1).
  */
 
@@ -13,7 +13,7 @@ export type BolagsverketEnvironment = 'test' | 'accept' | 'prod'
 
 export type HandlingTyp =
   | 'arsredovisning_komplett'
-  | 'arsredovisning'
+  | 'arsredovisning_kompletteras'
   | 'revisionsberattelse'
 
 // ---- hamta-arsredovisningsinformation/v1.4 ---------------------------------
@@ -147,7 +147,9 @@ export interface HamtaHandelserSvar {
 export type SubmissionStatus =
   | 'draft'
   | 'kontrollerad'
+  | 'sending'
   | 'uploaded'
+  | 'unknown'
   | 'inkommen'
   | 'forelagd'
   | 'komplettering'
@@ -160,6 +162,7 @@ export interface ArsredovisningSubmission {
   company_id: string
   user_id: string
   fiscal_period_id: string
+  annual_report_version_id: string | null
   handling_typ: HandlingTyp
   taxonomy_version: string
   entry_point: string

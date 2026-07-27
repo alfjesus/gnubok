@@ -1,6 +1,10 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
-import { fetchAllRows } from '@/lib/supabase/fetch-all'
-import { calculatePeriodDates } from './vat-declaration'
+import {
+  fetchEntryLines,
+  fetchLinesByEntryIds,
+  type EntryLinesQuery,
+} from '@/lib/bookkeeping/entry-lines'
+import { resolvePeriodDates } from './vat-declaration'
 import type { VatPeriodType } from '@/types'
 
 /**
@@ -90,6 +94,7 @@ function pickEntry(row: RcLineRow): EntryFields | null {
 }
 
 interface SiblingLineRow {
+  id: string
   journal_entry_id: string
   account_number: string
   debit_amount: number
@@ -102,39 +107,40 @@ export async function findRcBasisGaps(
   periodType: VatPeriodType,
   year: number,
   period: number,
+  options: { fiscalPeriodId?: string } = {},
 ): Promise<RcBasisGap[]> {
-  const { start, end } = calculatePeriodDates(periodType, year, period)
+  // Same period resolution as the declaration itself: helårsmoms covers the
+  // räkenskapsår, not the calendar year, so a calendar span would hide gap
+  // vouchers from the tail of an extended/broken fiscal year while the
+  // declaration totals (and the aggregate check) still include them.
+  const { start, end } = await resolvePeriodDates(
+    supabase, companyId, periodType, year, period, options.fiscalPeriodId
+  )
 
-  const rcLines = (await fetchAllRows<unknown>(({ from, to }) =>
-    supabase
-      .from('journal_entry_lines')
-      .select(`
-        journal_entry_id,
-        account_number,
-        debit_amount,
-        credit_amount,
-        journal_entries!inner (
-          id, voucher_number, voucher_series, entry_date, description, status, company_id
-        )
-      `)
-      .in('account_number', RC_OUTPUT_ACCOUNTS as unknown as string[])
-      .eq('journal_entries.company_id', companyId)
-      .eq('journal_entries.status', 'posted')
-      .gte('journal_entries.entry_date', start)
-      .lte('journal_entries.entry_date', end)
-      .range(from, to),
-  )) as RcLineRow[]
+  // Two-step entry-lines fetch (see lib/bookkeeping/entry-lines.ts).
+  const rcLines = (await fetchEntryLines<unknown>({
+    supabase,
+    entryColumns:
+      'id, voucher_number, voucher_series, entry_date, description, status, company_id',
+    lineColumns: 'journal_entry_id, account_number, debit_amount, credit_amount',
+    filterEntries: (q: EntryLinesQuery) =>
+      q
+        .eq('company_id', companyId)
+        .eq('status', 'posted')
+        .gte('entry_date', start)
+        .lte('entry_date', end),
+    filterLines: (q: EntryLinesQuery) =>
+      q.in('account_number', RC_OUTPUT_ACCOUNTS as unknown as string[]),
+  })) as RcLineRow[]
 
   if (rcLines.length === 0) return []
 
   const entryIds = [...new Set(rcLines.map((l) => l.journal_entry_id))]
 
-  const siblingLines = await fetchAllRows<SiblingLineRow>(({ from, to }) =>
-    supabase
-      .from('journal_entry_lines')
-      .select('journal_entry_id, account_number, debit_amount, credit_amount')
-      .in('journal_entry_id', entryIds)
-      .range(from, to),
+  const siblingLines = await fetchLinesByEntryIds<SiblingLineRow>(
+    supabase,
+    entryIds,
+    'id, journal_entry_id, account_number, debit_amount, credit_amount',
   )
 
   const basisByEntry = new Map<string, number>()
@@ -148,7 +154,7 @@ export async function findRcBasisGaps(
     }
   }
 
-  // Aggregate RC output per (entry, account) — a voucher may have multiple
+  // Aggregate RC output per (entry, account): a voucher may have multiple
   // 2614 lines (rare) and we want to flag the total shortfall.
   const aggregated = new Map<string, { row: RcLineRow; amount: number }>()
   for (const line of rcLines) {

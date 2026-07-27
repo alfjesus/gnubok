@@ -2,7 +2,6 @@
 
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
-import { Badge } from '@/components/ui/badge'
 import {
   Table,
   TableBody,
@@ -21,6 +20,7 @@ import {
   FileText,
 } from 'lucide-react'
 import { formatCurrency } from '@/lib/utils'
+import { summarizeByCurrency } from '@/lib/import/bank-file/currency-summary'
 import type { BankFileParseResult } from '@/lib/import/bank-file/types'
 
 interface BankFilePreviewStepProps {
@@ -37,6 +37,9 @@ export default function BankFilePreviewStep({
   const { transactions, stats, issues, date_from, date_to } = parseResult
   const hasIssues = issues.filter((i) => i.severity === 'error').length > 0
   const warnings = issues.filter((i) => i.severity === 'warning')
+  // Wise/camt.053 files can mix currencies per row: the parser-level totals
+  // sum across currencies, so income/expenses are grouped per currency here.
+  const currencyTotals = summarizeByCurrency(transactions)
 
   return (
     <div className="space-y-6">
@@ -48,7 +51,7 @@ export default function BankFilePreviewStep({
               <FileText className="h-4 w-4" />
               <span className="text-sm">Transaktioner</span>
             </div>
-            <p className="text-2xl font-display font-medium tabular-nums">{stats.parsed_rows}</p>
+            <p className="text-2xl font-display tabular-nums">{stats.parsed_rows}</p>
             {stats.skipped_rows > 0 && (
               <p className="text-xs text-muted-foreground mt-1">
                 {stats.skipped_rows} rader hoppades över
@@ -64,7 +67,7 @@ export default function BankFilePreviewStep({
               <span className="text-sm">Period</span>
             </div>
             <p className="text-sm font-medium">
-              {date_from || '–'} till {date_to || '–'}
+              {date_from || '-'} till {date_to || '-'}
             </p>
           </CardContent>
         </Card>
@@ -75,9 +78,11 @@ export default function BankFilePreviewStep({
               <TrendingUp className="h-4 w-4" />
               <span className="text-sm">Inkomster</span>
             </div>
-            <p className="text-lg font-display font-medium tabular-nums">
-              {formatCurrency(stats.total_income)}
-            </p>
+            {(currencyTotals.length ? currencyTotals : [{ currency: 'SEK', total_income: 0, total_expenses: 0 }]).map((row) => (
+              <p key={row.currency} className="text-lg font-display tabular-nums">
+                {formatCurrency(row.total_income, row.currency)}
+              </p>
+            ))}
           </CardContent>
         </Card>
 
@@ -85,20 +90,22 @@ export default function BankFilePreviewStep({
           <CardContent className="pt-6">
             <div className="flex items-center gap-2 text-muted-foreground mb-1">
               <TrendingDown className="h-4 w-4" />
-              <span className="text-sm">Leverantörsfakturor</span>
+              <span className="text-sm">Utgifter</span>
             </div>
-            <p className="text-lg font-display font-medium tabular-nums">
-              {formatCurrency(stats.total_expenses)}
-            </p>
+            {(currencyTotals.length ? currencyTotals : [{ currency: 'SEK', total_income: 0, total_expenses: 0 }]).map((row) => (
+              <p key={row.currency} className="text-lg font-display tabular-nums">
+                {formatCurrency(row.total_expenses, row.currency)}
+              </p>
+            ))}
           </CardContent>
         </Card>
       </div>
 
       {/* Warnings */}
       {warnings.length > 0 && (
-        <Card className="border-yellow-300">
+        <Card>
           <CardHeader className="py-3">
-            <CardTitle className="text-sm flex items-center gap-2 text-yellow-600">
+            <CardTitle className="text-sm flex items-center gap-2 text-warning">
               <AlertTriangle className="h-4 w-4" />
               {warnings.length} varning{warnings.length !== 1 ? 'ar' : ''}
             </CardTitle>
@@ -152,22 +159,16 @@ export default function BankFilePreviewStep({
                     <TableCell
                       className="text-right font-mono text-sm"
                     >
-                      {formatCurrency(tx.amount)}
+                      {formatCurrency(tx.amount, tx.currency || 'SEK')}
                     </TableCell>
                     {transactions.some((t) => t.balance != null) && (
                       <TableCell className="text-right font-mono text-sm text-muted-foreground">
-                        {tx.balance != null ? formatCurrency(tx.balance) : '–'}
+                        {tx.balance != null ? formatCurrency(tx.balance, tx.currency || 'SEK') : '-'}
                       </TableCell>
                     )}
                     {transactions.some((t) => t.reference) && (
-                      <TableCell className="text-sm">
-                        {tx.reference ? (
-                          <Badge variant="outline" className="font-mono text-xs">
-                            {tx.reference}
-                          </Badge>
-                        ) : (
-                          '–'
-                        )}
+                      <TableCell className="font-mono text-sm text-muted-foreground">
+                        {tx.reference ? tx.reference : '-'}
                       </TableCell>
                     )}
                   </TableRow>

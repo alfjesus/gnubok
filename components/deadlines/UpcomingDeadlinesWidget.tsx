@@ -13,6 +13,7 @@ import {
   STATUS_LABELS,
 } from '@/lib/calendar/utils'
 import { Calendar, ChevronRight, AlertTriangle, Clock, Check, Send, Loader2 } from 'lucide-react'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 interface UpcomingDeadlinesWidgetProps {
   deadlines: Deadline[]
@@ -72,8 +73,17 @@ export function UpcomingDeadlinesWidget({ deadlines, maxItems = 5, onStatusChang
       })
 
       if (!response.ok) {
-        const data = await response.json()
-        throw new Error(data.error || 'Failed to update status')
+        // Map the parsed body plus the status, never `new Error(data.error)`:
+        // the route answers thrown errors with the canonical envelope
+        // `{ error: { code, message } }`, and the Error constructor would
+        // stringify that object to "[object Object]", discarding the route's
+        // own Swedish reason.
+        const body = await response.json().catch(() => null)
+        toast({
+          title: getUserErrorMessage(body, { statusCode: response.status }),
+          variant: 'destructive',
+        })
+        return
       }
 
       toast({
@@ -85,7 +95,7 @@ export function UpcomingDeadlinesWidget({ deadlines, maxItems = 5, onStatusChang
       onStatusChange?.(deadlineId, newStatus)
     } catch (error) {
       toast({
-        title: error instanceof Error ? error.message : t('toast_status_update_failed'),
+        title: error instanceof Error ? getUserErrorMessage(error) : t('toast_status_update_failed'),
         variant: 'destructive',
       })
     } finally {
@@ -129,11 +139,7 @@ export function UpcomingDeadlinesWidget({ deadlines, maxItems = 5, onStatusChang
             <div
               key={deadline.id}
               className={`flex items-center justify-between p-2 rounded-lg ${
-                deadline.status === 'overdue'
-                  ? 'bg-destructive/5 border border-destructive/30'
-                  : deadline.status === 'action_needed'
-                  ? 'bg-warning/5 border border-warning/20'
-                  : ''
+                deadline.status === 'overdue' ? 'bg-destructive/5' : ''
               }`}
             >
               <div className="flex items-center gap-2 min-w-0 flex-1">
@@ -146,17 +152,16 @@ export function UpcomingDeadlinesWidget({ deadlines, maxItems = 5, onStatusChang
                 )}
                 <div className="min-w-0 flex-1">
                   <p className="text-sm font-medium truncate">{deadline.title}</p>
-                  <div className="flex items-center gap-2">
-                    <p className="text-xs text-muted-foreground">
-                      {formatDate(deadline.due_date)}
-                      {deadline.due_time && ` ${t('time_prefix')} ${deadline.due_time.slice(0, 5)}`}
-                    </p>
+                  <p className="text-xs text-muted-foreground">
+                    {formatDate(deadline.due_date)}
+                    {deadline.due_time && ` ${t('time_prefix')} ${deadline.due_time.slice(0, 5)}`}
                     {deadline.tax_deadline_type && (
-                      <Badge variant="outline" className="text-xs px-1 py-0">
-                        {t('tax_badge')}
-                      </Badge>
+                      <>
+                        {' '}
+                        <span className="text-muted-foreground/30">·</span> {t('tax_badge')}
+                      </>
                     )}
-                  </div>
+                  </p>
                 </div>
               </div>
 

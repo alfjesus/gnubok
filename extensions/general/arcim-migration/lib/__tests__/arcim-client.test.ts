@@ -180,7 +180,7 @@ describe('arcim-client', () => {
     it('increases delay on successive retries', async () => {
       const delays: number[] = []
       const realSetTimeout = globalThis.setTimeout
-      // Only intercept retry delays (1000–10000ms range), pass abort timers through
+      // Only intercept retry delays (1000-10000ms range), pass abort timers through
       vi.spyOn(globalThis, 'setTimeout').mockImplementation((fn, ms) => {
         if (ms && ms >= 1000 && ms < 120_000) {
           delays.push(ms as number)
@@ -228,7 +228,7 @@ describe('arcim-client', () => {
         )
       )
 
-      await createConsent('fortnox' as any, 'Test', '5591234567', 'Test AB')
+      await createConsent('fortnox', 'Test', '5591234567', 'Test AB')
 
       const [url, opts] = fetchSpy.mock.calls[0]
       expect(url).toBe('https://arcim.test.com/api/v1/consents')
@@ -266,7 +266,7 @@ describe('arcim-client', () => {
 
       const result = await fetchCustomers('consent-1')
       expect(result).toHaveLength(3)
-      expect(result.map((c: any) => c.id)).toEqual(['c1', 'c2', 'c3'])
+      expect(result.map((c) => c.id)).toEqual(['c1', 'c2', 'c3'])
       expect(fetchSpy).toHaveBeenCalledTimes(2)
     })
 

@@ -1,11 +1,24 @@
-import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
 import { renderToBuffer } from '@react-pdf/renderer'
+import { withRouteContext } from '@/lib/api/with-route-context'
 import { InvoicePDF } from '@/lib/invoices/pdf-template'
-import { prepareInvoicePdfRender } from '@/lib/invoices/pdf-render-helpers'
+import { prepareInvoicePdfRender, buildSwishQrDataUrl, buildPaymentLinkQrDataUrl } from '@/lib/invoices/pdf-render-helpers'
 import { getVatRules } from '@/lib/invoices/vat-rules'
-import { requireCompanyId } from '@/lib/company/context'
+import { invoicePdfFilename } from '@/lib/invoices/pdf-filename'
+import { contentDisposition } from '@/lib/api/content-disposition'
 import type { Invoice, InvoiceItem, Customer, CompanySettings, InvoiceDocumentType } from '@/types'
+import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
+import {
+  hasRequiredInvoicePaymentAccount,
+  invoiceRequiresPaymentAccount,
+} from '@/lib/invoices/payment-accounts'
+
+const PRIVATE_NO_STORE_HEADERS = { 'Cache-Control': 'private, no-store' }
+
+function privateNoStore(response: NextResponse): NextResponse {
+  response.headers.set('Cache-Control', 'private, no-store')
+  return response
+}
 
 /**
  * POST /api/invoices/preview-pdf
@@ -13,26 +26,66 @@ import type { Invoice, InvoiceItem, Customer, CompanySettings, InvoiceDocumentTy
  * Generates a preview PDF from form data without creating an invoice.
  * Returns the PDF as an inline blob for display in a new browser tab.
  */
-export async function POST(request: Request) {
-  const supabase = await createClient()
-
-  const { data: { user } } = await supabase.auth.getUser()
-
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const companyId = await requireCompanyId(supabase, user.id)
-
+export const POST = withRouteContext('invoice.preview_pdf', async (request, {
+  supabase,
+  user,
+  companyId,
+  log,
+  requestId,
+}) => {
   const body = await request.json()
-  const { customer_id, invoice_date, due_date, delivery_date, currency, items, your_reference, our_reference, notes, document_type, invoice_number } = body
+  const { customer_id, invoice_date, due_date, delivery_date, currency, items, your_reference, our_reference, notes, document_type, invoice_number, payment_link_url } = body
+
+  // Preview-only https gate, mirroring CreateInvoiceSchema: the value is
+  // rendered as a clickable link + QR in the preview PDF.
+  const previewPaymentLink = (() => {
+    if (typeof payment_link_url !== 'string' || !payment_link_url.trim()) return null
+    try {
+      return new URL(payment_link_url).protocol === 'https:' ? payment_link_url.trim() : null
+    } catch {
+      return null
+    }
+  })()
 
   if (!items || items.length === 0) {
-    return NextResponse.json({ error: 'Rader krävs' }, { status: 400 })
+    return NextResponse.json(
+      { error: 'Rader krävs' },
+      { status: 400, headers: PRIVATE_NO_STORE_HEADERS },
+    )
+  }
+
+  const docType: InvoiceDocumentType = document_type || 'invoice'
+  const requestedCurrency = currency || 'SEK'
+
+  // Fetch and validate company payment settings before customer data. The
+  // preview performs no writes, but a request that cannot be rendered should
+  // still stop before processing customer details.
+  const { data: company, error: companyError } = await supabase
+    .from('company_settings')
+    .select('*')
+    .eq('company_id', companyId)
+    .single()
+
+  if (companyError || !company) {
+    return NextResponse.json(
+      { error: 'Företagsinställningar saknas' },
+      { status: 404, headers: PRIVATE_NO_STORE_HEADERS },
+    )
+  }
+
+  if (!hasRequiredInvoicePaymentAccount(company as CompanySettings, {
+    currency: requestedCurrency,
+    document_type: docType,
+    credited_invoice_id: null,
+  })) {
+    return privateNoStore(errorResponseFromCode('INVOICE_SEND_PAYMENT_ACCOUNT_MISSING', log, {
+      requestId,
+      details: { currency: requestedCurrency },
+    }))
   }
 
   // When customer_id is omitted, only allow the synthetic preview if the
-  // company has no real customers — this is the settings-preview dead-end
+  // company has no real customers: this is the settings-preview dead-end
   // case. Derived server-side so a client can't bypass the ownership check
   // by passing a flag.
   const isMockCustomer = !customer_id
@@ -45,7 +98,10 @@ export async function POST(request: Request) {
       .eq('company_id', companyId)
 
     if (countError || (count ?? 0) > 0) {
-      return NextResponse.json({ error: 'Kunduppgifter krävs' }, { status: 400 })
+      return NextResponse.json(
+        { error: 'Kunduppgifter krävs' },
+        { status: 400, headers: PRIVATE_NO_STORE_HEADERS },
+      )
     }
 
     const nowIso = new Date().toISOString()
@@ -55,6 +111,7 @@ export async function POST(request: Request) {
       company_id: 'preview-company',
       name: 'Exempel AB',
       customer_type: 'swedish_business',
+      customer_number: null,
       email: 'kund@exempel.se',
       phone: null,
       address_line1: 'Storgatan 1',
@@ -82,35 +139,31 @@ export async function POST(request: Request) {
       .single()
 
     if (customerError || !data) {
-      return NextResponse.json({ error: 'Kunden hittades inte' }, { status: 404 })
+      return NextResponse.json(
+        { error: 'Kunden hittades inte' },
+        { status: 404, headers: PRIVATE_NO_STORE_HEADERS },
+      )
     }
     customer = data as Customer
   }
 
-  // Fetch company settings
-  const { data: company, error: companyError } = await supabase
-    .from('company_settings')
-    .select('*')
-    .eq('company_id', companyId)
-    .single()
-
-  if (companyError || !company) {
-    return NextResponse.json({ error: 'Företagsinställningar saknas' }, { status: 404 })
-  }
-
-  // VAT rules are customer-type-driven; the seller's registration status no
-  // longer constrains the preview. A non-momsregistrerad seller who chose a
-  // non-zero rate sees the rate they picked rendered — the form surfaces the
-  // ML 16 kap. 23 § warning at submit time.
+  // VAT rules are customer-type-driven and only know the customer side.
   const vatRules = getVatRules(customer.customer_type, customer.vat_number_validated)
 
-  const docType: InvoiceDocumentType = document_type || 'invoice'
   const isDeliveryNote = docType === 'delivery_note'
+
+  // VAT registration gate: mirror the server-side write gate
+  // (lib/invoices/build-invoice-write.ts) so the preview never shows output VAT
+  // for a non-momsregistrerad seller. Without this the per-item fallback below
+  // (`?? vatRules.rate`) would render 25% for a Swedish customer even though the
+  // created invoice books no VAT, misleading the user at the review step.
+  const notVatRegistered = (company as { vat_registered?: boolean }).vat_registered === false
+  const zeroVat = notVatRegistered && !isDeliveryNote
 
   // Build items with line totals and per-item VAT
   const invoiceItems: InvoiceItem[] = items.map((item: { description: string; quantity: number; unit: string; unit_price: number; vat_rate?: number }, index: number) => {
     const lineTotal = Math.round(item.quantity * item.unit_price * 100) / 100
-    const rate = item.vat_rate ?? vatRules.rate
+    const rate = zeroVat ? 0 : (item.vat_rate ?? vatRules.rate)
     return {
       id: `preview-${index}`,
       invoice_id: 'preview',
@@ -146,7 +199,7 @@ export async function POST(request: Request) {
     due_date: due_date || new Date().toISOString().split('T')[0],
     delivery_date: delivery_date || null,
     status: 'draft',
-    currency: currency || 'SEK',
+    currency: requestedCurrency,
     exchange_rate: null,
     exchange_rate_date: null,
     subtotal: isDeliveryNote ? 0 : subtotal,
@@ -161,6 +214,7 @@ export async function POST(request: Request) {
     your_reference: your_reference || null,
     our_reference: our_reference || null,
     notes: notes || null,
+    payment_link_url: previewPaymentLink,
     reverse_charge_text: vatRules.reverseChargeText || null,
     credited_invoice_id: null,
     document_type: docType,
@@ -172,29 +226,46 @@ export async function POST(request: Request) {
   } as Invoice
 
   try {
-    const { branding } = prepareInvoicePdfRender(company as CompanySettings)
+    const { branding, company: renderCompany } = await prepareInvoicePdfRender(
+      company as CompanySettings,
+      previewInvoice.currency,
+      { paymentAccountRequired: invoiceRequiresPaymentAccount(previewInvoice) },
+    )
+    const swishQrDataUrl = await buildSwishQrDataUrl(renderCompany, previewInvoice)
+    const paymentLinkQrDataUrl = await buildPaymentLinkQrDataUrl(previewInvoice)
     const pdfBuffer = await renderToBuffer(
       InvoicePDF({
         invoice: previewInvoice,
         customer,
         items: invoiceItems,
-        company: company as CompanySettings,
+        company: renderCompany,
         isPreview: true,
         branding,
+        swishQrDataUrl,
+        paymentLinkQrDataUrl,
       })
     )
+    const filename = invoicePdfFilename({
+      companyName: (company as CompanySettings).company_name,
+      customerName: customer.name,
+      invoiceNumber: previewInvoice.invoice_number,
+      invoiceId: previewInvoice.id,
+      invoiceDate: previewInvoice.invoice_date,
+      documentType: previewInvoice.document_type,
+    })
 
     return new Response(new Uint8Array(pdfBuffer), {
       headers: {
         'Content-Type': 'application/pdf',
-        'Content-Disposition': 'inline; filename="forhandsvisning.pdf"',
+        'Content-Disposition': contentDisposition('inline', filename),
+        'Cache-Control': 'private, no-store',
       },
     })
   } catch (error) {
-    console.error('Preview PDF generation error:', error)
+    log.error('invoice preview PDF generation failed', error, { requestId })
     return NextResponse.json(
       { error: 'Kunde inte generera PDF-förhandsgranskning' },
-      { status: 500 }
+      { status: 500, headers: PRIVATE_NO_STORE_HEADERS }
     )
   }
-}
+})

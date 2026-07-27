@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import {
   createMockRequest,
   parseJsonResponse,
@@ -38,6 +38,21 @@ vi.mock('@/lib/bookkeeping/supplier-invoice-entries', () => ({
   createSupplierInvoicePrivatelyPaidEntry: (...args: unknown[]) =>
     mockCreateSupplierInvoicePrivatelyPaidEntry(...args),
 }))
+
+const mockLinkToJournalEntry = vi.fn()
+vi.mock('@/lib/core/documents/document-service', () => ({
+  linkToJournalEntry: (...args: unknown[]) => mockLinkToJournalEntry(...args),
+}))
+
+// Riksbanken is the only external dependency of the new server-side rate
+// lookup. Spread the real module so anything else importing from it (e.g.
+// convertToSEK) keeps working.
+const mockFetchExchangeRate = vi.fn()
+vi.mock('@/lib/currency/riksbanken', async () => {
+  const actual =
+    await vi.importActual<typeof import('@/lib/currency/riksbanken')>('@/lib/currency/riksbanken')
+  return { ...actual, fetchExchangeRate: (...args: unknown[]) => mockFetchExchangeRate(...args) }
+})
 
 import { eventBus } from '@/lib/events'
 
@@ -100,6 +115,20 @@ describe('GET /api/supplier-invoices', () => {
     expect(status).toBe(200)
   })
 
+  it('applies supplier_id filter', async () => {
+    const invoices = [makeSupplierInvoice({ supplier_id: 'supplier-1' })]
+    enqueue({ data: invoices, error: null })
+
+    const request = createMockRequest('/api/supplier-invoices', {
+      searchParams: { status: 'all', supplier_id: 'supplier-1' },
+    })
+    const response = await GET(request)
+    const { status, body } = await parseJsonResponse<{ data: unknown[] }>(response)
+
+    expect(status).toBe(200)
+    expect(body.data).toEqual(invoices)
+  })
+
   it('returns 500 on database error', async () => {
     enqueue({ data: null, error: { message: 'DB error' } })
 
@@ -114,6 +143,7 @@ describe('GET /api/supplier-invoices', () => {
 
 const VALID_UUID = '550e8400-e29b-41d4-a716-446655440000'
 const VALID_UUID_2 = '550e8400-e29b-41d4-a716-446655440001'
+const DOCUMENT_UUID = '550e8400-e29b-41d4-a716-446655440002'
 
 describe('POST /api/supplier-invoices', () => {
   const mockUser = { id: 'user-1', email: 'test@test.se' }
@@ -137,6 +167,33 @@ describe('POST /api/supplier-invoices', () => {
 
     expect(status).toBe(401)
     expect(body).toEqual({ error: 'Unauthorized' })
+  })
+
+  it('returns 400 when vat_rate is percent-shaped (25 instead of 0.25, issue #310)', async () => {
+    const request = createMockRequest('/api/supplier-invoices', {
+      method: 'POST',
+      body: {
+        supplier_id: VALID_UUID,
+        supplier_invoice_number: 'LF-PERCENT',
+        invoice_date: '2024-06-01',
+        due_date: '2024-07-01',
+        items: [
+          // Percent-integer shape: used to be accepted and silently booked
+          // 2500 % VAT (line_total * 25).
+          { description: 'Material', quantity: 1, unit_price: 1000, account_number: '4010', vat_rate: 25 },
+        ],
+      },
+    })
+    const response = await POST(request)
+    const { status, body } = await parseJsonResponse<{
+      type: string
+      errors: Array<{ field: string; message: string }>
+    }>(response)
+
+    expect(status).toBe(400)
+    expect(body.type).toBe('validation_error')
+    expect(body.errors.some((e) => e.field === 'items.0.vat_rate')).toBe(true)
+    expect(mockCreateSupplierInvoiceRegistrationEntry).not.toHaveBeenCalled()
   })
 
   it('returns 404 when supplier not found', async () => {
@@ -205,6 +262,122 @@ describe('POST /api/supplier-invoices', () => {
     expect(body.data).toBeTruthy()
     expect(body.data.registration_journal_entry_id).toBe('je-1')
     expect(mockCreateSupplierInvoiceRegistrationEntry).toHaveBeenCalled()
+  })
+
+  it('registers WITHOUT booking when defer_invoice_booking is on (#967)', async () => {
+    const supplier = makeSupplier({ id: VALID_UUID })
+    const createdInvoice = makeSupplierInvoice({ id: 'si-deferred' })
+
+    // Fetch supplier
+    enqueue({ data: supplier, error: null })
+    // RPC get_next_arrival_number
+    enqueue({ data: 5 })
+    // Insert invoice
+    enqueue({ data: createdInvoice, error: null })
+    // Insert items
+    enqueue({ data: null, error: null })
+    // Fetch company settings: accrual + deferred booking
+    enqueue({ data: { accounting_method: 'accrual', defer_invoice_booking: true }, error: null })
+
+    const request = createMockRequest('/api/supplier-invoices', {
+      method: 'POST',
+      body: {
+        supplier_id: VALID_UUID,
+        supplier_invoice_number: 'LF-002',
+        invoice_date: '2024-06-01',
+        due_date: '2024-07-01',
+        items: [
+          {
+            description: 'Material',
+            quantity: 10,
+            unit_price: 800,
+            account_number: '4010',
+            vat_rate: 0.25,
+          },
+        ],
+      },
+    })
+    const response = await POST(request)
+    const { status, body } = await parseJsonResponse<{
+      data: { registration_journal_entry_id: string | null }
+    }>(response)
+
+    expect(status).toBe(200)
+    expect(body.data).toBeTruthy()
+    // No registration verifikat: booking is a separate explicit step.
+    expect(mockCreateSupplierInvoiceRegistrationEntry).not.toHaveBeenCalled()
+    expect(body.data.registration_journal_entry_id ?? null).toBeNull()
+  })
+
+  it('stores an uploaded document and links it to the registration entry', async () => {
+    const supplier = makeSupplier({ id: VALID_UUID })
+    const createdInvoice = makeSupplierInvoice({ id: 'si-with-document', document_id: DOCUMENT_UUID })
+
+    enqueue({ data: { id: DOCUMENT_UUID, journal_entry_id: null }, error: null })
+    enqueue({ data: null, error: null })
+    enqueue({ data: supplier, error: null })
+    enqueue({ data: 6 })
+    enqueue({ data: createdInvoice, error: null })
+    enqueue({ data: null, error: null })
+    enqueue({ data: { accounting_method: 'accrual' }, error: null })
+    mockCreateSupplierInvoiceRegistrationEntry.mockResolvedValue({ id: 'je-document' })
+    enqueue({ data: null, error: null })
+    mockLinkToJournalEntry.mockResolvedValue({ id: DOCUMENT_UUID })
+
+    const request = createMockRequest('/api/supplier-invoices', {
+      method: 'POST',
+      body: {
+        supplier_id: VALID_UUID,
+        document_id: DOCUMENT_UUID,
+        supplier_invoice_number: 'LF-DOCUMENT',
+        invoice_date: '2024-06-01',
+        due_date: '2024-07-01',
+        items: [
+          { description: 'Service', quantity: 1, unit_price: 1000, account_number: '6200' },
+        ],
+      },
+    })
+
+    const response = await POST(request)
+    const { status, body } = await parseJsonResponse<{
+      data: { document_id: string; registration_journal_entry_id: string }
+    }>(response)
+
+    expect(status).toBe(200)
+    expect(body.data.document_id).toBe(DOCUMENT_UUID)
+    expect(body.data.registration_journal_entry_id).toBe('je-document')
+    expect(mockLinkToJournalEntry).toHaveBeenCalledWith(
+      mockSupabase,
+      'company-1',
+      DOCUMENT_UUID,
+      'je-document',
+    )
+  })
+
+  it('rejects a document that is missing or outside the active company', async () => {
+    enqueue({ data: null, error: null })
+
+    const request = createMockRequest('/api/supplier-invoices', {
+      method: 'POST',
+      body: {
+        supplier_id: VALID_UUID,
+        document_id: DOCUMENT_UUID,
+        supplier_invoice_number: 'LF-INVALID-DOCUMENT',
+        invoice_date: '2024-06-01',
+        due_date: '2024-07-01',
+        items: [
+          { description: 'Service', quantity: 1, unit_price: 1000, account_number: '6200' },
+        ],
+      },
+    })
+
+    const response = await POST(request)
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(response)
+
+    expect(status).toBe(400)
+    expect(body.error.code).toBe('SI_CREATE_INVALID_INPUT')
+    expect(mockCreateSupplierInvoiceRegistrationEntry).not.toHaveBeenCalled()
+    expect(mockLinkToJournalEntry).not.toHaveBeenCalled()
   })
 
   it('emits supplier_invoice.registered event', async () => {
@@ -340,7 +513,7 @@ describe('POST /api/supplier-invoices', () => {
     expect(status).toBe(400)
     expect(body.error.code).toBe('SI_CREATE_NO_FISCAL_PERIOD')
     expect(mockCreateSupplierInvoiceRegistrationEntry).toHaveBeenCalled()
-    // The orphan must be rolled back — the delete is the 6th queued call.
+    // The orphan must be rolled back: the delete is the 6th queued call.
     expect(mockSupabase.from).toHaveBeenCalledWith('supplier_invoices')
   })
 
@@ -453,7 +626,7 @@ describe('POST /api/supplier-invoices', () => {
           'duplicate key value violates unique constraint "idx_supplier_invoices_company_supplier_number"',
       },
     })
-    // Lookup returns null — the row was deleted between the failing insert and our fetch
+    // Lookup returns null: the row was deleted between the failing insert and our fetch
     enqueue({ data: null, error: null })
 
     const request = createMockRequest('/api/supplier-invoices', {
@@ -739,5 +912,233 @@ describe('POST /api/supplier-invoices', () => {
     // Make sure we never touched the engine paths.
     expect(mockCreateSupplierInvoicePrivatelyPaidEntry).not.toHaveBeenCalled()
     expect(mockCreateSupplierInvoiceRegistrationEntry).not.toHaveBeenCalled()
+  })
+})
+
+// ── Exchange rate + SEK amounts ─────────────────────────────────────────────
+// The queued Supabase mock is a bare Proxy, so the only way to assert what was
+// actually written is to record the argument handed to `.insert()`. The route
+// echoes back the enqueued fixture row, not its own payload.
+
+type InsertRecord = { table: string; payload: Record<string, unknown> }
+
+function wrapCapturing(chain: unknown, table: string, sink: InsertRecord[]): unknown {
+  return new Proxy(
+    {},
+    {
+      get(_target, prop) {
+        const inner = (chain as Record<string | symbol, unknown>)[prop as string]
+        if (prop === 'then') return inner
+        return (...args: unknown[]) => {
+          if (
+            prop === 'insert' &&
+            args[0] &&
+            typeof args[0] === 'object' &&
+            !Array.isArray(args[0])
+          ) {
+            sink.push({ table, payload: args[0] as Record<string, unknown> })
+          }
+          return wrapCapturing((inner as (...a: unknown[]) => unknown)(...args), table, sink)
+        }
+      },
+    },
+  )
+}
+
+describe('POST /api/supplier-invoices: exchange rate + SEK amounts', () => {
+  const mockUser = { id: 'user-1', email: 'test@test.se' }
+  const captured: InsertRecord[] = []
+  let baseFrom: (...args: unknown[]) => unknown
+
+  const supplierInvoiceInsert = () =>
+    captured.find((c) => c.table === 'supplier_invoices')?.payload
+
+  function enqueueHappyPath() {
+    enqueue({ data: makeSupplier({ id: VALID_UUID }), error: null }) // supplier lookup
+    enqueue({ data: 7 }) // get_next_arrival_number
+    enqueue({ data: makeSupplierInvoice({ id: 'si-fx' }), error: null }) // insert invoice
+    enqueue({ data: [], error: null }) // insert items
+    enqueue({ data: { accounting_method: 'cash' }, error: null }) // company_settings
+  }
+
+  function body(overrides: Record<string, unknown> = {}) {
+    return {
+      supplier_id: VALID_UUID,
+      supplier_invoice_number: 'LF-FX',
+      invoice_date: '2024-06-01',
+      due_date: '2024-07-01',
+      items: [
+        { description: 'Molntjänst', amount: 10000, account_number: '6540', vat_rate: 0.25 },
+      ],
+      ...overrides,
+    }
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    reset()
+    eventBus.clear()
+    captured.length = 0
+    mockSupabase.auth.getUser.mockResolvedValue({ data: { user: mockUser } })
+    mockFetchExchangeRate.mockReset()
+    baseFrom = mockSupabase.from.getMockImplementation() as (...args: unknown[]) => unknown
+    mockSupabase.from.mockImplementation((table: string) =>
+      wrapCapturing(baseFrom(table), table, captured),
+    )
+  })
+
+  afterEach(() => {
+    mockSupabase.from.mockImplementation(baseFrom)
+  })
+
+  it('populates total_sek for an ordinary SEK invoice and never asks for a rate', async () => {
+    enqueueHappyPath()
+
+    const response = await POST(
+      createMockRequest('/api/supplier-invoices', { method: 'POST', body: body() }),
+    )
+    const { status } = await parseJsonResponse(response)
+
+    expect(status).toBe(200)
+    const payload = supplierInvoiceInsert()
+    expect(payload).toBeDefined()
+    // total_sek used to be NULL for every SEK invoice because the writer gated
+    // it on an exchange rate existing. A SEK invoice has none by definition.
+    expect(payload!.subtotal_sek).toBe(10000)
+    expect(payload!.vat_amount_sek).toBe(2500)
+    expect(payload!.total_sek).toBe(12500)
+    expect(payload!.total_sek).toBe(payload!.total)
+    expect(payload!.exchange_rate).toBeNull()
+    expect(payload!.exchange_rate_date).toBeNull()
+    expect(mockFetchExchangeRate).not.toHaveBeenCalled()
+  })
+
+  it('uses a caller-supplied rate for a foreign invoice without fetching', async () => {
+    enqueueHappyPath()
+
+    const response = await POST(
+      createMockRequest('/api/supplier-invoices', {
+        method: 'POST',
+        body: body({ currency: 'EUR', exchange_rate: 11.5 }),
+      }),
+    )
+    const { status } = await parseJsonResponse(response)
+
+    expect(status).toBe(200)
+    const payload = supplierInvoiceInsert()
+    expect(payload!.currency).toBe('EUR')
+    expect(payload!.exchange_rate).toBe(11.5)
+    expect(payload!.subtotal_sek).toBe(115000)
+    expect(payload!.vat_amount_sek).toBe(28750)
+    expect(payload!.total_sek).toBe(143750)
+    expect(mockFetchExchangeRate).not.toHaveBeenCalled()
+  })
+
+  it('fetches the invoice-date rate server-side when the caller omits one', async () => {
+    enqueueHappyPath()
+    mockFetchExchangeRate.mockResolvedValue({ currency: 'EUR', rate: 11.2, date: '2024-05-31' })
+
+    const response = await POST(
+      createMockRequest('/api/supplier-invoices', {
+        method: 'POST',
+        body: body({ currency: 'EUR' }),
+      }),
+    )
+    const { status } = await parseJsonResponse(response)
+
+    expect(status).toBe(200)
+    expect(mockFetchExchangeRate).toHaveBeenCalledTimes(1)
+    const [currencyArg, dateArg, clientArg] = mockFetchExchangeRate.mock.calls[0]
+    expect(currencyArg).toBe('EUR')
+    expect((dateArg as Date).toISOString().slice(0, 10)).toBe('2024-06-01')
+    // The supabase client must be passed through: that is what makes the
+    // shared exchange_rates cache a read-through cache instead of dead weight.
+    expect(clientArg).toBe(mockSupabase)
+
+    const payload = supplierInvoiceInsert()
+    expect(payload!.exchange_rate).toBe(11.2)
+    // Observation date, not the requested date: Riksbanken publishes no rate
+    // on weekends and the lookback picks the previous banking day.
+    expect(payload!.exchange_rate_date).toBe('2024-05-31')
+    expect(payload!.total_sek).toBe(140000)
+  })
+
+  it('refuses the create with SI_FX_RATE_MISSING when no rate can be resolved', async () => {
+    enqueue({ data: makeSupplier({ id: VALID_UUID }), error: null })
+    mockFetchExchangeRate.mockResolvedValue(null)
+
+    const response = await POST(
+      createMockRequest('/api/supplier-invoices', {
+        method: 'POST',
+        body: body({ currency: 'USD' }),
+      }),
+    )
+    const { status, body: responseBody } = await parseJsonResponse<{
+      error: { code: string; details?: { currency?: string; invoice_date?: string } }
+    }>(response)
+
+    expect(status).toBe(400)
+    expect(responseBody.error.code).toBe('SI_FX_RATE_MISSING')
+    expect(responseBody.error.details?.currency).toBe('USD')
+    // Nothing may be persisted, no ankomstnummer burned, no verifikat posted:
+    // an unconverted row would only fail again inside the booking path.
+    expect(supplierInvoiceInsert()).toBeUndefined()
+    expect(mockSupabase.rpc).not.toHaveBeenCalled()
+    expect(mockCreateSupplierInvoiceRegistrationEntry).not.toHaveBeenCalled()
+  })
+
+  // supplier_invoices_exchange_rate_check is `> 0 AND < 100000`. The schema
+  // used to have no ceiling, so 250000 sailed past validation, reached the
+  // constraint and came back to the user as an unexplained 500.
+  it('rejects an out-of-range exchange rate as a 400, not a constraint-violation 500', async () => {
+    const response = await POST(
+      createMockRequest('/api/supplier-invoices', {
+        method: 'POST',
+        body: body({ currency: 'EUR', exchange_rate: 250000 }),
+      }),
+    )
+    const { status, body: responseBody } = await parseJsonResponse<{
+      error: string
+      type: string
+      errors: Array<{ field: string; message: string }>
+    }>(response)
+
+    expect(status).toBe(400)
+    expect(responseBody.type).toBe('validation_error')
+    const issue = responseBody.errors.find((e) => e.field === 'exchange_rate')
+    // Actionable, and Swedish: getErrorMessage passes a 'Valideringsfel:'
+    // summary through verbatim, so this is what the user actually reads.
+    expect(issue?.message).toContain('100 000')
+    expect(responseBody.error).toContain('Valideringsfel')
+    expect(supplierInvoiceInsert()).toBeUndefined()
+    expect(mockCreateSupplierInvoiceRegistrationEntry).not.toHaveBeenCalled()
+  })
+
+  it('rejects exactly 100000: the CHECK bound is exclusive, so the mirror is too', async () => {
+    const response = await POST(
+      createMockRequest('/api/supplier-invoices', {
+        method: 'POST',
+        body: body({ currency: 'EUR', exchange_rate: 100000 }),
+      }),
+    )
+    const { status } = await parseJsonResponse(response)
+
+    expect(status).toBe(400)
+    expect(supplierInvoiceInsert()).toBeUndefined()
+  })
+
+  it('accepts 99999.99, the largest rate the CHECK allows', async () => {
+    enqueueHappyPath()
+
+    const response = await POST(
+      createMockRequest('/api/supplier-invoices', {
+        method: 'POST',
+        body: body({ currency: 'EUR', exchange_rate: 99999.99 }),
+      }),
+    )
+    const { status } = await parseJsonResponse(response)
+
+    expect(status).toBe(200)
+    expect(supplierInvoiceInsert()!.exchange_rate).toBe(99999.99)
   })
 })

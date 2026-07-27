@@ -5,7 +5,9 @@
  * provider into the exact shapes Accounted expects for database insertion.
  */
 
-import type { CustomerType, SupplierType, VatTreatment } from '@/types'
+import type { SupabaseClient } from '@supabase/supabase-js'
+import { fetchExchangeRate } from '@/lib/currency/riksbanken'
+import type { Currency, CustomerType, ExchangeRate, SupplierType, VatTreatment } from '@/types'
 import type {
   CustomerDto,
   SupplierDto,
@@ -68,6 +70,21 @@ function looksLikeSwedishOrgNumber(orgNumber: string | null | undefined): boolea
 }
 
 /**
+ * Check if a string looks like a Swedish identity number: an organisation
+ * number or personnummer in 10-digit form, or a personnummer in the 12-digit
+ * century-prefixed form (19xx / 20xx). Used to avoid misclassifying a domestic
+ * party as foreign just because its number isn't exactly 10 digits: a 12-digit
+ * personnummer like 19700616-7113 is Swedish, not an unknown foreign org number.
+ */
+function looksLikeSwedishIdNumber(orgNumber: string | null | undefined): boolean {
+  if (!orgNumber) return false
+  const digits = orgNumber.replace(/[-+\s]/g, '')
+  if (!/^\d+$/.test(digits)) return false
+  if (digits.length === 10) return true
+  return digits.length === 12 && /^(19|20)/.test(digits)
+}
+
+/**
  * Company name suffixes that indicate a foreign (non-Swedish) entity.
  * These override the default swedish_business assumption when no other
  * signals (VAT, country code, org number) are available.
@@ -98,7 +115,7 @@ const FOREIGN_SUFFIXES: { suffix: string; region: 'eu' | 'non_eu' }[] = [
   // Danish/Norwegian
   { suffix: 'a/s', region: 'eu' },
   { suffix: 'aps', region: 'eu' },
-  // Anglo (could be UK, US, etc. — treat as non-EU since UK left)
+  // Anglo (could be UK, US, etc.: treat as non-EU since UK left)
   { suffix: 'ltd', region: 'non_eu' },
   { suffix: 'limited', region: 'non_eu' },
   { suffix: 'llc', region: 'non_eu' },
@@ -148,11 +165,13 @@ function inferTypeFromVatOrCountry(
   // 3. Swedish-format org number is strong evidence of domestic entity
   if (looksLikeSwedishOrgNumber(orgNumber)) return 'swedish_business'
 
-  // 4. Non-Swedish org number format (wrong digit count) → not Swedish
+  // 4. A number that isn't a Swedish-format identity number → foreign entity.
+  //    Accepts both 10-digit and 12-digit (century-prefixed) Swedish numbers so
+  //    a domestic personnummer like 19700616-7113 isn't treated as foreign.
   if (orgNumber) {
-    const digits = orgNumber.replace(/[-\s]/g, '')
-    if (digits.length > 0 && digits.length !== 10) {
-      // Not a Swedish org number — use name heuristic or default to non_eu
+    const digits = orgNumber.replace(/[-+\s]/g, '')
+    if (digits.length > 0 && !looksLikeSwedishIdNumber(orgNumber)) {
+      // Not a Swedish number: use name heuristic or default to non_eu
       const nameRegion = inferRegionFromName(companyName)
       if (nameRegion === 'eu') return 'eu_business'
       return 'non_eu_business'
@@ -164,7 +183,7 @@ function inferTypeFromVatOrCountry(
   if (nameRegion === 'eu') return 'eu_business'
   if (nameRegion === 'non_eu') return 'non_eu_business'
 
-  // 6. No signal at all — default to swedish_business (most common in Swedish systems)
+  // 6. No signal at all: default to swedish_business (most common in Swedish systems)
   return 'swedish_business'
 }
 
@@ -217,19 +236,209 @@ function inferVatRate(taxPercent?: number): number {
   return 25 // Default to standard rate
 }
 
+// ── Currency conversion ─────────────────────────────────────────────
+//
+// The provider DTOs (lib/providers/dto.ts) carry NO exchange rate and NO SEK
+// amount: an invoice exposes only `currencyCode` plus amounts already expressed
+// in that currency. So for a foreign-currency document the SEK value has to be
+// established here, at import, from the rate that was valid on the document's
+// OWN date. An imported invoice is räkenskapsinformation (BFL 7 kap): its SEK
+// value is part of the record, and stamping it with today's rate, or with a
+// fabricated 1:1, would misstate it.
+//
+// Same pattern as lib/transactions/ingest.ts: pre-resolve the unique
+// (currency, date) pairs once through fetchExchangeRate WITH the supabase
+// client (so the shared `exchange_rates` cache absorbs repeat dates) and WITH
+// the document date, then map synchronously against that index.
+
+/**
+ * Currencies Riksbanken publishes a series for (SERIES_IDS in
+ * lib/currency/riksbanken.ts). A document in any other currency has no rate
+ * source at all, so it is reported rather than written with a silent null.
+ */
+const CONVERTIBLE_CURRENCIES: readonly Currency[] = ['SEK', 'EUR', 'USD', 'GBP', 'NOK', 'DKK']
+
+/** Riksbanken fan-out bound, mirroring ingest.ts: a wide historical backfill
+ *  used to fire every pair at once and get the whole batch rate-limited. */
+const FX_FETCH_CONCURRENCY = 4
+
+function asConvertibleCurrency(code: string | undefined | null): Currency | null {
+  if (!code) return null
+  const upper = code.toUpperCase() as Currency
+  return CONVERTIBLE_CURRENCIES.includes(upper) ? upper : null
+}
+
+/** Normalize a DTO date to a plain ISO day, or null when it isn't one. */
+function isoDay(value: string | undefined | null): string | null {
+  if (!value || !/^\d{4}-\d{2}-\d{2}/.test(value)) return null
+  return value.slice(0, 10)
+}
+
+/** Pre-resolved rates, keyed by `${CURRENCY}|${YYYY-MM-DD}`. */
+export type FxRateIndex = Map<string, ExchangeRate>
+
+export function fxRateKey(currencyCode: string, isoDate: string): string {
+  return `${currencyCode.toUpperCase()}|${isoDate}`
+}
+
+/** Why a foreign-currency document could not be converted to SEK. */
+export type FxUnresolvedReason =
+  /** Currency outside Riksbanken's published series: no rate source exists. */
+  | 'unsupported_currency'
+  /** Rate source exists but no observation could be obtained for that date. */
+  | 'rate_unavailable'
+
+export interface FxUnresolved {
+  currency: string
+  /** The document's own date, i.e. the date a rate was needed for. */
+  date: string
+  reason: FxUnresolvedReason
+}
+
+interface FxResolution {
+  /** null for SEK documents (no rate applies) and for unconvertible ones. */
+  rate: number | null
+  /** Riksbanken observation date behind `rate`; null when there is no rate. */
+  rateDate: string | null
+  /** Factor to reach SEK: 1 for SEK documents, `rate` otherwise, null when
+   *  the conversion could not be established at all. */
+  sekFactor: number | null
+  /** Set ONLY when a foreign document could not be converted. */
+  unresolved: FxUnresolved | null
+}
+
+/**
+ * Fetch the rate valid on each document's own date, once per unique
+ * (currency, date) pair. SEK documents need no rate and are skipped.
+ *
+ * A pair that cannot be fetched is simply absent from the index; the mapper
+ * then reports that document as unresolved rather than inventing a number.
+ */
+export async function buildFxRateIndex(
+  supabase: SupabaseClient,
+  documents: { currencyCode?: string; issueDate?: string }[],
+): Promise<FxRateIndex> {
+  const index: FxRateIndex = new Map()
+
+  const pairs = new Map<string, { currency: Currency; date: string }>()
+  for (const doc of documents) {
+    const currency = asConvertibleCurrency(doc.currencyCode)
+    if (!currency || currency === 'SEK') continue
+    const date = isoDay(doc.issueDate)
+    if (!date) continue
+    const key = fxRateKey(currency, date)
+    if (!pairs.has(key)) pairs.set(key, { currency, date })
+  }
+  if (pairs.size === 0) return index
+
+  const entries = [...pairs.entries()]
+  for (let i = 0; i < entries.length; i += FX_FETCH_CONCURRENCY) {
+    const slice = entries.slice(i, i + FX_FETCH_CONCURRENCY)
+    const settled = await Promise.allSettled(
+      slice.map(([, { currency, date }]) => fetchExchangeRate(currency, new Date(date), supabase)),
+    )
+    for (let j = 0; j < slice.length; j++) {
+      const outcome = settled[j]
+      if (outcome.status === 'fulfilled' && outcome.value && outcome.value.rate > 0) {
+        index.set(slice[j][0], outcome.value)
+      }
+      // A miss deliberately leaves the key unset: never a made-up rate.
+    }
+  }
+
+  return index
+}
+
+/**
+ * Resolve the SEK conversion for one document.
+ *
+ * `rates` is optional so existing callers keep compiling; when it is omitted a
+ * foreign document resolves to `rate_unavailable` (reported), never to a
+ * silent 1:1. Only an actually-fetched positive rate produces a conversion.
+ */
+function resolveFx(
+  currencyCode: string | undefined,
+  issueDate: string | undefined,
+  rates?: FxRateIndex,
+): FxResolution {
+  const code = (currencyCode || 'SEK').toUpperCase()
+
+  if (code === 'SEK') {
+    // Domestic document: the ledger currency IS SEK, so there is no exchange
+    // rate to record. A plain null, not a conversion we failed to make. The
+    // SEK amount columns still get filled, via sekFactor 1.
+    return { rate: null, rateDate: null, sekFactor: 1, unresolved: null }
+  }
+
+  const currency = asConvertibleCurrency(code)
+  if (!currency) {
+    return {
+      rate: null, rateDate: null, sekFactor: null,
+      unresolved: { currency: code, date: isoDay(issueDate) ?? '', reason: 'unsupported_currency' },
+    }
+  }
+
+  const date = isoDay(issueDate)
+  if (!date) {
+    return {
+      rate: null, rateDate: null, sekFactor: null,
+      unresolved: { currency: code, date: issueDate ?? '', reason: 'rate_unavailable' },
+    }
+  }
+
+  const hit = rates?.get(fxRateKey(currency, date))
+  if (!hit || !(hit.rate > 0)) {
+    return {
+      rate: null, rateDate: null, sekFactor: null,
+      unresolved: { currency: code, date, reason: 'rate_unavailable' },
+    }
+  }
+
+  return { rate: hit.rate, rateDate: hit.date, sekFactor: hit.rate, unresolved: null }
+}
+
+/** Convert to SEK, or null when no conversion could be established. */
+function toSek(amount: number, sekFactor: number | null): number | null {
+  return sekFactor === null ? null : round2(amount * sekFactor)
+}
+
+/**
+ * A mapped invoice plus the FX verdict for it. `fxUnresolved` is non-null only
+ * for a FOREIGN document whose SEK value could not be established: the caller
+ * must surface those as needing attention instead of letting them pass as
+ * ordinary imports. They are still imported (dropping them would lose
+ * räkenskapsinformation) but carry exchange_rate = null, so every booking path
+ * refuses them loudly (SupplierInvoiceFxRateMissingError /
+ * InvoiceBookingRateMissingError) rather than posting at a fabricated 1:1.
+ */
+export interface MappedInvoice {
+  invoice: Record<string, unknown>
+  items: Record<string, unknown>[]
+  fxUnresolved: FxUnresolved | null
+}
+
 // ── Public mappers ──────────────────────────────────────────────────
 
 export function mapCustomer(dto: CustomerDto, userId: string, companyId: string): Record<string, unknown> {
   const addr = formatAddress(dto.party.postalAddress)
+  const customerType = inferCustomerType(dto)
+  const number = getOrgNumber(dto.party)
+  // The provider exposes a single identity-number field, but Accounted stores a
+  // personnummer in `personal_number` (individuals) and an org number in
+  // `org_number` (businesses). Route it to the column the type expects: else a
+  // Privatperson's personnummer lands in org_number and is hidden by the
+  // individual customer form, which renders personal_number for individuals.
+  const isIndividual = customerType === 'individual'
   return {
     user_id: userId,
     company_id: companyId,
     name: dto.party.name,
-    customer_type: inferCustomerType(dto),
+    customer_type: customerType,
     email: dto.party.contact?.email || null,
     phone: dto.party.contact?.telephone || null,
     ...addr,
-    org_number: getOrgNumber(dto.party),
+    org_number: isIndividual ? null : number,
+    personal_number: isIndividual ? number : null,
     vat_number: dto.vatNumber || null,
     vat_number_validated: false,
     default_payment_terms: dto.defaultPaymentTermsDays || 30,
@@ -252,6 +461,9 @@ export function mapSupplier(dto: SupplierDto, userId: string, companyId: string)
     bankgiro: dto.bankGiro || null,
     plusgiro: dto.plusGiro || null,
     bank_account: dto.bankAccount || null,
+    // SupplierDto carries bankAccount/bankGiro/plusGiro only: it has no IBAN,
+    // BIC or default expense account, so these are honest nulls, not dropped
+    // data. The user fills them in when a foreign payment first needs them.
     iban: null,
     bic: null,
     default_expense_account: null,
@@ -265,8 +477,9 @@ export function mapSalesInvoice(
   dto: SalesInvoiceDto,
   userId: string,
   companyId: string,
-  customerId: string
-): { invoice: Record<string, unknown>; items: Record<string, unknown>[] } {
+  customerId: string,
+  fxRates?: FxRateIndex
+): MappedInvoice {
   const subtotal = round2(dto.legalMonetaryTotal.lineExtensionAmount.value)
   const total = round2(dto.legalMonetaryTotal.payableAmount.value)
   const vatAmount = round2(dto.taxTotal?.taxAmount.value ?? (total - subtotal))
@@ -279,7 +492,7 @@ export function mapSalesInvoice(
   const statusMap: Record<string, string> = {
     draft: 'draft',
     sent: 'sent',
-    booked: 'sent', // Accounted has no 'booked' status — treat as sent
+    booked: 'sent', // Accounted has no 'booked' status: treat as sent
     paid: 'paid',
     overdue: 'overdue',
     cancelled: 'cancelled',
@@ -287,6 +500,9 @@ export function mapSalesInvoice(
   }
 
   const isCreditNote = dto.invoiceTypeCode === '381'
+
+  // SEK value of a foreign invoice, at the rate valid on its own issue date.
+  const fx = resolveFx(dto.currencyCode, dto.issueDate, fxRates)
 
   const invoice: Record<string, unknown> = {
     user_id: userId,
@@ -297,13 +513,16 @@ export function mapSalesInvoice(
     due_date: dto.dueDate || dto.issueDate,
     status: statusMap[dto.status] || 'sent',
     currency: dto.currencyCode || 'SEK',
-    exchange_rate: dto.currencyCode === 'SEK' ? null : null,
+    // null for a SEK invoice (no rate applies) and for a foreign invoice whose
+    // rate could not be established: that case is reported via fxUnresolved.
+    exchange_rate: fx.rate,
+    exchange_rate_date: fx.rateDate,
     subtotal,
-    subtotal_sek: dto.currencyCode === 'SEK' ? subtotal : null,
+    subtotal_sek: toSek(subtotal, fx.sekFactor),
     vat_amount: vatAmount,
-    vat_amount_sek: dto.currencyCode === 'SEK' ? vatAmount : null,
+    vat_amount_sek: toSek(vatAmount, fx.sekFactor),
     total,
-    total_sek: dto.currencyCode === 'SEK' ? total : null,
+    total_sek: toSek(total, fx.sekFactor),
     vat_treatment: vatTreatment,
     vat_rate: inferVatRate(primaryTaxPercent),
     your_reference: null,
@@ -316,7 +535,7 @@ export function mapSalesInvoice(
 
   const items = dto.lines.map((line, idx) => mapSalesInvoiceLine(line, idx))
 
-  return { invoice, items }
+  return { invoice, items, fxUnresolved: fx.unresolved }
 }
 
 function mapSalesInvoiceLine(line: SalesInvoiceLineDto, index: number): Record<string, unknown> {
@@ -336,8 +555,9 @@ export function mapSupplierInvoice(
   dto: SupplierInvoiceDto,
   userId: string,
   companyId: string,
-  supplierId: string
-): { invoice: Record<string, unknown>; items: Record<string, unknown>[] } {
+  supplierId: string,
+  fxRates?: FxRateIndex
+): MappedInvoice {
   const subtotal = round2(dto.legalMonetaryTotal.lineExtensionAmount.value)
   const total = round2(dto.legalMonetaryTotal.payableAmount.value)
   const vatAmount = round2(dto.taxTotal?.taxAmount.value ?? (total - subtotal))
@@ -373,7 +593,7 @@ export function mapSupplierInvoice(
   let resolvedStatus: string
   if (isCreditNote) {
     // A kreditfaktura is never an open or "paid" payable. Force a credit-note
-    // terminal status regardless of the provider's lifecycle status — the
+    // terminal status regardless of the provider's lifecycle status: the
     // arcim gateway is the only source of invoiceTypeCode and is NOT guaranteed
     // to also send status='credited', so trusting dto.status here could persist
     // a credit note as 'registered'/'paid' (contradicting its amounts).
@@ -389,6 +609,9 @@ export function mapSupplierInvoice(
     resolvedStatus = mappedStatus
   }
 
+  // SEK value of a foreign invoice, at the rate valid on its own issue date.
+  const fx = resolveFx(dto.currencyCode, dto.issueDate, fxRates)
+
   const invoice: Record<string, unknown> = {
     user_id: userId,
     company_id: companyId,
@@ -400,13 +623,16 @@ export function mapSupplierInvoice(
     delivery_date: dto.deliveryDate || null,
     status: resolvedStatus,
     currency: dto.currencyCode || 'SEK',
-    exchange_rate: dto.currencyCode === 'SEK' ? null : null,
+    // null for a SEK invoice (no rate applies) and for a foreign invoice whose
+    // rate could not be established: that case is reported via fxUnresolved.
+    exchange_rate: fx.rate,
+    exchange_rate_date: fx.rateDate,
     subtotal,
-    subtotal_sek: dto.currencyCode === 'SEK' ? subtotal : null,
+    subtotal_sek: toSek(subtotal, fx.sekFactor),
     vat_amount: vatAmount,
-    vat_amount_sek: dto.currencyCode === 'SEK' ? vatAmount : null,
+    vat_amount_sek: toSek(vatAmount, fx.sekFactor),
     total,
-    total_sek: dto.currencyCode === 'SEK' ? total : null,
+    total_sek: toSek(total, fx.sekFactor),
     vat_treatment: vatTreatment,
     reverse_charge: vatTreatment === 'reverse_charge',
     payment_reference: dto.ocrNumber || null,
@@ -421,7 +647,7 @@ export function mapSupplierInvoice(
 
   const items = dto.lines.map((line, idx) => mapSupplierInvoiceLine(line, idx))
 
-  return { invoice, items }
+  return { invoice, items, fxUnresolved: fx.unresolved }
 }
 
 function mapSupplierInvoiceLine(line: SupplierInvoiceLineDto, index: number): Record<string, unknown> {

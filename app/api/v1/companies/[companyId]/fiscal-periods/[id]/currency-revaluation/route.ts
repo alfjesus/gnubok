@@ -1,7 +1,7 @@
 /**
  * POST /api/v1/companies/{companyId}/fiscal-periods/{id}/currency-revaluation
  *
- * Runs FX revaluation for the period — re-rates open foreign-currency AR
+ * Runs FX revaluation for the period: re-rates open foreign-currency AR
  * (1510) + AP (2440) at the closing date's rate and posts the delta to
  * 3960 / 7960. Wraps lib/bookkeeping/currency-revaluation.executeCurrencyRevaluation.
  * Records an operation row and returns 202 + operation_id.
@@ -12,12 +12,13 @@
 
 import { z } from 'zod'
 import { accepted } from '@/lib/api/v1/response'
-import { registerEndpoint } from '@/lib/api/v1/registry'
+import { registerEndpoint, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
 import { v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
 import { ownsFiscalPeriod } from '@/lib/api/v1/owns-fiscal-period'
 import { startOperation, completeOperation, failOperation } from '@/lib/api/v1/operations'
 import { executeCurrencyRevaluation } from '@/lib/bookkeeping/currency-revaluation'
+import { getErrorMessage } from '@/lib/errors/get-error-message'
 
 const Body = z
   .object({ as_of_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional() })
@@ -44,7 +45,7 @@ registerEndpoint({
     'Re-running on the same period (CURRENCY_REVALUATION_ALREADY_EXISTS). Revaluing a closed period (the trigger blocks JE writes to closed periods).',
   pitfalls: [
     'Idempotency-Key is mandatory.',
-    'Engine returns null if no open foreign-currency items exist — the operation succeeds with result.revaluation_entry_id=null.',
+    'Engine returns null if no open foreign-currency items exist: the operation succeeds with result.revaluation_entry_id=null.',
     'as_of_date defaults to period_end if omitted.',
   ],
   example: {
@@ -59,7 +60,7 @@ registerEndpoint({
   reversible: true,
   dryRunSupported: false,
   request: { body: Body },
-  response: { success: RevaluationAccepted },
+  response: { success: dataEnvelope(RevaluationAccepted) },
 })
 
 export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string }> }>(
@@ -97,7 +98,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       bodyAsOfDate = parsed.data.as_of_date
     }
 
-    // Ownership pre-check on the URL period — UNCONDITIONAL. Round-3
+    // Ownership pre-check on the URL period: UNCONDITIONAL. Round-3
     // missed this when as_of_date was supplied in the body (the
     // ownership-by-side-effect via period_end lookup was conditional).
     if (!(await ownsFiscalPeriod(ctx.supabase, ctx.companyId!, fiscalPeriodId))) {
@@ -106,7 +107,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       })
     }
 
-    // Resolve as_of_date — default to period_end. Ownership is already
+    // Resolve as_of_date: default to period_end. Ownership is already
     // confirmed above, so this is a pure read.
     let asOfDate = bodyAsOfDate
     if (!asOfDate) {
@@ -177,7 +178,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
           id: operationId,
           error: {
             code: msg.includes('already exists') ? 'CURRENCY_REVALUATION_ALREADY_EXISTS' : 'CURRENCY_REVALUATION_FAILED',
-            message: msg,
+            message: getErrorMessage(err, { locale: 'en' }),
           },
         },
         ctx.log,

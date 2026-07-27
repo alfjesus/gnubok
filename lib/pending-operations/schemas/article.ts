@@ -1,13 +1,14 @@
 import { z } from 'zod'
+import { INVOICE_POSTING_ACCOUNT_REGEX } from '@/lib/invoices/posting-account'
 
 // Commit-boundary re-validation for staged article operations. A staged
 // pending_operations row is re-parsed here before it touches the articles table
 // so a tampered row cannot inject unexpected fields or malformed data
-// (defense in depth, ASVS V4.5) — mirrors lib/pending-operations/schemas/create-supplier.ts.
+// (defense in depth, ASVS V4.5): mirrors lib/pending-operations/schemas/create-supplier.ts.
 
-const revenueAccount = z
+const invoicePostingAccount = z
   .string()
-  .regex(/^3\d{3}$/, 'Revenue account must be a 4-digit BAS class-3 account (3xxx)')
+  .regex(INVOICE_POSTING_ACCOUNT_REGEX, 'Posting account must be a 4-digit BAS class 1-3 account')
 
 const vatRatePercent = z.union([z.literal(0), z.literal(6), z.literal(12), z.literal(25)])
 
@@ -20,13 +21,22 @@ const trimmedName = z.preprocess(
   z.string().min(1, 'Article name is required').max(200),
 )
 
+// ISO 4217 shape, normalized to upper case; the currencies-table FK on
+// articles.currency is the authoritative allow-list (unknown codes fail at
+// commit with a clear message). Empty string / null → undefined.
+const currencyCode = z.preprocess(
+  (v) => (v == null || v === '' ? undefined : typeof v === 'string' ? v.trim().toUpperCase() : v),
+  z.string().regex(/^[A-Z]{3}$/, 'Currency must be a 3-letter ISO 4217 code (e.g. EUR)').optional(),
+)
+
 export const CreateArticleParamsSchema = z.object({
   name: trimmedName,
   type: z.enum(['vara', 'tjanst']).default('tjanst'),
   unit: optString(32),
   price_excl_vat: z.number().nonnegative(),
+  currency: currencyCode,
   vat_rate: vatRatePercent.default(25),
-  revenue_account: revenueAccount.nullable().optional(),
+  revenue_account: invoicePostingAccount.nullable().optional(),
   cost_price: z.number().nonnegative().nullable().optional(),
   ean: optString(32),
   housework_type: optString(64),
@@ -41,8 +51,9 @@ export const UpdateArticleParamsSchema = z.object({
   type: z.enum(['vara', 'tjanst']).optional(),
   unit: optString(32),
   price_excl_vat: z.number().nonnegative().optional(),
+  currency: currencyCode,
   vat_rate: vatRatePercent.optional(),
-  revenue_account: revenueAccount.nullable().optional(),
+  revenue_account: invoicePostingAccount.nullable().optional(),
   cost_price: z.number().nonnegative().nullable().optional(),
   ean: optString(32),
   housework_type: optString(64),

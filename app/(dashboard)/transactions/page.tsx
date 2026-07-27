@@ -1,69 +1,126 @@
 'use client'
 
-import { useState, useEffect, useMemo, useRef } from 'react'
-import { AnimatePresence } from 'framer-motion'
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
+import type { SupabaseClient } from '@supabase/supabase-js'
+import dynamic from 'next/dynamic'
+import Link from 'next/link'
 import { useSearchParams } from 'next/navigation'
 import { useTranslations } from 'next-intl'
-import { createClient } from '@/lib/supabase/client'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { useToast } from '@/components/ui/use-toast'
 import { ToastAction } from '@/components/ui/toast'
 import { DestructiveConfirmDialog, useDestructiveConfirm } from '@/components/ui/destructive-confirm-dialog'
-import { DataList, DataListHeader, DataListEmpty } from '@/components/ui/data-list'
+import { DataList, DataListEmpty } from '@/components/ui/data-list'
 import { Input } from '@/components/ui/input'
-import {
-  DropdownMenu,
-  DropdownMenuTrigger,
-  DropdownMenuContent,
-  DropdownMenuRadioGroup,
-  DropdownMenuRadioItem,
-} from '@/components/ui/dropdown-menu'
-import { ChevronDown, Layers, Search, Trash2, X } from 'lucide-react'
-import TransactionForm from '@/components/transactions/TransactionForm'
-import BatchCategorySelector from '@/components/transactions/BatchCategorySelector'
+import { Skeleton } from '@/components/ui/skeleton'
+import { TH_CLASS, QUIET_LINK_CLASS } from '@/components/ui/dry-table'
+import { Loader2, Search } from 'lucide-react'
 import TransactionStatusBar from '@/components/transactions/TransactionStatusBar'
 import BankSyncStatusChip from '@/components/transactions/BankSyncStatusChip'
+import { ContextPicker, type ContextPickerItem } from '@/components/common/ContextPicker'
+import { AttnLine } from '@/components/ui/attn-line'
 import BankSyncNowButton from '@/components/transactions/BankSyncNowButton'
-import BankSyncSinceLastVisit from '@/components/transactions/BankSyncSinceLastVisit'
 import TransactionInboxCard from '@/components/transactions/TransactionInboxCard'
 import TransactionHistoryList from '@/components/transactions/TransactionHistoryList'
 import InboxZeroState from '@/components/transactions/InboxZeroState'
 import SkattekontoInboxCard from '@/components/transactions/SkattekontoInboxCard'
-import { SkattekontoMatchDialog } from '@/components/skattekonto/SkattekontoMatchDialog'
-import InvoiceMatchDialog from '@/components/transactions/InvoiceMatchDialog'
-import { MatchVoucherDialog } from '@/components/transactions/MatchVoucherDialog'
-import InvoicePicker from '@/components/transactions/InvoicePicker'
-import SupplierInvoicePicker from '@/components/transactions/SupplierInvoicePicker'
-import MatchAllocationDialog from '@/components/transactions/MatchAllocationDialog'
-import BulkBookDialog from '@/components/transactions/BulkBookDialog'
-import TransactionBookingDialog from '@/components/transactions/TransactionBookingDialog'
-import TransactionAttachDocumentDialog from '@/components/transactions/TransactionAttachDocumentDialog'
-import QuickReviewDialog from '@/components/transactions/QuickReviewDialog'
-import EditTransactionTitleDialog from '@/components/transactions/EditTransactionTitleDialog'
+import type { BookedDuplicateCandidate } from '@/lib/transactions/booking-duplicate-detection'
 
-import TemplatePicker from '@/components/transactions/TemplatePicker'
+import { DialogLoadingSkeleton } from '@/components/ui/dialog-loading-skeleton'
 import { getDefaultAccountForCategory, getDefaultVatTreatmentForCategory } from '@/lib/bookkeeping/category-mapping'
 import { getTemplateById, type BookingTemplate } from '@/lib/bookkeeping/booking-templates'
 import { isCounterpartyTemplateId, extractCounterpartyId } from '@/lib/bookkeeping/counterparty-templates'
 import { isLibraryTemplateId } from '@/lib/bookkeeping/template-library'
-import type { TransactionWithInvoice, ViewMode, CategorizeHandler } from '@/components/transactions/transaction-types'
+import type {
+  TransactionWithInvoice,
+  ViewMode,
+  CategorizeHandler,
+} from '@/components/transactions/transaction-types'
 import type {
   SkattekontoTransactionWithSuggestion,
   StoredSkattekontoTransaction,
 } from '@/types/skatteverket'
 import { findBankSkvCounterparts } from '@/lib/skatteverket/bank-counterpart'
 import { useCompany } from '@/contexts/CompanyContext'
+import { useRealtimeSupabase } from '@/lib/hooks/use-realtime-supabase'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
-import { formatCurrency, formatDate } from '@/lib/utils'
-import type { TransactionCategory, CreateTransactionInput, Invoice, Customer, SupplierInvoice, Supplier, VatTreatment, EntityType, LinePatternEntry, BookingTemplateLibrary } from '@/types'
+import { cn, formatCurrency, formatDate } from '@/lib/utils'
+import type { TransactionCategory, CreateTransactionInput, Invoice, Customer, SupplierInvoice, Supplier, VatTreatment, EntityType, LinePatternEntry, BookingTemplateLibrary, CashAccount } from '@/types'
 import type { SuggestedTemplate } from '@/lib/transactions/category-suggestions'
 import { isImportedTransaction } from '@/lib/transactions/origin'
 import { computeJeUnderlagStatus, type JeUnderlagStatus } from '@/lib/transactions/underlag-status'
 
+function InlineDialogContentLoading() {
+  return (
+    <div className="space-y-4 py-4" role="status">
+      <Skeleton className="h-10 w-full" />
+      <Skeleton className="h-24 w-full" />
+      <Skeleton className="h-10 w-40" />
+    </div>
+  )
+}
+
+const TransactionForm = dynamic(() => import('@/components/transactions/TransactionForm'), { loading: InlineDialogContentLoading })
+const BatchCategorySelector = dynamic(() => import('@/components/transactions/BatchCategorySelector'), { loading: DialogLoadingSkeleton })
+const InvoiceMatchDialog = dynamic(() => import('@/components/transactions/InvoiceMatchDialog'), { loading: DialogLoadingSkeleton })
+const MatchVoucherDialog = dynamic(
+  () => import('@/components/transactions/MatchVoucherDialog').then((module) => module.MatchVoucherDialog),
+  { loading: DialogLoadingSkeleton },
+)
+const InvoicePicker = dynamic(() => import('@/components/transactions/InvoicePicker'), { loading: InlineDialogContentLoading })
+const SupplierInvoicePicker = dynamic(() => import('@/components/transactions/SupplierInvoicePicker'), { loading: InlineDialogContentLoading })
+const MatchAllocationDialog = dynamic(() => import('@/components/transactions/MatchAllocationDialog'), { loading: DialogLoadingSkeleton })
+const BulkBookDialog = dynamic(() => import('@/components/transactions/BulkBookDialog'), { loading: DialogLoadingSkeleton })
+const TransactionBookingDialog = dynamic(() => import('@/components/transactions/TransactionBookingDialog'), { loading: DialogLoadingSkeleton })
+const TransactionAttachDocumentDialog = dynamic(
+  () => import('@/components/transactions/TransactionAttachDocumentDialog'),
+  { loading: DialogLoadingSkeleton },
+)
+const QuickReviewDialog = dynamic(() => import('@/components/transactions/QuickReviewDialog'), { loading: DialogLoadingSkeleton })
+const EditTransactionTitleDialog = dynamic(
+  () => import('@/components/transactions/EditTransactionTitleDialog'),
+  { loading: DialogLoadingSkeleton },
+)
+const SkattekontoMatchDialog = dynamic(
+  () => import('@/components/skattekonto/SkattekontoMatchDialog').then((module) => module.SkattekontoMatchDialog),
+  { loading: DialogLoadingSkeleton },
+)
+const DuplicateBookingDialog = dynamic(
+  () => import('@/components/transactions/DuplicateBookingDialog'),
+  { loading: DialogLoadingSkeleton },
+)
+const TemplatePicker = dynamic(() => import('@/components/transactions/TemplatePicker'), { loading: InlineDialogContentLoading })
+
 type InvoiceWithCustomer = Invoice & { customer?: Customer }
 type SupplierInvoiceWithSupplier = SupplierInvoice & { supplier?: Supplier }
+
+// Source filter for the merged inbox (concept scene 10 account chooser):
+// everything, one cash account ('acct:<id>'), bank rows not yet tied to a
+// registered cash account ('bank:other'), all bank rows ('bank': the fallback
+// split when no cash accounts are registered), or the skattekonto side.
+type SourceFilter = 'all' | 'bank' | 'bank:other' | 'skatteverket' | `acct:${string}`
+
+const SOURCE_FILTER_STORAGE_KEY = 'Accounted:transaction-source-filter:v1'
+
+// Journal-entry ids get interpolated into the supplier-invoice .or() filter
+// string in the underlag-badge effect below. They come from journal_entries.id
+// (DB-sourced), but this guard keeps the interpolated list UUID-only, matching
+// /api/documents/counts.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+// Validates a persisted value. Stale acct:<id> entries (account removed or
+// disabled) are caught later by the sourceItems stale-filter guard.
+function isSourceFilter(value: string | null): value is SourceFilter {
+  return (
+    value === 'all' ||
+    value === 'bank' ||
+    value === 'bank:other' ||
+    value === 'skatteverket' ||
+    (value?.startsWith('acct:') ?? false)
+  )
+}
 
 function buildInvoiceMap(rows: InvoiceWithCustomer[] | null): Record<string, InvoiceWithCustomer> {
   if (!rows) return {}
@@ -83,6 +140,45 @@ function buildSupplierInvoiceMap(
   }, {})
 }
 
+// Fetch the potential invoice/supplier-invoice matches referenced by a page
+// of transactions in one parallel round trip. A single-query PostgREST embed
+// on potential_supplier_invoice_id is blocked until that FK exists in the
+// prod schema cache (see DECISIONS.md 2026-07-06).
+async function fetchPotentialMatches(
+  supabase: SupabaseClient,
+  rows: { potential_invoice_id: string | null; potential_supplier_invoice_id: string | null }[],
+) {
+  const potentialInvoiceIds = rows
+    .filter((t) => t.potential_invoice_id)
+    .map((t) => t.potential_invoice_id)
+  const potentialSupplierInvoiceIds = rows
+    .filter((t) => t.potential_supplier_invoice_id)
+    .map((t) => t.potential_supplier_invoice_id)
+
+  const [invoiceResult, supplierInvoiceResult] = await Promise.all([
+    potentialInvoiceIds.length > 0
+      ? supabase.from('invoices').select('*, customer:customers(*)').in('id', potentialInvoiceIds)
+      : Promise.resolve({ data: null, error: null }),
+    potentialSupplierInvoiceIds.length > 0
+      ? supabase.from('supplier_invoices').select('*, supplier:suppliers(*)').in('id', potentialSupplierInvoiceIds)
+      : Promise.resolve({ data: null, error: null }),
+  ])
+
+  // Non-fatal: the transaction list still renders without match hints, but
+  // log so a DB failure isn't mistaken for "no potential match".
+  if (invoiceResult.error) {
+    console.error('[fetchPotentialMatches] invoices query failed', invoiceResult.error)
+  }
+  if (supplierInvoiceResult.error) {
+    console.error('[fetchPotentialMatches] supplier_invoices query failed', supplierInvoiceResult.error)
+  }
+
+  return {
+    invoiceMap: buildInvoiceMap(invoiceResult.data),
+    supplierInvoiceMap: buildSupplierInvoiceMap(supplierInvoiceResult.data),
+  }
+}
+
 interface QuickReviewState {
   transaction: TransactionWithInvoice
   category: TransactionCategory
@@ -94,6 +190,7 @@ interface QuickReviewState {
 
 export default function TransactionsPage() {
   const { company } = useCompany()
+  const companyId = company?.id ?? null
   const t = useTranslations('transactions')
   const [transactions, setTransactions] = useState<TransactionWithInvoice[]>([])
   const [isLoading, setIsLoading] = useState(true)
@@ -104,11 +201,13 @@ export default function TransactionsPage() {
   const [processingId, setProcessingId] = useState<string | null>(null)
   const [searchTerm, setSearchTerm] = useState('')
 
-  // Batch mode
-  const [isBatchMode, setIsBatchMode] = useState(false)
+  // Batch selection: hover checkboxes + bulkbar (concept), no mode toggle.
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [showBatchSelector, setShowBatchSelector] = useState(false)
   const [batchProgress, setBatchProgress] = useState<{ done: number; total: number } | null>(null)
+  // Row expansion (concept foldout): one open row at a time, mirroring the
+  // verifikat list.
+  const [expandedTxId, setExpandedTxId] = useState<string | null>(null)
 
   // Invoice match dialog
   const [matchDialogOpen, setMatchDialogOpen] = useState(false)
@@ -122,7 +221,7 @@ export default function TransactionsPage() {
 
   // Attach-underlag dialog (tx→doc mirror of the Documents view's matcher)
   const [attachDocTx, setAttachDocTx] = useState<TransactionWithInvoice | null>(null)
-  // Underlag status per booked journal_entry_id — drives the per-row
+  // Underlag status per booked journal_entry_id: drives the per-row
   // "Underlag"/"Underlag saknas" badges in history view.
   const [jeUnderlagStatus, setJeUnderlagStatus] = useState<Record<string, JeUnderlagStatus>>({})
   // JE ids already requested (in-flight or done) so the enrichment effect
@@ -143,7 +242,7 @@ export default function TransactionsPage() {
   const [supplierInvoicePickerTransaction, setSupplierInvoicePickerTransaction] = useState<TransactionWithInvoice | null>(null)
   const [splitMatchOpen, setSplitMatchOpen] = useState(false)
   const [splitMatchTransaction, setSplitMatchTransaction] = useState<TransactionWithInvoice | null>(null)
-  // "Matcha mot befintlig verifikation" — link a bank tx to an already-booked
+  // "Matcha mot befintlig verifikation": link a bank tx to an already-booked
   // voucher (salary, Fortnox import, manual entry) with no new bokföring.
   const [matchVoucherTx, setMatchVoucherTx] = useState<TransactionWithInvoice | null>(null)
   const [bulkBookOpen, setBulkBookOpen] = useState(false)
@@ -188,8 +287,24 @@ export default function TransactionsPage() {
   } | null>(null)
   const [ciMatchProcessing, setCiMatchProcessing] = useState(false)
 
-  // Entity type for tooltip context
-  const [entityType, setEntityType] = useState<string>('enskild_firma')
+  // Booking-time duplicate guard (TRANSACTION_BOOK_POSSIBLE_DUPLICATE): the
+  // server found this affärshändelse already booked: either another booked
+  // transaction sharing this one's date+amount+bank account, OR an unlinked
+  // voucher that already books the amount on the bank account (a paid invoice,
+  // a salary payout). Surface the existing verifikat and let the user book
+  // anyway: genuinely repeated same-day payments (e.g. identical Swish
+  // transfers) are legitimate. "Bokför ändå" retries with force bound to the
+  // reviewed candidate via expected_duplicate_journal_entry_id (present on both
+  // candidate kinds), which the server re-detects so a stale id can't wave it.
+  const [duplicateWarning, setDuplicateWarning] = useState<{
+    transactionId: string
+    retry: () => Promise<string | null>
+    candidate: BookedDuplicateCandidate
+  } | null>(null)
+  const [duplicateProcessing, setDuplicateProcessing] = useState(false)
+
+  // Dashboard layout already resolved the effective entity type from settings.
+  const entityType = company?.entity_type ?? 'enskild_firma'
 
   // Pagination
   const [hasMore, setHasMore] = useState(false)
@@ -209,52 +324,101 @@ export default function TransactionsPage() {
   const [skvMatchTarget, setSkvMatchTarget] = useState<StoredSkattekontoTransaction | null>(
     null,
   )
+  // True when an SKV connection exists but is dead (needs_reconsent, or
+  // expired with no refresh left). Drives the reconnect banner: without it
+  // a user whose token died sees an empty skattekonto and has no reason to
+  // ever visit the settings panel where the reconnect prompt lives.
+  const [skvNeedsReconnect, setSkvNeedsReconnect] = useState(false)
 
-  // Source filter for the merged inbox. Defaults to 'all' so users see
-  // both sources unless they want to narrow down.
-  const [sourceFilter, setSourceFilter] = useState<'all' | 'bank' | 'skatteverket'>('all')
+  // One browser-wide source filter, persisted (#1105) so the choice
+  // survives reloads. Defaults to 'all'.
+  const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all')
+
+  useEffect(() => {
+    try {
+      const stored = window.localStorage.getItem(SOURCE_FILTER_STORAGE_KEY)
+      if (isSourceFilter(stored)) setSourceFilter(stored)
+    } catch {
+      // localStorage may be unavailable. Keep the default in-memory state.
+    }
+  }, [])
+
+  const handleSourceFilterChange = useCallback((next: SourceFilter) => {
+    setSourceFilter(next)
+
+    try {
+      window.localStorage.setItem(SOURCE_FILTER_STORAGE_KEY, next)
+    } catch {
+      // localStorage may be unavailable. The in-memory filter still works.
+    }
+  }, [])
+  // Registered cash accounts (cash_accounts): the account chooser's rows,
+  // with PSD2 balances when the bank reports them.
+  const [cashAccounts, setCashAccounts] = useState<CashAccount[]>([])
 
   const { toast } = useToast()
   const { dialogProps: confirmDialogProps, confirm } = useDestructiveConfirm()
   // Bank transaction whose title is being edited (null = dialog closed).
   const [editTitleTarget, setEditTitleTarget] = useState<TransactionWithInvoice | null>(null)
-  const supabase = createClient()
+  const supabase = useRealtimeSupabase()
   const searchParams = useSearchParams()
   const highlightId = searchParams.get('highlight')
   // Tracks the last highlight target we acted on so re-renders don't re-trigger
   // the auto-open every time the user closes the categorize panel.
   const handledHighlightRef = useRef<string | null>(null)
+  const refreshTransactionsInFlightRef = useRef(false)
+  const refreshTransactionsQueuedRef = useRef(false)
 
   // Computed lists
-  const uncategorizedTransactions = transactions
-    .filter((t) => t.is_business === null && !t.is_ignored && !exitingIds.has(t.id))
-    .sort((a, b) => {
-      const aHasMatch = a.potential_invoice || a.potential_supplier_invoice ? 1 : 0
-      const bHasMatch = b.potential_invoice || b.potential_supplier_invoice ? 1 : 0
-      if (aHasMatch !== bHasMatch) return bHasMatch - aHasMatch
-      return b.date.localeCompare(a.date)
-    })
+  const uncategorizedTransactions = useMemo(
+    () => transactions
+      .filter((t) => t.is_business === null && !t.is_ignored && !exitingIds.has(t.id))
+      .sort((a, b) => {
+        const aHasMatch = a.potential_invoice || a.potential_supplier_invoice ? 1 : 0
+        const bHasMatch = b.potential_invoice || b.potential_supplier_invoice ? 1 : 0
+        if (aHasMatch !== bHasMatch) return bHasMatch - aHasMatch
+        return b.date.localeCompare(a.date)
+      }),
+    [exitingIds, transactions],
+  )
 
   // Merged inbox: bank tx + SKV rows interleaved by date. Source filter
   // narrows to one side. SKV rows always go after bank rows on the same
-  // date — bank tx tend to have invoice-match suggestions and we'd rather
+  // date: bank tx tend to have invoice-match suggestions and we'd rather
   // surface those first.
   type InboxItem =
     | { source: 'bank'; date: string; data: TransactionWithInvoice }
     | { source: 'skatteverket'; date: string; data: SkattekontoTransactionWithSuggestion }
 
-  const skvUnmatched = skvRows.filter(r => !r.journal_entry_id)
+  const skvUnmatched = useMemo(
+    () => skvRows.filter((row) => !row.journal_entry_id),
+    [skvRows],
+  )
 
-  const bankToSkvHints = findBankSkvCounterparts({
-    bankRows: uncategorizedTransactions.map(t => ({ id: t.id, date: t.date, amount: t.amount })),
-    skvRows: skvUnmatched,
-  })
+  const bankToSkvHints = useMemo(
+    () => findBankSkvCounterparts({
+      bankRows: uncategorizedTransactions.map((transaction) => ({
+        id: transaction.id,
+        date: transaction.date,
+        amount: transaction.amount,
+      })),
+      skvRows: skvUnmatched,
+    }),
+    [skvUnmatched, uncategorizedTransactions],
+  )
 
-  const inboxItems: InboxItem[] = (() => {
+  const inboxItems = useMemo<InboxItem[]>(() => {
     const items: InboxItem[] = []
     const query = searchTerm.trim().toLowerCase()
     if (sourceFilter !== 'skatteverket') {
       for (const tx of uncategorizedTransactions) {
+        if (
+          sourceFilter.startsWith('acct:') &&
+          tx.cash_account_id !== sourceFilter.slice('acct:'.length)
+        ) {
+          continue
+        }
+        if (sourceFilter === 'bank:other' && tx.cash_account_id != null) continue
         if (
           query &&
           !tx.description?.toLowerCase().includes(query) &&
@@ -266,7 +430,7 @@ export default function TransactionsPage() {
         items.push({ source: 'bank', date: tx.date, data: tx })
       }
     }
-    if (sourceFilter !== 'bank') {
+    if (sourceFilter === 'all' || sourceFilter === 'skatteverket') {
       // Inbox only shows SKV rows that need action (no verifikat yet).
       for (const r of skvRows) {
         if (r.journal_entry_id) continue
@@ -288,82 +452,116 @@ export default function TransactionsPage() {
       if (a.source !== b.source) return a.source === 'bank' ? -1 : 1
       return 0
     })
-  })()
-  const transactionsWithMatches = transactions.filter(
-    (t) =>
-      (t.potential_invoice && !t.invoice_id) ||
-      (t.potential_supplier_invoice && !t.supplier_invoice_id),
+  }, [exitingIds, searchTerm, skvRows, sourceFilter, uncategorizedTransactions])
+
+  // Account chooser (concept scene 10): the source picker doubles as a
+  // balance readout. The total sums only SEK ledgers (mixing currencies into
+  // one figure would be a lie); null hides the annotation entirely.
+  const totalSourceBalance = useMemo(() => {
+    const sekBalances = cashAccounts.filter((a) => a.currency === 'SEK' && a.balance != null)
+    if (sekBalances.length === 0) return null
+    return sekBalances.reduce((sum, a) => sum + (a.balance ?? 0), 0)
+  }, [cashAccounts])
+
+  const hasUnassignedBankRows = useMemo(
+    () => uncategorizedTransactions.some((tx) => tx.cash_account_id == null),
+    [uncategorizedTransactions],
   )
+
+  const sourceItems = useMemo<ContextPickerItem[]>(() => {
+    const showSkvSource = skvRows.length > 0
+    const items: ContextPickerItem[] = [
+      {
+        id: 'all',
+        label: t('source_all_label'),
+        annotation: totalSourceBalance != null ? formatCurrency(totalSourceBalance) : undefined,
+      },
+    ]
+    for (const account of cashAccounts) {
+      items.push({
+        id: `acct:${account.id}`,
+        label: `${account.name || t('source_account_fallback')} ${account.ledger_account}`,
+        annotation:
+          account.balance != null ? formatCurrency(account.balance, account.currency) : undefined,
+      })
+    }
+    if (cashAccounts.length === 0 && showSkvSource) {
+      // No registered cash accounts yet: keep the plain bank/skattekonto split.
+      items.push({ id: 'bank', label: t('source_bank_label') })
+    } else if (cashAccounts.length > 0 && hasUnassignedBankRows) {
+      items.push({ id: 'bank:other', label: t('source_bank_other') })
+    }
+    if (showSkvSource) {
+      items.push({ id: 'skatteverket', label: t('source_skatteverket_label') })
+    }
+    return items
+  }, [cashAccounts, hasUnassignedBankRows, skvRows.length, t, totalSourceBalance])
+
+  // A narrowed filter can go stale (account disabled, skv rows drained,
+  // "övriga" bucket emptied): fall back to everything rather than filtering
+  // the inbox down to an invisible source.
+  useEffect(() => {
+    if (sourceFilter === 'all') return
+    if (!sourceItems.some((item) => item.id === sourceFilter)) setSourceFilter('all')
+  }, [sourceFilter, sourceItems])
+
+  // Rows the bulkbar's "Markera alla" can select: the visible bank rows
+  // (skattekonto rows aren't batch-bookable).
+  const selectableInboxIds = useMemo(
+    () => inboxItems.filter((item) => item.source === 'bank').map((item) => item.data.id),
+    [inboxItems],
+  )
+
 
   const PAGE_SIZE = 200
 
-  async function fetchTransactions() {
-    if (!company) return
-    setIsLoading(true)
-    const [{ data: txData, error: txError }, { count: uncatCount }] = await Promise.all([
-      supabase
-        .from('transactions')
-        .select('*')
-        .eq('company_id', company.id)
-        .order('date', { ascending: false })
-        .limit(PAGE_SIZE),
-      supabase
-        .from('transactions')
-        .select('*', { count: 'exact', head: true })
-        .eq('company_id', company.id)
-        .is('is_business', null)
-        // Same predicate as lib/worklist countUnbookedTransactions — ignored
-        // rows are handled, not pending.
-        .eq('is_ignored', false),
-    ])
-
-    if (txError) {
-      toast({ title: t('load_failed_title'), description: t('load_failed_description'), variant: 'destructive' })
-      setIsLoading(false)
-      return
+  // Account chooser rows: the registered, enabled cash accounts. One fetch
+  // per company; balances refresh with the page (bank sync triggers a
+  // router.refresh via the sync toast flow).
+  useEffect(() => {
+    if (!companyId) return
+    let cancelled = false
+    fetch('/api/cash-accounts?enabled_only=true')
+      .then((res) => (res.ok ? res.json() : { data: [] }))
+      .then((json: { data?: CashAccount[] }) => {
+        if (!cancelled) setCashAccounts(json.data ?? [])
+      })
+      .catch(() => {
+        if (!cancelled) setCashAccounts([])
+      })
+    return () => {
+      cancelled = true
     }
+  }, [companyId])
 
-    const rows = txData || []
-    const potentialInvoiceIds = rows
-      .filter((t) => t.potential_invoice_id)
-      .map((t) => t.potential_invoice_id)
-    const potentialSupplierInvoiceIds = rows
-      .filter((t) => t.potential_supplier_invoice_id)
-      .map((t) => t.potential_supplier_invoice_id)
-
-    const [invoiceResult, supplierInvoiceResult] = await Promise.all([
-      potentialInvoiceIds.length > 0
-        ? supabase.from('invoices').select('*, customer:customers(*)').in('id', potentialInvoiceIds)
-        : Promise.resolve({ data: null }),
-      potentialSupplierInvoiceIds.length > 0
-        ? supabase.from('supplier_invoices').select('*, supplier:suppliers(*)').in('id', potentialSupplierInvoiceIds)
-        : Promise.resolve({ data: null }),
-    ])
-
-    const invoiceMap = buildInvoiceMap(invoiceResult.data)
-    const supplierInvoiceMap = buildSupplierInvoiceMap(supplierInvoiceResult.data)
-
-    const transactionsWithInvoices: TransactionWithInvoice[] = rows.map((t) => ({
-      ...t,
-      potential_invoice: t.potential_invoice_id ? invoiceMap[t.potential_invoice_id] : undefined,
-      potential_supplier_invoice: t.potential_supplier_invoice_id
-        ? supplierInvoiceMap[t.potential_supplier_invoice_id]
-        : undefined,
-    }))
-
-    setTransactions(transactionsWithInvoices)
-    setTotalUncategorizedCount(uncatCount ?? 0)
-    setHasMore(rows.length >= PAGE_SIZE)
-    setIsLoading(false)
-
-    // Fire-and-forget: load SKV rows in parallel with the rest of the
-    // page. We don't block on this — if the extension is disabled or the
-    // user isn't connected the response is 503/401 and we just leave the
-    // SKV section empty.
-    void loadSkvRows()
-  }
-
-  async function loadSkvRows() {
+  const loadSkvRows = useCallback(async () => {
+    // Connection health, fetched alongside the rows: any failure (extension
+    // disabled, capability gate, not connected) just hides the banner.
+    void (async () => {
+      try {
+        const res = await fetch('/api/extensions/ext/skatteverket/status')
+        if (!res.ok) {
+          setSkvNeedsReconnect(false)
+          return
+        }
+        const s = (await res.json()) as {
+          connected?: boolean
+          disabled?: boolean
+          needsReconsent?: boolean
+          expired?: boolean
+          canRefresh?: boolean
+        }
+        setSkvNeedsReconnect(
+          Boolean(
+            s.connected &&
+              !s.disabled &&
+              (s.needsReconsent || (s.expired && !s.canRefresh)),
+          ),
+        )
+      } catch {
+        setSkvNeedsReconnect(false)
+      }
+    })()
     try {
       const res = await fetch('/api/extensions/ext/skatteverket/skattekonto/transaktioner')
       if (!res.ok) {
@@ -372,23 +570,89 @@ export default function TransactionsPage() {
       }
       const json = await res.json()
       const booked = (json.data?.booked ?? []) as SkattekontoTransactionWithSuggestion[]
-      // Keep all booked SKV rows in state — inbox view filters to obokförda
+      // Keep all booked SKV rows in state: inbox view filters to obokförda
       // (journal_entry_id null), history view shows all of them (matched
       // and unmatched) interleaved with bank tx by date.
       setSkvRows(booked)
     } catch {
       setSkvRows([])
     }
-  }
+  }, [])
+
+  const fetchTransactions = useCallback(async (showLoading = false, includeSkvRows = false) => {
+    if (!companyId) return
+    if (showLoading) setIsLoading(true)
+    if (includeSkvRows) void loadSkvRows()
+    try {
+      const [{ data: txData, error: txError }, { count: uncatCount }] = await Promise.all([
+        supabase
+          .from('transactions')
+          .select('*')
+          .eq('company_id', companyId)
+          .order('date', { ascending: false })
+          .limit(PAGE_SIZE),
+        supabase
+          .from('transactions')
+          .select('*', { count: 'exact', head: true })
+          .eq('company_id', companyId)
+          .is('is_business', null)
+          // Same predicate as lib/worklist countUnbookedTransactions: ignored
+          // rows are handled, not pending.
+          .eq('is_ignored', false),
+      ])
+
+      if (txError) {
+        toast({ title: t('load_failed_title'), description: t('load_failed_description'), variant: 'destructive' })
+        return
+      }
+
+      const rows = txData || []
+      const { invoiceMap, supplierInvoiceMap } = await fetchPotentialMatches(supabase, rows)
+
+      const transactionsWithInvoices: TransactionWithInvoice[] = rows.map((t) => ({
+        ...t,
+        potential_invoice: t.potential_invoice_id ? invoiceMap[t.potential_invoice_id] : undefined,
+        potential_supplier_invoice: t.potential_supplier_invoice_id
+          ? supplierInvoiceMap[t.potential_supplier_invoice_id]
+          : undefined,
+      }))
+
+      setTransactions(transactionsWithInvoices)
+      setTotalUncategorizedCount(uncatCount ?? 0)
+      setHasMore(rows.length >= PAGE_SIZE)
+
+    } finally {
+      if (showLoading) setIsLoading(false)
+    }
+  }, [companyId, loadSkvRows, supabase, t, toast])
+
+  const refreshTransactions = useCallback(async () => {
+    if (!companyId) return
+    if (refreshTransactionsInFlightRef.current) {
+      refreshTransactionsQueuedRef.current = true
+      return
+    }
+
+    refreshTransactionsInFlightRef.current = true
+    try {
+      do {
+        refreshTransactionsQueuedRef.current = false
+        await fetchTransactions(false, false)
+      } while (refreshTransactionsQueuedRef.current)
+    } finally {
+      refreshTransactionsInFlightRef.current = false
+      refreshTransactionsQueuedRef.current = false
+    }
+  }, [companyId, fetchTransactions])
 
   async function loadMoreTransactions() {
-    if (!company) return
+    if (!companyId) return
     setIsLoadingMore(true)
     const offset = transactions.length
     const { data: txData, error: txError } = await supabase
       .from('transactions')
       .select('*')
-      .eq('company_id', company.id)
+      .eq('company_id', companyId)
       .order('date', { ascending: false })
       .range(offset, offset + PAGE_SIZE - 1)
 
@@ -399,24 +663,7 @@ export default function TransactionsPage() {
 
     setHasMore(txData.length >= PAGE_SIZE)
 
-    const potentialInvoiceIds = txData
-      .filter((t) => t.potential_invoice_id)
-      .map((t) => t.potential_invoice_id)
-    const potentialSupplierInvoiceIds = txData
-      .filter((t) => t.potential_supplier_invoice_id)
-      .map((t) => t.potential_supplier_invoice_id)
-
-    const [invoiceResult, supplierInvoiceResult] = await Promise.all([
-      potentialInvoiceIds.length > 0
-        ? supabase.from('invoices').select('*, customer:customers(*)').in('id', potentialInvoiceIds)
-        : Promise.resolve({ data: null }),
-      potentialSupplierInvoiceIds.length > 0
-        ? supabase.from('supplier_invoices').select('*, supplier:suppliers(*)').in('id', potentialSupplierInvoiceIds)
-        : Promise.resolve({ data: null }),
-    ])
-
-    const invoiceMap = buildInvoiceMap(invoiceResult.data)
-    const supplierInvoiceMap = buildSupplierInvoiceMap(supplierInvoiceResult.data)
+    const { invoiceMap, supplierInvoiceMap } = await fetchPotentialMatches(supabase, txData)
 
     const newTransactions: TransactionWithInvoice[] = txData.map((t) => ({
       ...t,
@@ -430,17 +677,20 @@ export default function TransactionsPage() {
     setIsLoadingMore(false)
   }
 
-  // Underlag-status enrichment for booked rows. Three RLS-scoped reads per
+  // Underlag-status enrichment for booked rows. Five RLS-scoped reads per
   // 150-id chunk (PostgREST .in() URL-length convention, see
   // lib/worklist/categories.ts): the JEs' source types, which JEs have a
-  // current-version document, and which are exempted via
-  // journal_entry_no_doc_required. Incremental — only fetches JE ids not yet
-  // requested, so loadMoreTransactions pages are covered without refetching.
+  // current-version document, which are covered by a supplier invoice's
+  // retained document (BFL 5 kap 7 § hänvisning: registration/payment FK or a
+  // supplier_invoice_payments row: mirrors the verifikat_without_documents
+  // RPC), and which are exempted via journal_entry_no_doc_required.
+  // Incremental: only fetches JE ids not yet requested, so
+  // loadMoreTransactions pages are covered without refetching.
   // Soft-fails to "no badges" on error.
   useEffect(() => {
-    if (!company) return
-    if (requestedJeIdsRef.current.companyId !== company.id) {
-      requestedJeIdsRef.current = { companyId: company.id, ids: new Set() }
+    if (!companyId) return
+    if (requestedJeIdsRef.current.companyId !== companyId) {
+      requestedJeIdsRef.current = { companyId, ids: new Set() }
       setJeUnderlagStatus({})
     }
     const requested = requestedJeIdsRef.current.ids
@@ -454,19 +704,21 @@ export default function TransactionsPage() {
     if (newIds.length === 0) return
     newIds.forEach((id) => requested.add(id))
 
-    const companyId = company.id
     ;(async () => {
       const IN_CLAUSE_CHUNK = 150
       const merged: Record<string, JeUnderlagStatus> = {}
       for (let i = 0; i < newIds.length; i += IN_CLAUSE_CHUNK) {
         const chunk = newIds.slice(i, i + IN_CLAUSE_CHUNK)
-        const [entriesRes, docsRes, exemptRes] = await Promise.all([
+        // Only UUIDs reach the interpolated .or() string (the .in() array
+        // filters are already injection-safe).
+        const chunkInList = `(${chunk.filter((id) => UUID_RE.test(id)).join(',')})`
+        const [entriesRes, docsRes, siRefRes, sipRefRes, exemptRes] = await Promise.all([
           supabase
             .from('journal_entries')
             .select('id, source_type')
             // Same posted-only scope as countVerifikatMissingDocument:
             // reversed/corrected entries fall out of the result set and the
-            // row renders no badge — a storno'd verifikation must never grow
+            // row renders no badge: a storno'd verifikation must never grow
             // an "Underlag saknas" attach affordance.
             .eq('status', 'posted')
             .in('id', chunk)
@@ -478,16 +730,53 @@ export default function TransactionsPage() {
             .eq('company_id', companyId)
             .eq('is_current_version', true),
           supabase
+            .from('supplier_invoices')
+            .select(
+              'registration_journal_entry_id, payment_journal_entry_id, document:document_attachments(journal_entry_id)',
+            )
+            .eq('company_id', companyId)
+            .not('document_id', 'is', null)
+            .or(
+              `registration_journal_entry_id.in.${chunkInList},payment_journal_entry_id.in.${chunkInList}`,
+            ),
+          supabase
+            .from('supplier_invoice_payments')
+            .select(
+              'journal_entry_id, supplier_invoice:supplier_invoices(document_id, document:document_attachments(journal_entry_id))',
+            )
+            .eq('company_id', companyId)
+            .in('journal_entry_id', chunk),
+          supabase
             .from('journal_entry_no_doc_required')
             .select('journal_entry_id')
             .in('journal_entry_id', chunk)
             .eq('company_id', companyId),
         ])
         // Soft-fail: keep the chunks that already succeeded.
-        if (entriesRes.error || docsRes.error || exemptRes.error) break
+        if (entriesRes.error || docsRes.error || siRefRes.error || sipRefRes.error || exemptRes.error) break
         const jeIdsWithDocs = new Set(
           (docsRes.data ?? []).map((d) => d.journal_entry_id as string),
         )
+        for (const si of (siRefRes.data ?? []) as unknown as {
+          registration_journal_entry_id: string | null
+          payment_journal_entry_id: string | null
+          document: { journal_entry_id: string | null } | null
+        }[]) {
+          if (!si.document?.journal_entry_id) continue // unanchored: not underlag
+          if (si.registration_journal_entry_id) jeIdsWithDocs.add(si.registration_journal_entry_id)
+          if (si.payment_journal_entry_id) jeIdsWithDocs.add(si.payment_journal_entry_id)
+        }
+        for (const sip of (sipRefRes.data ?? []) as unknown as {
+          journal_entry_id: string | null
+          supplier_invoice: {
+            document_id: string | null
+            document: { journal_entry_id: string | null } | null
+          } | null
+        }[]) {
+          if (sip.journal_entry_id && sip.supplier_invoice?.document?.journal_entry_id) {
+            jeIdsWithDocs.add(sip.journal_entry_id)
+          }
+        }
         const exemptIds = new Set(
           (exemptRes.data ?? []).map((e) => e.journal_entry_id as string),
         )
@@ -498,14 +787,14 @@ export default function TransactionsPage() {
       }
       // The merge is an idempotent keyed write, so it stays valid across
       // unrelated transactions-state changes (booking a row, deletes,
-      // load-more) — only a company switch invalidates it. No cleanup-based
+      // load-more); only a company switch invalidates it. No cleanup-based
       // cancellation: that would orphan ids already marked as requested.
       if (requestedJeIdsRef.current.companyId === companyId && Object.keys(merged).length > 0) {
         setJeUnderlagStatus((prev) => ({ ...prev, ...merged }))
       }
     })()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [transactions, company])
+  }, [transactions, companyId])
 
   async function fetchCategorySuggestions(txIds: string[]) {
     if (txIds.length === 0) return
@@ -525,32 +814,46 @@ export default function TransactionsPage() {
     }
   }
 
-  // Fetch transactions and entity type in parallel on mount, then suggestions
+  // Fetch the initial page. Entity type is already available from CompanyContext.
   useEffect(() => {
+    void fetchTransactions(true, true)
+  }, [fetchTransactions])
+
+  useEffect(() => {
+    if (!companyId) return
+
     let cancelled = false
 
-    async function loadAll() {
-      // Fetch transactions and entity type in parallel
-      const [, entityRes] = await Promise.all([
-        fetchTransactions(),
-        fetch('/api/settings').then(r => r.json()).catch(() => null),
-      ])
-
+    const refreshFromRealtime = async () => {
       if (cancelled) return
-
-      if (entityRes?.data?.entity_type) {
-        setEntityType(entityRes.data.entity_type)
-      }
+      await refreshTransactions()
     }
 
-    loadAll()
+    const channel = supabase
+      .channel(`transactions:list:${companyId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'transactions',
+          filter: `company_id=eq.${companyId}`,
+        },
+        () => {
+          void refreshFromRealtime()
+        },
+      )
+      .subscribe()
 
-    return () => { cancelled = true }
-  }, [])
+    return () => {
+      cancelled = true
+      void supabase.removeChannel(channel)
+    }
+  }, [companyId, refreshTransactions, supabase])
 
   // Scroll the targeted row into view when arriving via
   // /transactions?highlight=<id>. Callers are inbox "Öppna transaktionen",
-  // payment-booking dialog, and supplier-invoice cross-link — all "go look
+  // payment-booking dialog, and supplier-invoice cross-link: all "go look
   // at this row", not "start booking". The legacy auto-open-template-picker
   // behavior was removed in v5: booking happens in the inbox workspace now.
   // Runs once per distinct highlight id so closing/scrolling away doesn't
@@ -601,8 +904,14 @@ export default function TransactionsPage() {
     templateId?: string
     inboxItemId?: string
     confirmNoMatch: boolean
+    // Set after the user confirms the booking-time duplicate warning. force
+    // bypasses the guard; the bypass is bound to the reviewed candidate's
+    // voucher (journal_entry_id), present on both a sibling-transaction and a
+    // ledger-only voucher candidate.
+    force?: boolean
+    expectedDuplicateJournalEntryId?: string
   }): Promise<string | null> {
-    const { id, isBusiness, category, vatTreatment, accountOverride, templateId, inboxItemId, confirmNoMatch } = args
+    const { id, isBusiness, category, vatTreatment, accountOverride, templateId, inboxItemId, confirmNoMatch, force, expectedDuplicateJournalEntryId } = args
     try {
       setProcessingId(id)
       const response = await fetch(`/api/transactions/${id}/categorize`, {
@@ -616,6 +925,9 @@ export default function TransactionsPage() {
           template_id: templateId,
           inbox_item_id: inboxItemId,
           ...(confirmNoMatch ? { confirm_no_match: true } : {}),
+          ...(force && expectedDuplicateJournalEntryId
+            ? { force: true, expected_duplicate_journal_entry_id: expectedDuplicateJournalEntryId }
+            : {}),
         }),
       })
 
@@ -655,10 +967,10 @@ export default function TransactionsPage() {
           // The user picked a library template (or typed an account
           // override) whose account isn't in this company's kontoplan.
           // Mirror the ACCOUNTS_NOT_IN_CHART flow with a one-click
-          // "Aktivera och bokför" — pull the BAS name if known so the
+          // "Aktivera och bokför": pull the BAS name if known so the
           // toast carries real context.
           // Validate the BAS account number is a plain 4-digit string before
-          // embedding it in any fetch URL/body — the value comes from the
+          // embedding it in any fetch URL/body: the value comes from the
           // server error envelope but defense-in-depth.
           const rawAccountNumber: unknown = result.error.details?.accountNumber
           const accountNumber: string | undefined =
@@ -672,7 +984,7 @@ export default function TransactionsPage() {
               if (lookupRes.ok) {
                 const lookup = await lookupRes.json() as { data?: Array<{ account_number: string; account_name: string | null; known?: boolean }> }
                 const hit = lookup.data?.find((r) => r.account_number === accountNumber)
-                if (hit?.account_name) displayName = `${accountNumber} — ${hit.account_name}`
+                if (hit?.account_name) displayName = `${accountNumber} - ${hit.account_name}`
               }
             } catch { /* fall through to the plain number */ }
           }
@@ -706,7 +1018,7 @@ export default function TransactionsPage() {
                   if (Array.isArray(activateBody.unknown) && activateBody.unknown.length > 0) {
                     toast({
                       title: 'Kontot finns inte i BAS-planen',
-                      description: `Lägg till ${accountNumber} manuellt under Inställningar → Kontoplan.`,
+                      description: `Lägg till ${accountNumber} manuellt i Kontoplan.`,
                       variant: 'destructive',
                     })
                     return
@@ -727,7 +1039,7 @@ export default function TransactionsPage() {
           // The mapped template/category references one or more accounts
           // that aren't active in this company's kontoplan. Without an
           // inline action the user has to navigate to settings, activate
-          // each account, and come back — surface a one-click "Aktivera
+          // each account, and come back: surface a one-click "Aktivera
           // och bokför" instead.
           const accountNumbers: string[] =
             (Array.isArray(result.error.account_numbers) && result.error.account_numbers) ||
@@ -766,7 +1078,7 @@ export default function TransactionsPage() {
                   if (Array.isArray(activateBody.unknown) && activateBody.unknown.length > 0) {
                     toast({
                       title: 'Kunde inte hitta alla konton',
-                      description: `Lägg till ${activateBody.unknown.join(', ')} manuellt under Inställningar → Kontoplan.`,
+                      description: `Lägg till ${activateBody.unknown.join(', ')} manuellt i Kontoplan.`,
                       variant: 'destructive',
                     })
                     return
@@ -779,6 +1091,28 @@ export default function TransactionsPage() {
                 Aktivera och bokför
               </ToastAction>
             ) : undefined,
+          })
+          setProcessingId(null)
+          return null
+        }
+        if (
+          result?.error?.code === 'TRANSACTION_BOOK_POSSIBLE_DUPLICATE' &&
+          result.error.details?.candidate
+        ) {
+          // Booking-time duplicate guard fired. Don't dead-end on a toast that
+          // merely says "book anyway" with no way to do so: open a dialog with
+          // the already-booked sibling and let the user confirm. "Bokför ändå"
+          // re-runs with force bound to this candidate (server re-detects it).
+          const candidate = result.error.details.candidate as BookedDuplicateCandidate
+          setDuplicateWarning({
+            transactionId: id,
+            retry: () =>
+              runCategorize({
+                ...args,
+                force: true,
+                expectedDuplicateJournalEntryId: candidate.journal_entry_id,
+              }),
+            candidate,
           })
           setProcessingId(null)
           return null
@@ -961,13 +1295,13 @@ export default function TransactionsPage() {
 
   async function handleIgnoreTransaction(tx: TransactionWithInvoice) {
     // Mirrors BankReconciliationView's ignore flow: Ignorera is fully
-    // reversible, but the row vanishes immediately — confirmation before the
+    // reversible, but the row vanishes immediately: confirmation before the
     // write plus an Ångra toast gives two recovery affordances. The
     // "Ignorerade transaktioner" card on Rapporter → Bankavstämning is the
     // standing third.
     const ok = await confirm({
       title: 'Ignorera transaktionen?',
-      description: `${tx.description} — ${formatCurrency(tx.amount, tx.currency)} (${formatDate(tx.date)}) försvinner från listan utan att bokföras. Använd bara för poster som inte är affärshändelser, t.ex. dubbletter eller överföringar mellan egna konton — riktiga köp och betalningar ska bokföras. Du kan återställa den under Bankavstämning när som helst.`,
+      description: `${tx.description}, ${formatCurrency(tx.amount, tx.currency)} (${formatDate(tx.date)}) försvinner från listan utan att bokföras. Använd bara för poster som inte är affärshändelser, t.ex. dubbletter eller överföringar mellan egna konton. Riktiga köp och betalningar ska bokföras. Du kan återställa den under Bankavstämning när som helst.`,
       confirmLabel: 'Ignorera',
       cancelLabel: 'Avbryt',
       variant: 'warning',
@@ -1000,7 +1334,7 @@ export default function TransactionsPage() {
       }, 350)
       toast({
         title: 'Transaktionen ignorerad',
-        description: `${tx.description} — ${formatCurrency(tx.amount, tx.currency)}`,
+        description: `${tx.description}, ${formatCurrency(tx.amount, tx.currency)}`,
         action: (
           <ToastAction altText="Ångra ignorera" onClick={() => void handleUnignoreTransaction(tx.id)}>
             Ångra
@@ -1209,7 +1543,7 @@ export default function TransactionsPage() {
 
   // Called by MatchVoucherDialog after /api/reconciliation/bank/link succeeds.
   // The row is now booked (journal_entry_id set, is_business true) so the inbox
-  // filter drops it — animate it out the same way as the invoice-link path.
+  // filter drops it: animate it out the same way as the invoice-link path.
   function handleVoucherLinked(transactionId: string, journalEntryId: string, voucherLabel: string) {
     toast({
       title: 'Bankhändelsen kopplad',
@@ -1317,7 +1651,7 @@ export default function TransactionsPage() {
 
   // Selected-tx derivation for bulk-book eligibility.
   // The action bar shows "Bokför i klump" only when ≥2 txs are selected,
-  // share the same date, and same direction (all income or all expense) —
+  // share the same date, and same direction (all income or all expense):
   // matches the RPC's same-day + same-direction invariants so the user
   // doesn't submit a guaranteed-fail batch.
   const selectedTransactions = useMemo(
@@ -1341,9 +1675,8 @@ export default function TransactionsPage() {
       for (const id of ids) next.add(id)
       return next
     })
-    await fetchTransactions()
+    await refreshTransactions()
     setSelectedIds(new Set())
-    setIsBatchMode(false)
     setTimeout(() => {
       setExitingIds((prev) => {
         const next = new Set(prev)
@@ -1361,7 +1694,7 @@ export default function TransactionsPage() {
     // confirms it's booked. Mirrors the pattern at the supplier-invoice
     // match success path below.
     setExitingIds((prev) => new Set(prev).add(txId))
-    await fetchTransactions()
+    await refreshTransactions()
     setTimeout(() => {
       setExitingIds((prev) => {
         const next = new Set(prev)
@@ -1375,7 +1708,7 @@ export default function TransactionsPage() {
     setIsCreating(true)
     try {
       // Create through the server route so the payload is validated server-side
-      // (shared CreateTransactionSchema) and the DB CHECK applies — the browser
+      // (shared CreateTransactionSchema) and the DB CHECK applies: the browser
       // client must never be the only guard on a mutation.
       const response = await fetch('/api/transactions', {
         method: 'POST',
@@ -1491,7 +1824,15 @@ export default function TransactionsPage() {
       )
       const json = await res.json()
       if (!res.ok) {
-        throw new Error(json.error || 'Bokföring misslyckades')
+        // Map the parsed body plus the status, never `new Error(json.error)`:
+        // the Error constructor stringifies a non-string body field, and the
+        // mapper would discard the route's own Swedish reason.
+        toast({
+          title: 'Kunde inte bokföra',
+          description: getErrorMessage(json, { statusCode: res.status }),
+          variant: 'destructive',
+        })
+        return
       }
       toast({
         title: 'Utkast skapat',
@@ -1501,7 +1842,7 @@ export default function TransactionsPage() {
     } catch (err) {
       toast({
         title: 'Kunde inte bokföra',
-        description: err instanceof Error ? err.message : undefined,
+        description: err instanceof Error ? getErrorMessage(err) : undefined,
         variant: 'destructive',
       })
     } finally {
@@ -1510,7 +1851,7 @@ export default function TransactionsPage() {
   }
 
   function handleSkvMatched() {
-    // After a successful match, drop the row from the inbox — it's now
+    // After a successful match, drop the row from the inbox: it's now
     // linked to a verifikat. Trigger an exit animation first.
     if (skvMatchTarget) {
       const id = skvMatchTarget.id
@@ -1530,6 +1871,9 @@ export default function TransactionsPage() {
     transactionId: string,
     journalEntryId: string,
     attachedDocumentId?: string | null,
+    // True when the duplicate guard's match action LINKED the transaction to
+    // an existing voucher instead of creating a new one.
+    matched?: boolean,
   ) {
     setExitingIds((prev) => new Set(prev).add(transactionId))
     setTimeout(() => {
@@ -1540,7 +1884,7 @@ export default function TransactionsPage() {
                 ...t,
                 is_business: true,
                 journal_entry_id: journalEntryId,
-                // Existing pin wins — the link route only pins when the tx
+                // Existing pin wins: the link route only pins when the tx
                 // had none (document_id IS NULL guard).
                 document_id: t.document_id ?? attachedDocumentId ?? null,
               }
@@ -1556,7 +1900,11 @@ export default function TransactionsPage() {
     setBookingDialogOpen(false)
     setBookingDialogTransaction(null)
     setBookingDialogTemplate(null)
-    toast({ title: 'Bokförd' })
+    if (matched) {
+      toast({ title: 'Bankhändelsen kopplad', description: 'Ingen ny bokföring skapad.' })
+    } else {
+      toast({ title: 'Bokförd' })
+    }
   }
 
   function openAttachDocumentDialog(transaction: TransactionWithInvoice) {
@@ -1569,7 +1917,7 @@ export default function TransactionsPage() {
     )
     // Booked row: the attach route propagated the doc onto the verifikation,
     // so flip the JE status optimistically too. Read the JE id off the
-    // dialog's own subject (attachDocTx), not the transactions snapshot —
+    // dialog's own subject (attachDocTx), not the transactions snapshot:
     // the list may have changed (load-more, booking) while the dialog was
     // open, and a stale find() would silently skip the badge flip.
     const jeId =
@@ -1590,7 +1938,6 @@ export default function TransactionsPage() {
   }
 
   function exitBatchMode() {
-    setIsBatchMode(false)
     setSelectedIds(new Set())
   }
 
@@ -1660,6 +2007,75 @@ export default function TransactionsPage() {
       toast({
         title: 'Delvis klart',
         description: parts.join(', '),
+        variant: 'destructive',
+      })
+    }
+    exitBatchMode()
+  }
+
+  async function handleBatchIgnore() {
+    const ids = Array.from(selectedIds)
+    const ok = await confirm({
+      title: `Ignorera ${ids.length} transaktioner?`,
+      description: 'Transaktionerna försvinner från listan utan att bokföras. Du kan återställa dem under Bankavstämning.',
+      confirmLabel: 'Ignorera',
+      cancelLabel: 'Avbryt',
+      variant: 'warning',
+    })
+    if (!ok) return
+
+    const ignoredIds = new Set<string>()
+    setBatchProgress({ done: 0, total: ids.length })
+    let successes = 0
+    const failures: string[] = []
+    for (let i = 0; i < ids.length; i++) {
+      try {
+        const res = await fetch(`/api/transactions/${ids[i]}/ignore`, { method: 'POST' })
+        if (res.ok) {
+          successes++
+          ignoredIds.add(ids[i])
+        } else {
+          const tx = transactions.find((t) => t.id === ids[i])
+          failures.push(tx?.description || ids[i])
+        }
+      } catch {
+        failures.push(ids[i])
+      }
+      setBatchProgress({ done: i + 1, total: ids.length })
+    }
+    if (ignoredIds.size > 0) {
+      setExitingIds((prev) => {
+        const next = new Set(prev)
+        for (const id of ignoredIds) next.add(id)
+        return next
+      })
+      setTotalUncategorizedCount((prev) => Math.max(0, (prev ?? ignoredIds.size) - ignoredIds.size))
+      setTimeout(() => {
+        setTransactions((prev) =>
+          prev.map((t) => (ignoredIds.has(t.id) ? { ...t, is_ignored: true } : t))
+        )
+        setExitingIds((prev) => {
+          const next = new Set(prev)
+          for (const id of ignoredIds) next.delete(id)
+          return next
+        })
+      }, 350)
+    }
+    setBatchProgress(null)
+    if (failures.length === 0) {
+      toast({
+        title: 'Klart',
+        description: `${successes} transaktioner ignorerade`,
+        action: (
+          <ToastAction altText="Öppna Bankavstämning" asChild>
+            <Link href="/reports/bank-reconciliation">Bankavstämning</Link>
+          </ToastAction>
+        ),
+      })
+    } else {
+      toast({
+        title: 'Delvis klart',
+        description: `${successes} ignorerade, ${failures.length} misslyckades`,
         variant: 'destructive',
       })
     }
@@ -1763,7 +2179,7 @@ export default function TransactionsPage() {
   }
 
   // Complex (multi-leg or otherwise non-convertible) library template picked
-  // from the transaction modal — route into the manual booking dialog with
+  // from the transaction modal: route into the manual booking dialog with
   // the template pre-applied against the transaction's amount.
   function handlePickLibraryTemplate(raw: BookingTemplateLibrary) {
     if (!templatePickerTransaction) return
@@ -1799,7 +2215,7 @@ export default function TransactionsPage() {
             (Array.isArray(result.error.account_numbers) && result.error.account_numbers) ||
             (Array.isArray(result.error.details?.account_numbers) && result.error.details?.account_numbers) ||
             []
-          // Synchronous in-flight flag per toast closure — see same pattern
+          // Synchronous in-flight flag per toast closure: see same pattern
           // in runCategorize. Double-click on the counterparty-template
           // retry would race the second cpCategorize against the first's
           // verifikation insert.
@@ -1859,7 +2275,7 @@ export default function TransactionsPage() {
         } else {
           toast({ title: 'Kategorisering misslyckades', description: getErrorMessage(result, { context: 'transaction', statusCode: cpStatus }), variant: 'destructive' })
         }
-        // Close the review dialog on hard errors — the toast (with action if
+        // Close the review dialog on hard errors: the toast (with action if
         // ACCOUNTS_NOT_IN_CHART) carries the message and the recovery path.
         setQuickReviewOpen(false)
         setQuickReview(null)
@@ -1870,7 +2286,7 @@ export default function TransactionsPage() {
     } else {
       journalEntryId = await handleCategorize(id, true, category, vatTreatment, accountOverride, templateId)
     }
-    // Always close — whether the server created a verifikation, returned a
+    // Always close: whether the server created a verifikation, returned a
     // structured 4xx (ACCOUNTS_NOT_IN_CHART, INVALID_MAPPING, …), or hit a
     // partial-success path. The toast from runCategorize already communicates
     // the outcome; keeping the dialog open serves no purpose.
@@ -1880,26 +2296,54 @@ export default function TransactionsPage() {
   }
 
   return (
-    <div className="space-y-6">
-      {/* Status bar */}
-      <TransactionStatusBar
-        uncategorizedCount={totalUncategorizedCount ?? uncategorizedTransactions.length}
-        invoiceMatchCount={transactionsWithMatches.length}
-        mode={mode}
-        onOpenCreateDialog={() => setIsDialogOpen(true)}
-        isBatchMode={isBatchMode}
-        onToggleBatchMode={() => (isBatchMode ? exitBatchMode() : setIsBatchMode(true))}
-      />
+    <div className="space-y-8">
+      {/* Page header (concept scene 10): title + Importera split button */}
+      <TransactionStatusBar onOpenCreateDialog={() => setIsDialogOpen(true)} />
 
+
+      {skvNeedsReconnect && (
+        <AttnLine action={{ label: t('skv_reconnect_cta'), href: '/settings/tax' }}>
+          {t('skv_reconnect_body')}
+        </AttnLine>
+      )}
+
+      {/* Toolbar (concept order): [Att bokföra/Alla-seg] [sök] [Välj flera]
+          ... [source ContextPicker far right] */}
       <div className="flex flex-wrap items-center gap-2">
-        <BankSyncStatusChip />
-        <BankSyncNowButton />
-      </div>
-      <BankSyncSinceLastVisit />
-
-      {/* Search + view dropdown */}
-      <div className="flex items-center gap-2">
-        <div className="relative flex-1">
+        <div className="inline-flex shrink-0 gap-0.5 rounded-lg bg-muted/70 p-[3px]" role="tablist">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={mode === 'inbox'}
+            onClick={() => setMode('inbox')}
+            className={`inline-flex items-center gap-1.5 rounded-md px-3.5 py-[5px] text-[12.5px] transition-colors duration-150 ${
+              mode === 'inbox'
+                ? 'border border-border bg-card font-medium text-foreground'
+                : 'text-muted-foreground hover:text-foreground'
+            }`}
+          >
+            {t('mode_inbox')}
+            {(totalUncategorizedCount ?? uncategorizedTransactions.length) > 0 && (
+              <span className="rounded-full bg-secondary px-1.5 text-[10px] font-medium tabular-nums">
+                {totalUncategorizedCount ?? uncategorizedTransactions.length}
+              </span>
+            )}
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={mode === 'history'}
+            onClick={() => setMode('history')}
+            className={`rounded-md px-3.5 py-[5px] text-[12.5px] transition-colors duration-150 ${
+              mode === 'history'
+                ? 'border border-border bg-card font-medium text-foreground'
+                : 'text-muted-foreground hover:text-foreground'
+            }`}
+          >
+            {t('mode_all')}
+          </button>
+        </div>
+        <div className="relative min-w-[220px] max-w-xs flex-1">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
           <Input
             placeholder="Sök transaktioner…"
@@ -1908,134 +2352,183 @@ export default function TransactionsPage() {
             className="h-9 pl-10"
           />
         </div>
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button variant="outline" size="sm" className="h-9 gap-1.5 px-3 text-sm">
-              {mode === 'inbox'
-                ? `Att bokföra${(totalUncategorizedCount ?? uncategorizedTransactions.length) > 0 ? ` (${totalUncategorizedCount ?? uncategorizedTransactions.length})` : ''}`
-                : 'Alla transaktioner'}
-              <ChevronDown className="h-3.5 w-3.5 opacity-50" />
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="min-w-[14rem]">
-            <DropdownMenuRadioGroup value={mode} onValueChange={(v) => setMode(v as typeof mode)}>
-              <DropdownMenuRadioItem value="inbox">
-                {`Att bokföra${(totalUncategorizedCount ?? uncategorizedTransactions.length) > 0 ? ` (${totalUncategorizedCount ?? uncategorizedTransactions.length})` : ''}`}
-              </DropdownMenuRadioItem>
-              <DropdownMenuRadioItem value="history">Alla transaktioner</DropdownMenuRadioItem>
-            </DropdownMenuRadioGroup>
-          </DropdownMenuContent>
-        </DropdownMenu>
+        {/* Account chooser (convention 8): the one context chip, far right.
+            Per-cash-account rows with balances (concept scene 10); hidden
+            only when there is nothing beyond "Alla källor" to choose. */}
+        {mode === 'inbox' && sourceItems.length > 1 && (
+          <div className="ml-auto">
+            <ContextPicker
+              value={sourceFilter}
+              onChange={(id) => handleSourceFilterChange(id as SourceFilter)}
+              triggerLabel={(() => {
+                const active =
+                  sourceItems.find((item) => item.id === sourceFilter) ?? sourceItems[0]
+                return active.annotation ? `${active.label} · ${active.annotation}` : active.label
+              })()}
+              items={sourceItems}
+            />
+          </div>
+        )}
       </div>
 
       {/* Content based on mode */}
       {isLoading ? (
-        <DataList>
+        <DataList className="stagger-enter">
           {[1, 2, 3].map((i) => (
-            <div key={i} className="flex items-center gap-3 px-4 py-3 animate-pulse">
-              <div className="h-5 w-5 rounded bg-muted" />
+            <div key={i} className="flex items-center gap-3 px-4 py-3">
+              <Skeleton className="h-5 w-5 rounded" />
               <div className="flex-1 space-y-2">
-                <div className="h-4 w-48 rounded bg-muted" />
-                <div className="h-3 w-24 rounded bg-muted" />
+                <Skeleton className="h-4 w-48 rounded" />
+                <Skeleton className="h-3 w-24 rounded" />
               </div>
-              <div className="h-5 w-20 rounded bg-muted" />
+              <Skeleton className="h-5 w-20 rounded" />
             </div>
           ))}
         </DataList>
       ) : mode === 'inbox' ? (
-        inboxItems.length === 0 && !searchTerm ? (
-          <InboxZeroState
-            hasTransactions={transactions.length > 0 || skvRows.length > 0}
-            onCreateTransaction={() => setIsDialogOpen(true)}
-          />
+        inboxItems.length === 0 ? (
+          searchTerm || sourceFilter !== 'all' ? (
+            <DataListEmpty
+              title="Inga träffar"
+              description={searchTerm ? t('no_search_results') : t('source_empty')}
+            />
+          ) : (
+            <InboxZeroState
+              hasTransactions={transactions.length > 0 || skvRows.length > 0}
+              onCreateTransaction={() => setIsDialogOpen(true)}
+            />
+          )
         ) : (
-          <DataList>
-            {skvUnmatched.length > 0 && uncategorizedTransactions.length > 0 && (
-              <DataListHeader>
-                <span className="text-xs uppercase tracking-wider text-muted-foreground">
-                  {t('source_label')}
-                </span>
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <Button variant="outline" size="sm" className="h-7 gap-1.5 px-2 text-xs">
-                      {sourceFilter === 'all'
-                        ? t('source_all', { count: uncategorizedTransactions.length + skvUnmatched.length })
-                        : sourceFilter === 'bank'
-                          ? t('source_bank', { count: uncategorizedTransactions.length })
-                          : t('source_skatteverket', { count: skvUnmatched.length })}
-                      <ChevronDown className="h-3 w-3 opacity-50" />
-                    </Button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="start" className="min-w-[12rem]">
-                    <DropdownMenuRadioGroup
-                      value={sourceFilter}
-                      onValueChange={(v) => setSourceFilter(v as typeof sourceFilter)}
-                    >
-                      <DropdownMenuRadioItem value="all">
-                        {t('source_all', { count: uncategorizedTransactions.length + skvUnmatched.length })}
-                      </DropdownMenuRadioItem>
-                      <DropdownMenuRadioItem value="bank">
-                        {t('source_bank', { count: uncategorizedTransactions.length })}
-                      </DropdownMenuRadioItem>
-                      <DropdownMenuRadioItem value="skatteverket">
-                        {t('source_skatteverket', { count: skvUnmatched.length })}
-                      </DropdownMenuRadioItem>
-                    </DropdownMenuRadioGroup>
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              </DataListHeader>
-            )}
-            {inboxItems.length === 0 && searchTerm ? (
-              <DataListEmpty
-                title="Inga träffar"
-                description={t('no_search_results')}
-              />
-            ) : null}
-            <AnimatePresence mode="popLayout">
-              {inboxItems.map(item =>
-                item.source === 'bank' ? (
-                  <TransactionInboxCard
-                    key={`bank-${item.data.id}`}
-                    transaction={item.data}
-                    skvCounterpartDate={bankToSkvHints.get(item.data.id)}
-                    processingId={processingId}
-                    isBatchMode={isBatchMode}
-                    isSelected={selectedIds.has(item.data.id)}
-                    entityType={entityType}
-                    onCategorize={handleCategorize}
-                    onOpenMatchDialog={openMatchDialog}
-                    onOpenMatchInvoicePicker={openInvoiceMatchPicker}
-                    onOpenSplitMatch={openSplitMatchDialog}
-                    onOpenMatchVoucher={openMatchVoucherDialog}
-                    onOpenAttachDocument={openAttachDocumentDialog}
-                    onOpenCategoryDialog={openCategoryDialog}
-                    onDelete={handleDeleteTransaction}
-                    onEditTitle={openEditTitleDialog}
-                    onToggleSelect={toggleBatchSelect}
-                  />
+          <div>
+            {/* Bulkbar (concept): hidden until at least one transaction is
+                selected via the hover checkboxes, then it pops in with the
+                count and the batch actions. */}
+            {selectedIds.size > 0 && (
+              <div className="flex flex-wrap items-center gap-x-5 gap-y-2 border-b border-border px-1 py-2.5 text-[12.5px] animate-fade-in">
+                {batchProgress ? (
+                  <span className="flex items-center gap-2 text-muted-foreground">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    {t('batch_progress', { done: batchProgress.done, total: batchProgress.total })}
+                  </span>
                 ) : (
-                  <SkattekontoInboxCard
-                    key={`skv-${item.data.id}`}
-                    row={item.data}
-                    matchSuggestion={item.data.match_suggestion}
-                    processing={skvProcessingId === item.data.id}
-                    onBokfor={handleSkvBokfor}
-                    onMatch={r => setSkvMatchTarget(r)}
-                  />
-                ),
-              )}
-            </AnimatePresence>
-          </DataList>
+                  <>
+                    <span className="whitespace-nowrap">
+                      <strong className="font-semibold tabular-nums">{selectedIds.size}</strong>{' '}
+                      {t('bulkbar_selected', { count: selectedIds.size })}
+                    </span>
+                    <Button size="sm" onClick={() => setShowBatchSelector(true)}>
+                      {t('batch_book')}
+                    </Button>
+                    {/* Bulk-book (samlingsverifikation): only when ≥2 selected
+                        on the same date + same direction. Disabled state
+                        explains why via title. */}
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => setBulkBookOpen(true)}
+                      disabled={!bulkBookEligible}
+                      title={!bulkBookEligible ? t('batch_bulk_book_hint') : undefined}
+                    >
+                      {t('batch_bulk_book')}
+                    </Button>
+                    <button type="button" className={QUIET_LINK_CLASS} onClick={handleBatchIgnore}>
+                      {t('batch_ignore')}
+                    </button>
+                    <button
+                      type="button"
+                      className={cn(QUIET_LINK_CLASS, 'hover:text-destructive')}
+                      onClick={handleBatchDelete}
+                    >
+                      {t('batch_delete')}
+                    </button>
+                    {selectedIds.size < selectableInboxIds.length && (
+                      <button
+                        type="button"
+                        className={QUIET_LINK_CLASS}
+                        onClick={() => setSelectedIds(new Set(selectableInboxIds))}
+                      >
+                        {t('batch_select_all', { count: selectableInboxIds.length })}
+                      </button>
+                    )}
+                    <button type="button" className={QUIET_LINK_CLASS} onClick={exitBatchMode}>
+                      {t('batch_clear')}
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
+
+            {/* Negative margin + matching padding: lets the hover-revealed
+                checkbox/chevron hang into the page margins without being
+                clipped by the overflow container, while the columns stay
+                flush with the page edges. */}
+            <div className="-mx-5 overflow-x-auto px-5 md:-mx-8 md:px-8">
+              <table className="w-full border-collapse text-[13px]">
+                <thead>
+                  <tr>
+                    <th className={cn(TH_CLASS, 'w-0 !p-0')} aria-hidden="true"></th>
+                    <th className={cn(TH_CLASS, '!pl-0')}>{t('th_date')}</th>
+                    <th className={cn(TH_CLASS, 'w-full')}>{t('th_description')}</th>
+                    <th className={cn(TH_CLASS, 'text-right')}>{t('th_amount')}</th>
+                    <th className={cn(TH_CLASS, 'text-right !pr-0')}>{t('th_status')}</th>
+                  </tr>
+                </thead>
+                <tbody className="stagger-enter">
+                  {inboxItems.map(item =>
+                    item.source === 'bank' ? (
+                      <TransactionInboxCard
+                        key={`bank-${item.data.id}`}
+                        transaction={item.data}
+                        skvCounterpartDate={bankToSkvHints.get(item.data.id)}
+                        processingId={processingId}
+                        isSelected={selectedIds.has(item.data.id)}
+                        isExpanded={expandedTxId === item.data.id}
+                        onToggleExpand={(id) =>
+                          setExpandedTxId((prev) => (prev === id ? null : id))
+                        }
+                        entityType={entityType}
+                        onCategorize={handleCategorize}
+                        onOpenMatchDialog={openMatchDialog}
+                        onOpenMatchInvoicePicker={openInvoiceMatchPicker}
+                        onOpenSplitMatch={openSplitMatchDialog}
+                        onOpenMatchVoucher={openMatchVoucherDialog}
+                        onOpenAttachDocument={openAttachDocumentDialog}
+                        onOpenCategoryDialog={openCategoryDialog}
+                        onDelete={handleDeleteTransaction}
+                        onIgnore={handleIgnoreTransaction}
+                        onEditTitle={openEditTitleDialog}
+                        onToggleSelect={toggleBatchSelect}
+                      />
+                    ) : (
+                      <SkattekontoInboxCard
+                        key={`skv-${item.data.id}`}
+                        row={item.data}
+                        matchSuggestion={item.data.match_suggestion}
+                        processing={skvProcessingId === item.data.id}
+                        onBokfor={handleSkvBokfor}
+                        onMatch={r => setSkvMatchTarget(r)}
+                      />
+                    ),
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
         )
       ) : (
         <TransactionHistoryList
           transactions={transactions}
           skvRows={skvRows}
           searchTerm={searchTerm}
+          sourceFilter={
+            sourceFilter === 'all' || sourceFilter === 'skatteverket' ? sourceFilter : 'bank'
+          }
+          onSourceFilterChange={handleSourceFilterChange}
           jeUnderlagStatus={jeUnderlagStatus}
           onOpenMatchDialog={openMatchDialog}
           onOpenCategoryDialog={openCategoryDialog}
           onOpenAttachDocument={openAttachDocumentDialog}
+          onOpenMatchVoucher={openMatchVoucherDialog}
           onDelete={handleDeleteTransaction}
           onSkvBokfor={handleSkvBokfor}
           onSkvMatch={r => setSkvMatchTarget(r)}
@@ -2045,148 +2538,122 @@ export default function TransactionsPage() {
         />
       )}
 
-      {/* Batch mode floating action bar */}
-      {isBatchMode && selectedIds.size > 0 && (
-        <div className="fixed bottom-20 md:bottom-6 left-1/2 -translate-x-1/2 z-40 flex items-center gap-3 bg-background border rounded-xl shadow-lg px-4 py-3">
-          {batchProgress ? (
-            <>
-              <Badge variant="secondary">
-                {batchProgress.done}/{batchProgress.total}
-              </Badge>
-              <p className="text-sm text-muted-foreground">
-                Bokför {batchProgress.done} av {batchProgress.total}...
-              </p>
-            </>
-          ) : (
-            <>
-              <Badge variant="secondary">{selectedIds.size} valda</Badge>
-              <Button variant="ghost" size="sm" onClick={() => setSelectedIds(new Set())}>
-                <X className="mr-1 h-3 w-3" />
-                Avmarkera
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={handleBatchDelete}
-                className="text-destructive hover:text-destructive"
-              >
-                <Trash2 className="mr-1 h-3 w-3" />
-                Ta bort
-              </Button>
-              {/* Bulk-book (samlingsverifikation) — only when ≥2 selected on
-                  the same date + same direction. Disabled state explains why
-                  via title. */}
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setBulkBookOpen(true)}
-                disabled={!bulkBookEligible}
-                title={
-                  !bulkBookEligible
-                    ? 'Välj minst två transaktioner från samma datum och samma riktning'
-                    : 'Skapa en samlingsverifikation för de valda transaktionerna'
-                }
-              >
-                <Layers className="mr-1 h-3 w-3" />
-                Bokför i klump
-              </Button>
-              <Button size="sm" onClick={() => setShowBatchSelector(true)}>
-                Bokför
-              </Button>
-            </>
-          )}
-        </div>
-      )}
+      {/* Footer status line (concept): honest counter from the visible
+          rows + bank sync status/actions + the Bankavstämning path (the
+          ignore flows point users there). */}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 px-1 text-xs text-muted-foreground">
+        {mode === 'inbox' && (
+          <span className="tabular-nums">{t('footer_to_handle', { count: inboxItems.length })}</span>
+        )}
+        <BankSyncStatusChip />
+        <BankSyncNowButton />
+        <Link
+          href="/reports/bank-reconciliation"
+          className="ml-auto transition-colors duration-150 hover:text-foreground"
+        >
+          Bankavstämning →
+        </Link>
+      </div>
 
       {/* Dialogs */}
-      <BatchCategorySelector
-        open={showBatchSelector}
-        onOpenChange={setShowBatchSelector}
-        selectedCount={selectedIds.size}
-        onSelectCategory={handleBatchCategorize}
-        progress={batchProgress}
-      />
+      {showBatchSelector && (
+        <BatchCategorySelector
+          open
+          onOpenChange={setShowBatchSelector}
+          selectedCount={selectedIds.size}
+          onSelectCategory={handleBatchCategorize}
+          progress={batchProgress}
+        />
+      )}
 
-      <InvoiceMatchDialog
-        open={matchDialogOpen}
-        onOpenChange={setMatchDialogOpen}
-        transaction={selectedTransaction}
-        isConfirming={isConfirmingMatch}
-        onConfirm={handleConfirmInvoiceMatch}
-        onLinkToExisting={handleLinkToExistingVoucher}
-      />
+      {matchDialogOpen && (
+        <InvoiceMatchDialog
+          open
+          onOpenChange={setMatchDialogOpen}
+          transaction={selectedTransaction}
+          isConfirming={isConfirmingMatch}
+          onConfirm={handleConfirmInvoiceMatch}
+          onLinkToExisting={handleLinkToExistingVoucher}
+        />
+      )}
 
-      <MatchVoucherDialog
-        open={matchVoucherTx !== null}
-        onOpenChange={(o) => { if (!o) setMatchVoucherTx(null) }}
-        transaction={matchVoucherTx}
-        onLinked={handleVoucherLinked}
-      />
+      {matchVoucherTx && (
+        <MatchVoucherDialog
+          open
+          onOpenChange={(o) => { if (!o) setMatchVoucherTx(null) }}
+          transaction={matchVoucherTx}
+          onLinked={handleVoucherLinked}
+        />
+      )}
 
-      <MatchAllocationDialog
-        open={splitMatchOpen}
-        onOpenChange={(o) => {
-          setSplitMatchOpen(o)
-          if (!o) setSplitMatchTransaction(null)
-        }}
-        transaction={splitMatchTransaction}
-        onSuccess={handleSplitMatchSuccess}
-      />
+      {splitMatchOpen && (
+        <MatchAllocationDialog
+          open
+          onOpenChange={(o) => {
+            setSplitMatchOpen(o)
+            if (!o) setSplitMatchTransaction(null)
+          }}
+          transaction={splitMatchTransaction}
+          onSuccess={handleSplitMatchSuccess}
+        />
+      )}
 
-      <BulkBookDialog
-        open={bulkBookOpen}
-        onOpenChange={setBulkBookOpen}
-        transactions={selectedTransactions}
-        onSuccess={handleBulkBookSuccess}
-      />
+      {bulkBookOpen && (
+        <BulkBookDialog
+          open
+          onOpenChange={setBulkBookOpen}
+          transactions={selectedTransactions}
+          onSuccess={handleBulkBookSuccess}
+        />
+      )}
 
-      <TransactionBookingDialog
-        open={bookingDialogOpen}
-        onOpenChange={(o) => {
-          setBookingDialogOpen(o)
-          if (!o) setBookingDialogTemplate(null)
-        }}
-        transaction={bookingDialogTransaction}
-        preselectedTemplate={bookingDialogTemplate}
-        onBooked={handleTransactionBooked}
-      />
+      {bookingDialogOpen && (
+        <TransactionBookingDialog
+          open
+          onOpenChange={(o) => {
+            setBookingDialogOpen(o)
+            if (!o) setBookingDialogTemplate(null)
+          }}
+          transaction={bookingDialogTransaction}
+          preselectedTemplate={bookingDialogTemplate}
+          onBooked={handleTransactionBooked}
+        />
+      )}
 
-      <TransactionAttachDocumentDialog
-        open={attachDocTx !== null}
-        onOpenChange={(o) => {
-          if (!o) setAttachDocTx(null)
-        }}
-        transaction={attachDocTx}
-        onAttached={handleDocumentAttached}
-      />
+      {attachDocTx && (
+        <TransactionAttachDocumentDialog
+          open
+          onOpenChange={(o) => {
+            if (!o) setAttachDocTx(null)
+          }}
+          transaction={attachDocTx}
+          onAttached={handleDocumentAttached}
+        />
+      )}
 
-      <Dialog open={templatePickerOpen} onOpenChange={setTemplatePickerOpen}>
-        <DialogContent className="max-w-lg max-h-[85vh] overflow-y-auto">
+      {templatePickerOpen && <Dialog open onOpenChange={setTemplatePickerOpen}>
+        <DialogContent className="max-w-lg max-h-[80vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>Bokför transaktion</DialogTitle>
           </DialogHeader>
           {templatePickerTransaction && (
-            <div className="flex items-center justify-between rounded-lg border px-3 py-2 text-sm">
+            <div className="flex items-center justify-between gap-3 text-sm">
               <span className="truncate text-muted-foreground">{templatePickerTransaction.description}</span>
-              <span className="font-medium tabular-nums flex-shrink-0 ml-3">
+              <span className="font-medium tabular-nums flex-shrink-0">
                 {templatePickerTransaction.amount > 0 ? '+' : ''}{formatCurrency(templatePickerTransaction.amount, templatePickerTransaction.currency)}
               </span>
             </div>
           )}
-          <div className="space-y-1">
-            <Button
-              variant="outline"
-              size="sm"
-              className="w-full justify-start"
-              onClick={handleManualBooking}
-            >
-              Bokför manuellt…
-            </Button>
+          {/* Alternate paths as quiet links (concept vact): the templates are
+              the main content, not three stacked buttons. */}
+          <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
+            <button type="button" className={QUIET_LINK_CLASS} onClick={handleManualBooking}>
+              Bokför manuellt
+            </button>
             {templatePickerTransaction && templatePickerTransaction.amount > 0 && (
-              <Button
-                variant="outline"
-                size="sm"
-                className="w-full justify-start"
+              <button
+                type="button"
+                className={QUIET_LINK_CLASS}
                 onClick={() => {
                   const tx = templatePickerTransaction
                   setTemplatePickerOpen(false)
@@ -2194,18 +2661,17 @@ export default function TransactionsPage() {
                   setInvoicePickerOpen(true)
                 }}
               >
-                Matcha med faktura…
-              </Button>
+                Matcha med faktura
+              </button>
             )}
             {templatePickerTransaction && (
-              <Button
-                variant="ghost"
-                size="sm"
-                className="w-full justify-start text-muted-foreground"
+              <button
+                type="button"
+                className={QUIET_LINK_CLASS}
                 onClick={() => void handleIgnoreTransaction(templatePickerTransaction)}
               >
-                Ignorera transaktionen…
-              </Button>
+                Ignorera transaktionen
+              </button>
             )}
           </div>
           <TemplatePicker
@@ -2221,10 +2687,10 @@ export default function TransactionsPage() {
             onPickLibraryTemplate={handlePickLibraryTemplate}
           />
         </DialogContent>
-      </Dialog>
+      </Dialog>}
 
-      <Dialog
-        open={invoicePickerOpen}
+      {invoicePickerOpen && <Dialog
+        open
         onOpenChange={(open) => {
           if (isMatchingFromPicker) return
           setInvoicePickerOpen(open)
@@ -2251,10 +2717,10 @@ export default function TransactionsPage() {
             </>
           )}
         </DialogContent>
-      </Dialog>
+      </Dialog>}
 
-      <Dialog
-        open={supplierInvoicePickerOpen}
+      {supplierInvoicePickerOpen && <Dialog
+        open
         onOpenChange={(open) => {
           if (isMatchingSupplierFromPicker) return
           setSupplierInvoicePickerOpen(open)
@@ -2281,67 +2747,73 @@ export default function TransactionsPage() {
             </>
           )}
         </DialogContent>
-      </Dialog>
+      </Dialog>}
 
-      <QuickReviewDialog
-        key={quickReview?.transaction.id ?? '' + String(quickReview?.category) + String(quickReview?.templateId) + String(quickReview?.template?.id)}
-        open={quickReviewOpen}
-        onOpenChange={setQuickReviewOpen}
-        transaction={quickReview?.transaction ?? null}
-        category={quickReview?.category ?? null}
-        categoryLabel={quickReview?.label ?? ''}
-        defaultAccount={
-          // For library templates (no templateId but a template object), use the
-          // template's debit account as the default; otherwise fall back to the
-          // category's default account.
-          !quickReview?.templateId && quickReview?.template
-            ? quickReview.template.debit_account
-            : quickReview?.category ? getDefaultAccountForCategory(quickReview.category) : ''
-        }
-        defaultVat={
-          !quickReview?.templateId && quickReview?.template
-            ? (quickReview.template.vat_treatment ?? 'none')
-            : quickReview?.category ? (getDefaultVatTreatmentForCategory(quickReview.category) ?? 'none') : 'none'
-        }
-        entityType={entityType as EntityType}
-        template={quickReview?.template ?? null}
-        templateId={quickReview?.templateId}
-        counterpartyLinePattern={quickReview?.linePattern ?? null}
-        onConfirm={handleQuickReviewConfirm}
-        onChangeTemplate={handleChangeTemplate}
-      />
+      {quickReviewOpen && (
+        <QuickReviewDialog
+          key={quickReview?.transaction.id ?? '' + String(quickReview?.category) + String(quickReview?.templateId) + String(quickReview?.template?.id)}
+          open
+          onOpenChange={setQuickReviewOpen}
+          transaction={quickReview?.transaction ?? null}
+          category={quickReview?.category ?? null}
+          categoryLabel={quickReview?.label ?? ''}
+          defaultAccount={
+            // For library templates (no templateId but a template object), use the
+            // template's debit account as the default; otherwise fall back to the
+            // category's default account.
+            !quickReview?.templateId && quickReview?.template
+              ? quickReview.template.debit_account
+              : quickReview?.category ? getDefaultAccountForCategory(quickReview.category) : ''
+          }
+          defaultVat={
+            !quickReview?.templateId && quickReview?.template
+              ? (quickReview.template.vat_treatment ?? 'none')
+              : quickReview?.category ? (getDefaultVatTreatmentForCategory(quickReview.category) ?? 'none') : 'none'
+          }
+          entityType={entityType as EntityType}
+          template={quickReview?.template ?? null}
+          templateId={quickReview?.templateId}
+          counterpartyLinePattern={quickReview?.linePattern ?? null}
+          onConfirm={handleQuickReviewConfirm}
+          onChangeTemplate={handleChangeTemplate}
+        />
+      )}
 
-      <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
+      {isDialogOpen && <Dialog open onOpenChange={setIsDialogOpen}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>{t('dialog_add_transaction')}</DialogTitle>
           </DialogHeader>
           <TransactionForm onSubmit={handleCreateTransaction} isLoading={isCreating} />
         </DialogContent>
-      </Dialog>
+      </Dialog>}
 
       <DestructiveConfirmDialog {...confirmDialogProps} />
 
-      <EditTransactionTitleDialog
-        open={editTitleTarget !== null}
-        onOpenChange={(v) => {
-          if (!v) setEditTitleTarget(null)
-        }}
-        currentTitle={editTitleTarget?.description ?? ''}
-        originalTitle={editTitleTarget?.original_description ?? null}
-        onSave={handleSaveTitle}
-      />
+      {editTitleTarget && (
+        <EditTransactionTitleDialog
+          open
+          onOpenChange={(v) => {
+            if (!v) setEditTitleTarget(null)
+          }}
+          currentTitle={editTitleTarget.description ?? ''}
+          originalTitle={editTitleTarget.original_description ?? null}
+          onSave={handleSaveTitle}
+        />
+      )}
 
-      <SkattekontoMatchDialog
-        row={skvMatchTarget}
-        open={!!skvMatchTarget}
-        onClose={() => setSkvMatchTarget(null)}
-        onMatched={handleSkvMatched}
-      />
+      {skvMatchTarget && (
+        <SkattekontoMatchDialog
+          row={skvMatchTarget}
+          open
+          onClose={() => setSkvMatchTarget(null)}
+          onMatched={handleSkvMatched}
+        />
+      )}
 
       {/* Prong B: match-against-supplier-invoice suggestion */}
-      <Dialog
-        open={siMatchSuggestion !== null}
+      {siMatchSuggestion && <Dialog
+        open
         onOpenChange={(open) => {
           if (!open) setSiMatchSuggestion(null)
         }}
@@ -2395,11 +2867,11 @@ export default function TransactionsPage() {
             </div>
           </div>
         </DialogContent>
-      </Dialog>
+      </Dialog>}
 
       {/* Prong B (customer side): match-against-customer-invoice suggestion */}
-      <Dialog
-        open={ciMatchSuggestion !== null}
+      {ciMatchSuggestion && <Dialog
+        open
         onOpenChange={(open) => {
           if (!open) setCiMatchSuggestion(null)
         }}
@@ -2420,7 +2892,7 @@ export default function TransactionsPage() {
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="font-medium">
-                        {c.customer_name || 'Kund'} · {c.invoice_number ?? '—'}
+                        {c.customer_name || 'Kund'} · {c.invoice_number ?? '-'}
                       </span>
                       {c.match_reason === 'ocr_exact' && (
                         <Badge variant="success">{t('badge_exact_ocr')}</Badge>
@@ -2458,7 +2930,36 @@ export default function TransactionsPage() {
             </div>
           </div>
         </DialogContent>
-      </Dialog>
+      </Dialog>}
+
+      {duplicateWarning && <DuplicateBookingDialog
+        candidate={duplicateWarning.candidate}
+        processing={duplicateProcessing}
+        onCancel={() => setDuplicateWarning(null)}
+        // Ledger-only candidate (transaction_id null, e.g. a verifikat from an
+        // SIE import): the primary action links the bank line to the existing
+        // voucher instead of double-booking it. Success refreshes the same
+        // state a MatchVoucherDialog link does.
+        matchTransaction={
+          transactions.find((tx) => tx.id === duplicateWarning.transactionId) ?? {
+            id: duplicateWarning.transactionId,
+          }
+        }
+        onMatched={(transactionId, journalEntryId, voucherLabel) => {
+          setDuplicateWarning(null)
+          handleVoucherLinked(transactionId, journalEntryId, voucherLabel)
+        }}
+        onBookAnyway={async () => {
+          const retry = duplicateWarning?.retry
+          setDuplicateProcessing(true)
+          try {
+            setDuplicateWarning(null)
+            if (retry) await retry()
+          } finally {
+            setDuplicateProcessing(false)
+          }
+        }}
+      />}
 
     </div>
   )

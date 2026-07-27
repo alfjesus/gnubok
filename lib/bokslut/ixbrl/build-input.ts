@@ -4,7 +4,7 @@
  * Reuses the same sources as the PDF builder (buildArsredovisningData) for
  * narrative texts, noter and flerårsöversikt, and adds what iXBRL needs on
  * top: trial balances for BOTH years mapped to risbs concepts
- * (jämförelsesiffror — kontrollera 3006/3007), per-signer dates from the
+ * (jämförelsesiffror: kontrollera 3006/3007), per-signer dates from the
  * signature flow, and the fastställelseintyg undertecknare.
  */
 
@@ -22,8 +22,9 @@ import type {
   IxbrlSigner,
   Resultatdisposition,
 } from './types'
+import type { ArsredovisningData } from '@/lib/bokslut/arsredovisning/types'
 
-/** TA §4.3.4–4.3.5: "<leverantör> - <produkt>", version "<huvud>.<revision>". */
+/** TA §4.3.4-4.3.5: "<leverantör> - <produkt>", version "<huvud>.<revision>". */
 export const PROGRAMVARA_NAMN = 'Accounted - Accounted'
 export const PROGRAMVARA_VERSION = '2026.1'
 
@@ -35,6 +36,10 @@ export interface BuildIxbrlOptions {
   proposedDividend?: number
   /** Override "today" for deterministic tests (ISO date). */
   todayIso?: string
+  /** Reuse a canonical report instance so PDF and iXBRL cannot diverge. */
+  reportData?: ArsredovisningData
+  /** Reuse the version-bound signer roster when a canonical model is built. */
+  signatureRequests?: Awaited<ReturnType<typeof listSignatureRequests>>
 }
 
 function splitName(fullName: string): { firstName: string; lastName: string } {
@@ -52,14 +57,14 @@ export async function buildIxbrlInput(
   const warnings: string[] = []
 
   // Two TB variants per year (see TrialBalancePair): the FULL trial balance
-  // (year-end closing included → 2099 booked, class 3–8 zeroed) drives the
-  // BR; the PRE-CLOSING trial balance (excludeYearEndClosing — the same split
-  // lib/reports' generateIncomeStatement uses) drives the RR. A single TB can
+  // (year-end closing included → 2099 booked, class 3-8 zeroed) drives the
+  // BR; the PRE-CLOSING trial balance (excludeFinalClosingEntry) drives the
+  // RR while retaining tax and appropriations. A single TB can
   // never serve both: with bokslut booked every RR concept would map to 0,
   // without it the BR would not tie.
   const [pdfData, periodRow, currentTbFull, currentTbPreClosing, signatureRequests] =
     await Promise.all([
-      buildArsredovisningData(supabase, companyId, fiscalPeriodId),
+      options.reportData ?? buildArsredovisningData(supabase, companyId, fiscalPeriodId),
       supabase
         .from('fiscal_periods')
         .select('id, period_start, period_end, previous_period_id')
@@ -67,8 +72,8 @@ export async function buildIxbrlInput(
         .eq('company_id', companyId)
         .single(),
       generateTrialBalance(supabase, companyId, fiscalPeriodId),
-      generateTrialBalance(supabase, companyId, fiscalPeriodId, { excludeYearEndClosing: true }),
-      listSignatureRequests(supabase, companyId, fiscalPeriodId),
+      generateTrialBalance(supabase, companyId, fiscalPeriodId, { excludeFinalClosingEntry: true }),
+      options.signatureRequests ?? listSignatureRequests(supabase, companyId, fiscalPeriodId),
     ])
 
   if (periodRow.error || !periodRow.data) throw new Error('Fiscal period not found')
@@ -76,7 +81,7 @@ export async function buildIxbrlInput(
 
   if (pdfData.accounting_framework !== 'k2') {
     throw new Error(
-      'Digital inlämning stöds ännu inte för K3 — generera PDF eller vänta på K3-stödet.',
+      'Digital inlämning stöds ännu inte för K3: generera PDF eller vänta på K3-stödet.',
     )
   }
   const entryPoint = resolveEntryPoint('k2')
@@ -97,12 +102,12 @@ export async function buildIxbrlInput(
       try {
         const [prevFull, prevPreClosing] = await Promise.all([
           generateTrialBalance(supabase, companyId, prev.id),
-          generateTrialBalance(supabase, companyId, prev.id, { excludeYearEndClosing: true }),
+          generateTrialBalance(supabase, companyId, prev.id, { excludeFinalClosingEntry: true }),
         ])
         previousTb = { full: prevFull.rows, preClosing: prevPreClosing.rows }
       } catch {
         warnings.push(
-          'Jämförelsesiffror kunde inte hämtas för föregående räkenskapsår — balans- och resultaträkning visas utan jämförelseår (kontrollera-kod 3006/3007 kan utlösas).',
+          'Jämförelsesiffror kunde inte hämtas för föregående räkenskapsår: balans- och resultaträkning visas utan jämförelseår (kontrollera-kod 3006/3007 kan utlösas).',
         )
         previousPeriod = null
       }
@@ -142,7 +147,7 @@ export async function buildIxbrlInput(
     })
     flerarsPerioder.push({ start: match.period_start, end: match.period_end })
   }
-  // Column 0 must be the current period and column 1 the previous one —
+  // Column 0 must be the current period and column 1 the previous one:
   // the document reuses period0/period1 contexts for them. Anything else
   // (e.g. a missed periodByName lookup shifting the rows) means the period
   // chain is inconsistent; drop the table rather than tag amounts against
@@ -154,7 +159,7 @@ export async function buildIxbrlInput(
       flerarsPerioder[1].start !== previousPeriod.start)
   if (flerarsMisaligned) {
     warnings.push(
-      'Flerårsöversikten kunde inte knytas till räkenskapsperioderna — tabellen utelämnas ur iXBRL-dokumentet.',
+      'Flerårsöversikten kunde inte knytas till räkenskapsperioderna: tabellen utelämnas ur iXBRL-dokumentet.',
     )
     flerarsoversikt.length = 0
     flerarsPerioder.length = 0
@@ -164,7 +169,7 @@ export async function buildIxbrlInput(
   // (period0/period1) as the RR, and repeated facts must be value-identical
   // or Bolagsverket rejects the filing. The PDF rows are computed from the
   // income statement (ALL class-3 revenue), while nettoomsättning per ÅRL is
-  // strictly 3000–3799 — so the current and previous year columns are
+  // strictly 3000-3799: so the current and previous year columns are
   // overridden with the mapper outputs. Older years have no RR facts and
   // keep the PDF values.
   if (flerarsoversikt.length > 0) {
@@ -223,14 +228,20 @@ export async function buildIxbrlInput(
 
   // ---- resultatdisposition --------------------------------------------------
   // BalanseratResultat is tagged in BR and the eget kapital-table for the
-  // same context — the disposition row must carry the identical value
+  // same context: the disposition row must carry the identical value
   // (TA §2.7.3), so fri överkursfond (2097) is its own row tagged with the
   // separate Overkursfond concept instead of being folded into balanserat.
-  const proposedDividend = Math.max(0, Math.round(options.proposedDividend ?? 0))
-  const dispBalanserat = br['BalanseratResultat']?.current ?? 0
-  const dispOverkursfond = br['Overkursfond']?.current ?? 0
-  const dispArets = br['AretsResultatEgetKapital']?.current ?? 0
-  const dispSumma = mapping.totals.frittEgetKapital.current
+  const proposedDividend = Math.max(
+    0,
+    Math.round(
+      options.proposedDividend ?? pdfData.forvaltningsberattelse.proposed_dividend,
+    ),
+  )
+  const dispositionAmounts = pdfData.forvaltningsberattelse.resultatdisposition_amounts
+  const dispBalanserat = dispositionAmounts.retained_earnings
+  const dispOverkursfond = dispositionAmounts.share_premium_reserve
+  const dispArets = dispositionAmounts.current_year_result
+  const dispSumma = dispositionAmounts.total
   if (proposedDividend > dispSumma) {
     warnings.push(
       `Föreslagen utdelning (${proposedDividend} kr) överstiger fritt eget kapital (${dispSumma} kr).`,
@@ -247,14 +258,17 @@ export async function buildIxbrlInput(
   }
 
   // ---- underskrifter ---------------------------------------------------------
-  // Every signature request becomes a signer row (the board must appear in
-  // the document), but ONLY actually-signed requests get a date — an unsigned
+  // Every active signature request becomes a signer row (the board must appear
+  // in the document), but ONLY actually-signed requests get a date: an unsigned
   // request keeps signedDate null. Legal dates are never fabricated: the
   // missing date renders as an omitted fact in the preview and preflight 1214
   // blocks the submission path until everyone has signed.
-  const signedRequests = signatureRequests.filter((request) => request.status === 'signed')
+  const activeSignatureRequests = signatureRequests.filter(
+    (request) => request.status !== 'declined',
+  )
+  const signedRequests = activeSignatureRequests.filter((request) => request.status === 'signed')
   const today = options.todayIso ?? new Date().toISOString().slice(0, 10)
-  const signers: IxbrlSigner[] = signatureRequests.map((request) => {
+  const signers: IxbrlSigner[] = activeSignatureRequests.map((request) => {
     const { firstName, lastName } = splitName(request.signer_name)
     return {
       firstName,
@@ -265,10 +279,10 @@ export async function buildIxbrlInput(
   })
   if (signers.length === 0) {
     warnings.push(
-      'Inga underskrifter är registrerade — årsredovisningen måste skrivas under av styrelsen (och ev. VD) innan inlämning (kontrollera-kod 1107/1201).',
+      'Inga underskrifter är registrerade: årsredovisningen måste skrivas under av styrelsen (och ev. VD) innan inlämning (kontrollera-kod 1107/1201).',
     )
   }
-  if (signedRequests.length !== signatureRequests.length) {
+  if (signedRequests.length !== activeSignatureRequests.length) {
     warnings.push('Alla underskriftsförfrågningar är inte signerade ännu.')
   }
   const harVd = signers.some((signer) => /verkställande direktör|^vd$/i.test(signer.role ?? ''))
@@ -281,14 +295,19 @@ export async function buildIxbrlInput(
   )
 
   // ---- fastställelseintyg ----------------------------------------------------
-  // A missing AGM date is NEVER replaced with today's date — it stays null,
+  // A missing AGM date is NEVER replaced with today's date: it stays null,
   // the document renders a placeholder and preflight 1103 blocks filing
   // (mirrors Bolagsverket kontrollera 1103).
   const agmDate = pdfData.forvaltningsberattelse.agm_date
   if (!agmDate) {
     warnings.push(
-      'Datum för årsstämma saknas — fastställelseintyget kan inte fyllas i (kontrollera-kod 1103).',
+      'Datum för årsstämma saknas: fastställelseintyget kan inte fyllas i (kontrollera-kod 1103).',
     )
+  }
+  const agmDispositionOutcome = pdfData.forvaltningsberattelse.agm_disposition_outcome
+  const agmDispositionDecision = pdfData.forvaltningsberattelse.agm_disposition_decision
+  if (!agmDispositionOutcome) {
+    warnings.push('Årsstämmans beslut om resultatdisposition saknas i fastställelseintyget.')
   }
   const fallbackSigner = signers[0] ?? { firstName: '', lastName: '', role: null }
   const undertecknare = options.undertecknare ?? {
@@ -352,6 +371,26 @@ export async function buildIxbrlInput(
       resultatdisposition,
     },
     noter: pdfData.noter.map((note) => ({ number: note.number, title: note.title, body: note.body })),
+    disclosures: {
+      longTermDebtOverFiveYears:
+        pdfData.disclosures.long_term_debt_over_five_years ?? 0,
+      securitiesPledged: pdfData.disclosures.securities_pledged?.trim() || 'Inga.',
+      contingentLiabilities:
+        pdfData.disclosures.contingent_liabilities?.trim() || 'Inga.',
+      parentCompany: pdfData.disclosures.parent_company_name
+        ? [
+            `Moderföretag: ${pdfData.disclosures.parent_company_name}.`,
+            pdfData.disclosures.parent_company_org_number
+              ? `Organisationsnummer: ${pdfData.disclosures.parent_company_org_number}.`
+              : '',
+            pdfData.disclosures.parent_company_city
+              ? `Säte: ${pdfData.disclosures.parent_company_city}.`
+              : '',
+          ]
+            .filter(Boolean)
+            .join(' ')
+        : null,
+    },
     medelantalAnstallda,
     underskrifter: {
       ort: pdfData.company.city ?? '',
@@ -361,6 +400,8 @@ export async function buildIxbrlInput(
     },
     faststallelseintyg: {
       arsstammaDatum: agmDate ?? null,
+      resultatdispositionOutcome: agmDispositionOutcome,
+      resultatdispositionDecision: agmDispositionDecision,
       signerFirstName: undertecknare.firstName,
       signerLastName: undertecknare.lastName,
       signerRole: undertecknare.role,
@@ -368,7 +409,9 @@ export async function buildIxbrlInput(
     },
     programvara: { namn: PROGRAMVARA_NAMN, version: PROGRAMVARA_VERSION },
     entryPointId: entryPoint.id,
-    warnings: [...pdfData.warnings, ...warnings],
+    // Dedupe: buildArsredovisningData now runs the same K2 mapping for the
+    // PDF statements, so its warnings overlap with the ones produced here.
+    warnings: Array.from(new Set([...pdfData.warnings, ...warnings])),
   }
 }
 

@@ -10,7 +10,7 @@
  *     entry has been linked.
  *   - The depreciation_schedules delete RLS policy refuses to delete rows
  *     that have a journal_entry_id set (posted) but allows it before posting.
- *   - RLS scopes both tables to user_company_ids() — a user in company A
+ *   - RLS scopes both tables to user_company_ids(): a user in company A
  *     cannot see / edit company B's rows.
  */
 import { describe, it, expect, beforeAll } from 'vitest'
@@ -122,7 +122,7 @@ beforeAll(async () => {
   }
 })
 
-describe('assets table — immutability after disposal', () => {
+describe('assets table: immutability after disposal', () => {
   it('allows changing notes/name on a disposed asset', async () => {
     const assetId = await insertAsset({
       userId: companyA.userId,
@@ -198,16 +198,26 @@ describe('assets table — immutability after disposal', () => {
       userId: companyA.userId,
       companyId: companyA.companyId,
     })
+    // acquisition_date is included here because the asset-edit feature lets
+    // users correct it before depreciation is booked: the immutability
+    // trigger must NOT block it on a non-disposed asset.
     await getPool().query(
-      `UPDATE public.assets SET acquisition_cost = 70000, useful_life_months = 72 WHERE id = $1`,
+      `UPDATE public.assets
+         SET acquisition_cost = 70000, useful_life_months = 72,
+             acquisition_date = '2025-08-15', category = 'computer'
+       WHERE id = $1`,
       [assetId],
     )
     const { rows } = await getPool().query(
-      `SELECT acquisition_cost, useful_life_months FROM public.assets WHERE id = $1`,
+      `SELECT acquisition_cost, useful_life_months,
+              acquisition_date::text AS acquisition_date, category
+         FROM public.assets WHERE id = $1`,
       [assetId],
     )
     expect(Number(rows[0]?.acquisition_cost)).toBe(70_000)
     expect(rows[0]?.useful_life_months).toBe(72)
+    expect(rows[0]?.acquisition_date).toBe('2025-08-15')
+    expect(rows[0]?.category).toBe('computer')
   })
 
   it('disposal CHECK requires both disposed_at and disposed_proceeds', async () => {
@@ -222,7 +232,7 @@ describe('assets table — immutability after disposal', () => {
   })
 })
 
-describe('depreciation_schedules — immutability after posting', () => {
+describe('depreciation_schedules: immutability after posting', () => {
   it('blocks planned_depreciation edits once a journal entry is linked', async () => {
     const assetId = await insertAsset({
       userId: companyA.userId,
@@ -272,7 +282,7 @@ describe('depreciation_schedules — immutability after posting', () => {
   })
 })
 
-describe('depreciation_schedules — delete RLS policy', () => {
+describe('depreciation_schedules: delete RLS policy', () => {
   it('user can DELETE a draft schedule (no journal_entry_id)', async () => {
     const assetId = await insertAsset({
       userId: companyA.userId,
@@ -312,7 +322,7 @@ describe('depreciation_schedules — delete RLS policy', () => {
       fiscalPeriodId: companyA.fiscalPeriodId,
       journalEntryId: entryId,
     })
-    // RLS-filtered DELETE returns 0 affected rows rather than raising — the
+    // RLS-filtered DELETE returns 0 affected rows rather than raising: the
     // row is invisible to the DELETE statement under the authenticated role.
     const deletedCount = await withUserContext(companyA.userId, async (client) => {
       const result = await client.query(
@@ -331,7 +341,7 @@ describe('depreciation_schedules — delete RLS policy', () => {
   })
 })
 
-describe('RLS — cross-company isolation', () => {
+describe('RLS: cross-company isolation', () => {
   it('company A user cannot SELECT company B assets', async () => {
     const bAssetId = await insertAsset({
       userId: companyB.userId,
@@ -384,7 +394,7 @@ describe('RLS — cross-company isolation', () => {
 // The columns are populated by disposeAsset() after the journal entry posts;
 // these pg tests cover the CHECK constraints directly so future schema changes
 // can't loosen them without us noticing.
-describe('assets — disposal VAT + jämkning constraints', () => {
+describe('assets: disposal VAT + jämkning constraints', () => {
   it('accepts a disposed_vat_treatment from the allowed enum', async () => {
     const assetId = await insertAsset({
       userId: companyA.userId,
@@ -446,7 +456,7 @@ describe('assets — disposal VAT + jämkning constraints', () => {
       disposedAt: '2025-12-31',
       disposedProceeds: 50_000,
     })
-    // Default values from the migration — should already pass on insert.
+    // Default values from the migration: should already pass on insert.
     const { rows } = await getPool().query(
       `SELECT disposed_proceeds_vat, disposed_vat_treatment FROM public.assets WHERE id = $1`,
       [assetId],

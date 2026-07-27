@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { validateBalance, getSwedishLocalDate, createDraftEntry, reverseEntry } from '../engine'
-import { BookkeepingDatabaseError, AccountsNotInChartError } from '../errors'
+import { BookkeepingDatabaseError, AccountsNotInChartError, CannotReverseStornoError } from '../errors'
 import type { CreateJournalEntryLineInput, JournalEntryStatus } from '@/types'
 
 // Mock Supabase client for createDraftEntry/reverseEntry tests
@@ -26,7 +26,7 @@ vi.mock('@/lib/events', () => ({
   eventBus: { emit: vi.fn().mockResolvedValue([]) },
 }))
 
-// Mock the on-demand BAS backfill — default: nothing seedable. Individual
+// Mock the on-demand BAS backfill, default: nothing seedable. Individual
 // tests override per scenario.
 const mockBackfill = vi.fn().mockResolvedValue([])
 vi.mock('@/lib/bookkeeping/account-backfill', () => ({
@@ -107,7 +107,7 @@ describe('getSwedishLocalDate', () => {
   })
 })
 
-describe('createDraftEntry — cancelled status on line-insert failure', () => {
+describe('createDraftEntry: cancelled status on line-insert failure', () => {
   it('sets status to cancelled (not delete) when line insert fails', async () => {
     const updateMock = vi.fn().mockReturnValue({ eq: vi.fn().mockResolvedValue({ error: null }) })
 
@@ -182,7 +182,7 @@ describe('createDraftEntry — cancelled status on line-insert failure', () => {
   })
 })
 
-describe('createDraftEntry — date/period cross-validation', () => {
+describe('createDraftEntry: date/period cross-validation', () => {
   function buildSupabase(periodData: { name: string; period_start: string; period_end: string } | null) {
     return {
       from: vi.fn().mockImplementation((table: string) => {
@@ -362,7 +362,7 @@ describe('JournalEntryStatus type includes cancelled', () => {
   })
 })
 
-describe('createDraftEntry — on-demand BAS account backfill', () => {
+describe('createDraftEntry: on-demand BAS account backfill', () => {
   // Engine seeds standard BAS accounts missing from the chart instead of
   // failing (June 2026 incident: 3740 öresavrundning missing → payment
   // voucher dead end). Non-seedable numbers still throw.
@@ -481,5 +481,460 @@ describe('createDraftEntry — on-demand BAS account backfill', () => {
     ).rejects.toThrow(AccountsNotInChartError)
 
     expect(mockBackfill).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('reverseEntry: entry_date defaults to original entry date', () => {
+  it('uses original entry_date when no reversalDate is provided', async () => {
+    const original = {
+      id: 'entry-1',
+      company_id: 'company-1',
+      status: 'posted',
+      fiscal_period_id: 'period-1',
+      voucher_series: 'A',
+      voucher_number: 3,
+      entry_date: '2024-11-15',
+      description: 'Hyra november',
+      source_type: 'manual',
+      source_id: null,
+      lines: [
+        { account_number: '5010', debit_amount: 10000, credit_amount: 0 },
+        { account_number: '1930', debit_amount: 0, credit_amount: 10000 },
+      ],
+    }
+    const reversal = { id: 'reversal-1', reverses_id: 'entry-1' }
+
+    let jeCall = 0
+    const jeResults = [
+      { data: original, error: null },
+      { data: reversal, error: null },
+      { data: null, error: null },
+      { data: [{ id: 'entry-1' }], error: null },
+      { data: { ...reversal, lines: [] }, error: null },
+    ]
+
+    let insertedEntryDate: string | undefined
+    function jeBuilder() {
+      const b: Record<string, unknown> = {}
+      for (const m of ['select', 'eq', 'in', 'update']) b[m] = vi.fn().mockReturnValue(b)
+      b.insert = vi.fn().mockImplementation((payload: unknown) => {
+        const p = payload as Record<string, unknown>
+        if (p.entry_date !== undefined) insertedEntryDate = p.entry_date as string
+        return b
+      })
+      b.single = vi.fn().mockImplementation(async () => jeResults[jeCall++])
+      b.then = (resolve: (v: unknown) => void) => resolve(jeResults[jeCall++])
+      return b
+    }
+
+    const supabase = {
+      rpc: vi.fn().mockResolvedValue({ data: 4, error: null }),
+      from: vi.fn().mockImplementation((table: string) => {
+        if (table === 'journal_entries') return jeBuilder()
+        if (table === 'chart_of_accounts') {
+          const b: Record<string, unknown> = {}
+          for (const m of ['select', 'eq', 'in']) b[m] = vi.fn().mockReturnValue(b)
+          b.then = (resolve: (v: unknown) => void) =>
+            resolve({ data: [{ id: 'acc-5010', account_number: '5010' }, { id: 'acc-1930', account_number: '1930' }], error: null })
+          return b
+        }
+        if (table === 'journal_entry_lines') return { insert: vi.fn().mockResolvedValue({ error: null }) }
+        return createMockChain()
+      }),
+    }
+
+    await reverseEntry(supabase as never, 'company-1', 'user-1', 'entry-1')
+
+    expect(insertedEntryDate).toBe('2024-11-15')
+  })
+
+  it('uses explicit reversalDate when provided', async () => {
+    const original = {
+      id: 'entry-1',
+      company_id: 'company-1',
+      status: 'posted',
+      fiscal_period_id: 'period-1',
+      voucher_series: 'A',
+      voucher_number: 3,
+      entry_date: '2024-11-15',
+      description: 'Hyra november',
+      source_type: 'manual',
+      source_id: null,
+      lines: [
+        { account_number: '5010', debit_amount: 10000, credit_amount: 0 },
+        { account_number: '1930', debit_amount: 0, credit_amount: 10000 },
+      ],
+    }
+    const reversal = { id: 'reversal-1', reverses_id: 'entry-1' }
+
+    let jeCall = 0
+    const jeResults = [
+      { data: original, error: null },
+      { data: reversal, error: null },
+      { data: null, error: null },
+      { data: [{ id: 'entry-1' }], error: null },
+      { data: { ...reversal, lines: [] }, error: null },
+    ]
+
+    let insertedEntryDate: string | undefined
+    function jeBuilder() {
+      const b: Record<string, unknown> = {}
+      for (const m of ['select', 'eq', 'in', 'update']) b[m] = vi.fn().mockReturnValue(b)
+      b.insert = vi.fn().mockImplementation((payload: unknown) => {
+        const p = payload as Record<string, unknown>
+        if (p.entry_date !== undefined) insertedEntryDate = p.entry_date as string
+        return b
+      })
+      b.single = vi.fn().mockImplementation(async () => jeResults[jeCall++])
+      b.then = (resolve: (v: unknown) => void) => resolve(jeResults[jeCall++])
+      return b
+    }
+
+    const supabase = {
+      rpc: vi.fn().mockResolvedValue({ data: 4, error: null }),
+      from: vi.fn().mockImplementation((table: string) => {
+        if (table === 'journal_entries') return jeBuilder()
+        if (table === 'chart_of_accounts') {
+          const b: Record<string, unknown> = {}
+          for (const m of ['select', 'eq', 'in']) b[m] = vi.fn().mockReturnValue(b)
+          b.then = (resolve: (v: unknown) => void) =>
+            resolve({ data: [{ id: 'acc-5010', account_number: '5010' }, { id: 'acc-1930', account_number: '1930' }], error: null })
+          return b
+        }
+        if (table === 'journal_entry_lines') return { insert: vi.fn().mockResolvedValue({ error: null }) }
+        return createMockChain()
+      }),
+    }
+
+    await reverseEntry(supabase as never, 'company-1', 'user-1', 'entry-1', '2025-01-01')
+
+    expect(insertedEntryDate).toBe('2025-01-01')
+  })
+})
+
+describe('reverseEntry: storno guard', () => {
+  // BFL 5 kap 5§: a storno-of-a-storno makes the original verifikat's
+  // cancellation chain ambiguous, so stornos are never reversible. A
+  // correction entry, by contrast, is a regular live verifikation (it can be
+  // a duplicate of an affärshändelse booked by another verifikat) and must
+  // stay reversible: the guard covers 'storno' only.
+  function supabaseReturningOriginal(original: Record<string, unknown>) {
+    return {
+      rpc: vi.fn(),
+      from: vi.fn().mockImplementation((table: string) => {
+        if (table === 'journal_entries') {
+          const b: Record<string, unknown> = {}
+          for (const m of ['select', 'eq', 'in', 'update', 'insert']) b[m] = vi.fn().mockReturnValue(b)
+          b.single = vi.fn().mockResolvedValue({ data: original, error: null })
+          return b
+        }
+        return createMockChain()
+      }),
+    }
+  }
+
+  it(`throws CannotReverseStornoError for source_type 'storno'`, async () => {
+    const original = {
+      id: 'entry-1',
+      company_id: 'company-1',
+      status: 'posted',
+      fiscal_period_id: 'period-1',
+      voucher_series: 'A',
+      voucher_number: 3,
+      entry_date: '2024-11-15',
+      description: 'Makulering: Hyra november',
+      source_type: 'storno',
+      source_id: null,
+      lines: [
+        { account_number: '1930', debit_amount: 10000, credit_amount: 0 },
+        { account_number: '5010', debit_amount: 0, credit_amount: 10000 },
+      ],
+    }
+    const supabase = supabaseReturningOriginal(original)
+
+    await expect(
+      reverseEntry(supabase as never, 'company-1', 'user-1', 'entry-1'),
+    ).rejects.toBeInstanceOf(CannotReverseStornoError)
+
+    // No reversal was written: the guard fires before any voucher number is drawn.
+    expect(supabase.rpc).not.toHaveBeenCalled()
+  })
+
+  it(`reverses a correction entry like any regular verifikat`, async () => {
+    // A rättelseverifikation that turned out to duplicate another booking
+    // (support case 2026-07-26) is nullified with a normal storno; the
+    // correction_of_id link keeps the chain traceable.
+    const original = {
+      id: 'entry-1',
+      company_id: 'company-1',
+      status: 'posted',
+      fiscal_period_id: 'period-1',
+      voucher_series: 'A',
+      voucher_number: 3,
+      entry_date: '2024-11-15',
+      description: 'Rättelse: Hyra november',
+      source_type: 'correction',
+      source_id: null,
+      correction_of_id: 'entry-0',
+      lines: [
+        { account_number: '5010', debit_amount: 10000, credit_amount: 0 },
+        { account_number: '1930', debit_amount: 0, credit_amount: 10000 },
+      ],
+    }
+    const reversal = { id: 'reversal-1', reverses_id: 'entry-1' }
+
+    let jeCall = 0
+    const jeResults = [
+      { data: original, error: null },
+      { data: reversal, error: null },
+      { data: null, error: null },
+      { data: [{ id: 'entry-1' }], error: null },
+      { data: { ...reversal, lines: [] }, error: null },
+    ]
+
+    let insertedEntry: Record<string, unknown> | undefined
+    function jeBuilder() {
+      const b: Record<string, unknown> = {}
+      for (const m of ['select', 'eq', 'in', 'update']) b[m] = vi.fn().mockReturnValue(b)
+      b.insert = vi.fn().mockImplementation((payload: unknown) => {
+        insertedEntry = payload as Record<string, unknown>
+        return b
+      })
+      b.single = vi.fn().mockImplementation(async () => jeResults[jeCall++])
+      b.then = (resolve: (v: unknown) => void) => resolve(jeResults[jeCall++])
+      return b
+    }
+
+    const supabase = {
+      rpc: vi.fn().mockResolvedValue({ data: 4, error: null }),
+      from: vi.fn().mockImplementation((table: string) => {
+        if (table === 'journal_entries') return jeBuilder()
+        if (table === 'chart_of_accounts') {
+          const b: Record<string, unknown> = {}
+          for (const m of ['select', 'eq', 'in']) b[m] = vi.fn().mockReturnValue(b)
+          b.then = (resolve: (v: unknown) => void) =>
+            resolve({ data: [{ id: 'acc-5010', account_number: '5010' }, { id: 'acc-1930', account_number: '1930' }], error: null })
+          return b
+        }
+        if (table === 'journal_entry_lines') return { insert: vi.fn().mockResolvedValue({ error: null }) }
+        return createMockChain()
+      }),
+    }
+
+    await reverseEntry(supabase as never, 'company-1', 'user-1', 'entry-1')
+
+    expect(insertedEntry).toBeDefined()
+    expect(insertedEntry!.source_type).toBe('storno')
+    expect(insertedEntry!.reverses_id).toBe('entry-1')
+    expect(insertedEntry!.description).toBe('Makulering: Rättelse: Hyra november')
+  })
+})
+
+describe('reverseEntry: bank transaction unlink', () => {
+  // After a reversal the booked bank transaction must return to "Att bokföra"
+  // (journal_entry_id cleared) so the user can book it again. The agent paths
+  // in lib/pending-operations/commit.ts did this manually; the engine now owns
+  // it so the dashboard reverse route behaves the same.
+  it('clears transactions.journal_entry_id for rows booked by the reversed entry', async () => {
+    const original = {
+      id: 'entry-1',
+      company_id: 'company-1',
+      status: 'posted',
+      fiscal_period_id: 'period-1',
+      voucher_series: 'A',
+      voucher_number: 7,
+      entry_date: '2026-02-02',
+      description: 'ALMI AB - Innovationslån',
+      source_type: 'manual',
+      source_id: null,
+      lines: [
+        { account_number: '1930', debit_amount: 1000, credit_amount: 0 },
+        { account_number: '2350', debit_amount: 0, credit_amount: 1000 },
+      ],
+    }
+    const reversal = { id: 'reversal-1', reverses_id: 'entry-1', source_type: 'storno' }
+
+    let jeCall = 0
+    const jeResults = [
+      { data: original, error: null },                   // fetch original (.single)
+      { data: reversal, error: null },                   // insert reversal (.single)
+      { data: null, error: null },                       // post reversal (await)
+      { data: [{ id: 'entry-1' }], error: null },        // CAS original → reversed (await)
+      { data: { ...reversal, lines: [] }, error: null }, // fetch complete (.single)
+    ]
+    function jeBuilder() {
+      const b: Record<string, unknown> = {}
+      for (const m of ['select', 'eq', 'in', 'update', 'insert']) {
+        b[m] = vi.fn().mockReturnValue(b)
+      }
+      b.single = vi.fn().mockImplementation(async () => jeResults[jeCall++])
+      b.then = (resolve: (v: unknown) => void) => resolve(jeResults[jeCall++])
+      return b
+    }
+
+    const txUpdatePayloads: unknown[] = []
+    const txFilters: Record<string, unknown> = {}
+
+    const supabase = {
+      rpc: vi.fn().mockResolvedValue({ data: 8, error: null }),
+      from: vi.fn().mockImplementation((table: string) => {
+        if (table === 'journal_entries') return jeBuilder()
+        if (table === 'chart_of_accounts') {
+          const b: Record<string, unknown> = {}
+          for (const m of ['select', 'eq', 'in']) b[m] = vi.fn().mockReturnValue(b)
+          b.then = (resolve: (v: unknown) => void) =>
+            resolve({
+              data: [
+                { id: 'acc-1930', account_number: '1930' },
+                { id: 'acc-2350', account_number: '2350' },
+              ],
+              error: null,
+            })
+          return b
+        }
+        if (table === 'journal_entry_lines') {
+          return { insert: vi.fn().mockResolvedValue({ error: null }) }
+        }
+        if (table === 'transactions') {
+          const b: Record<string, unknown> = {}
+          b.update = vi.fn().mockImplementation((payload: unknown) => {
+            txUpdatePayloads.push(payload)
+            return b
+          })
+          b.eq = vi.fn().mockImplementation((col: string, val: unknown) => {
+            txFilters[col] = val
+            return b
+          })
+          b.then = (resolve: (v: unknown) => void) => resolve({ error: null })
+          return b
+        }
+        return createMockChain()
+      }),
+    }
+
+    const result = await reverseEntry(supabase as never, 'company-1', 'user-1', 'entry-1')
+
+    expect(result.id).toBe('reversal-1')
+    expect(txUpdatePayloads).toEqual([{ journal_entry_id: null }])
+    expect(txFilters).toMatchObject({ company_id: 'company-1', journal_entry_id: 'entry-1' })
+  })
+})
+
+describe('reverseEntry: opening balance unlink', () => {
+  // Reversing a period's IB verifikat must also drop the period's pointer to
+  // it. getOpeningBalances() reads the linked entry's lines with no status
+  // filter, so a still-linked cancelled IB keeps showing in the Balansrapport,
+  // and year-end refuses to run while the pointer is non-null: the storno its
+  // own error message asks for could never satisfy it. See engine.pg.test.ts
+  // for why the flag must fall before the pointer.
+  function buildSupabase(sourceType: string) {
+    const original = {
+      id: 'entry-1',
+      company_id: 'company-1',
+      status: 'posted',
+      fiscal_period_id: 'period-1',
+      voucher_series: 'A',
+      voucher_number: 1,
+      entry_date: '2026-01-01',
+      description: 'Ingående balanser från SIE-import',
+      source_type: sourceType,
+      source_id: null,
+      lines: [
+        { account_number: '1930', debit_amount: 1000, credit_amount: 0 },
+        { account_number: '2350', debit_amount: 0, credit_amount: 1000 },
+      ],
+    }
+    const reversal = { id: 'reversal-1', reverses_id: 'entry-1', source_type: 'storno' }
+
+    let jeCall = 0
+    const jeResults = [
+      { data: original, error: null },
+      { data: reversal, error: null },
+      { data: null, error: null },
+      { data: [{ id: 'entry-1' }], error: null },
+      { data: { ...reversal, lines: [] }, error: null },
+    ]
+    function jeBuilder() {
+      const b: Record<string, unknown> = {}
+      for (const m of ['select', 'eq', 'in', 'update', 'insert']) {
+        b[m] = vi.fn().mockReturnValue(b)
+      }
+      b.single = vi.fn().mockImplementation(async () => jeResults[jeCall++])
+      b.then = (resolve: (v: unknown) => void) => resolve(jeResults[jeCall++])
+      return b
+    }
+
+    const fpUpdates: unknown[] = []
+    const fpFilters: Record<string, unknown>[] = []
+
+    const supabase = {
+      rpc: vi.fn().mockResolvedValue({ data: 2, error: null }),
+      from: vi.fn().mockImplementation((table: string) => {
+        if (table === 'journal_entries') return jeBuilder()
+        if (table === 'chart_of_accounts') {
+          const b: Record<string, unknown> = {}
+          for (const m of ['select', 'eq', 'in']) b[m] = vi.fn().mockReturnValue(b)
+          b.then = (resolve: (v: unknown) => void) =>
+            resolve({
+              data: [
+                { id: 'acc-1930', account_number: '1930' },
+                { id: 'acc-2350', account_number: '2350' },
+              ],
+              error: null,
+            })
+          return b
+        }
+        if (table === 'journal_entry_lines') {
+          return { insert: vi.fn().mockResolvedValue({ error: null }) }
+        }
+        if (table === 'fiscal_periods') {
+          const b: Record<string, unknown> = {}
+          const filters: Record<string, unknown> = {}
+          b.update = vi.fn().mockImplementation((payload: unknown) => {
+            fpUpdates.push(payload)
+            fpFilters.push(filters)
+            return b
+          })
+          b.eq = vi.fn().mockImplementation((col: string, val: unknown) => {
+            filters[col] = val
+            return b
+          })
+          b.then = (resolve: (v: unknown) => void) => resolve({ error: null })
+          return b
+        }
+        if (table === 'transactions') {
+          const b: Record<string, unknown> = {}
+          for (const m of ['update', 'eq']) b[m] = vi.fn().mockReturnValue(b)
+          b.then = (resolve: (v: unknown) => void) => resolve({ error: null })
+          return b
+        }
+        return createMockChain()
+      }),
+    }
+
+    return { supabase, fpUpdates, fpFilters }
+  }
+
+  it('clears the period IB link, flag before pointer, for an opening_balance entry', async () => {
+    const { supabase, fpUpdates, fpFilters } = buildSupabase('opening_balance')
+
+    const result = await reverseEntry(supabase as never, 'company-1', 'user-1', 'entry-1')
+
+    expect(result.id).toBe('reversal-1')
+    // Order matters: enforce_opening_balance_immutability rejects the pointer
+    // write while opening_balances_set is still true.
+    expect(fpUpdates).toEqual([{ opening_balances_set: false }, { opening_balance_entry_id: null }])
+    // Scoped to this entry, so a period pointing elsewhere is untouched.
+    for (const f of fpFilters) {
+      expect(f).toMatchObject({ company_id: 'company-1', opening_balance_entry_id: 'entry-1' })
+    }
+  })
+
+  it('leaves fiscal_periods untouched for a non-opening_balance entry', async () => {
+    const { supabase, fpUpdates } = buildSupabase('manual')
+
+    await reverseEntry(supabase as never, 'company-1', 'user-1', 'entry-1')
+
+    expect(fpUpdates).toEqual([])
   })
 })

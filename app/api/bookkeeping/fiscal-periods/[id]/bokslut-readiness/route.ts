@@ -1,10 +1,11 @@
 import { NextResponse } from 'next/server'
 import { withRouteContext } from '@/lib/api/with-route-context'
+import { getErrorMessage } from '@/lib/errors/get-error-message'
 import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
 import { buildBokslutReadinessReport } from '@/lib/bokslut/readiness-aggregator'
 
 /**
- * GET: aggregated bokslut readiness report — combines validateYearEndReadiness
+ * GET: aggregated bokslut readiness report: combines validateYearEndReadiness
  * (legal blockers) with bank-reconciliation status and informational reminders
  * for the bokslutsdispositioner that are still booked manually until Phase 2+
  * ships their calculators. One fetch backs the wizard's preflight step.
@@ -27,7 +28,7 @@ export const GET = withRouteContext(
       }
       return errorResponseFromCode('YEAR_END_PREVIEW_FAILED', opLog, {
         requestId,
-        details: { reason: message },
+        details: { reason: getErrorMessage(err) },
       })
     }
   },

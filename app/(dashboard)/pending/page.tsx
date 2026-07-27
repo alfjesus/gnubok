@@ -2,29 +2,19 @@
 
 import { useState, useEffect, useCallback, useMemo, Fragment } from 'react'
 import { useTranslations } from 'next-intl'
-import { PageHeader } from '@/components/ui/page-header'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
-import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { DataListEmpty, DataListLoading } from '@/components/ui/data-list'
+import { ContextPicker } from '@/components/common/ContextPicker'
+import { QUIET_LINK_CLASS, VTH_CLASS, VTD_CLASS } from '@/components/ui/dry-table'
 import {
-  DataList,
-  DataListHeader,
-  DataListRow,
-  DataListPrimary,
-  DataListMeta,
-  DataListMetaSeparator,
-  DataListEmpty,
-  DataListLoading,
-} from '@/components/ui/data-list'
-import {
-  DropdownMenu,
-  DropdownMenuTrigger,
-  DropdownMenuContent,
-  DropdownMenuRadioGroup,
-  DropdownMenuRadioItem,
-  DropdownMenuLabel,
-} from '@/components/ui/dropdown-menu'
+  SlideOver,
+  SlideOverContent,
+  SlideOverHeader,
+  SlideOverBody,
+  SlideOverFooter,
+} from '@/components/ui/slide-over'
 import { ConfirmationDialog } from '@/components/ui/confirmation-dialog'
 import {
   Dialog,
@@ -37,41 +27,112 @@ import {
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
 import { useToast } from '@/components/ui/use-toast'
-import { formatCurrency, formatDate } from '@/lib/utils'
+import { cn, formatCurrency, formatDate } from '@/lib/utils'
+import { getErrorMessage } from '@/lib/errors/get-error-message'
 import { createClient } from '@/lib/supabase/client'
 import {
   ClipboardCheck,
-  ArrowLeftRight,
-  Users,
-  Receipt,
   Bot,
-  BookOpen,
-  ChevronDown,
+  Check,
+  ChevronRight,
+  Info,
   Loader2,
   Lock,
   MessageSquare,
   AlertTriangle,
+  X,
 } from 'lucide-react'
 import type {
   PendingOperation,
-  PendingOperationStatus,
   PendingOperationRejectionCategory,
 } from '@/types'
 import { AttachDocumentPreview } from '@/components/bookkeeping/AttachDocumentPreview'
 import { MatchTransactionInvoicePreview } from '@/components/bookkeeping/MatchTransactionInvoicePreview'
 
-const OPERATION_LABEL_KEYS: Record<string, { labelKey: string; icon: typeof ArrowLeftRight; variant: 'default' | 'secondary' | 'outline' }> = {
-  categorize_transaction: { labelKey: 'type_categorize_transaction', icon: ArrowLeftRight, variant: 'default' },
-  create_customer: { labelKey: 'type_create_customer', icon: Users, variant: 'secondary' },
-  create_invoice: { labelKey: 'type_create_invoice', icon: Receipt, variant: 'outline' },
-  create_transaction: { labelKey: 'type_create_transaction', icon: ArrowLeftRight, variant: 'secondary' },
-  create_voucher: { labelKey: 'type_create_voucher', icon: BookOpen, variant: 'outline' },
-  correct_entry: { labelKey: 'type_correct_entry', icon: BookOpen, variant: 'outline' },
-  reverse_entry: { labelKey: 'type_reverse_entry', icon: BookOpen, variant: 'outline' },
-  mark_invoice_paid: { labelKey: 'type_mark_invoice_paid', icon: Receipt, variant: 'default' },
-  send_invoice: { labelKey: 'type_send_invoice', icon: Receipt, variant: 'outline' },
-  mark_invoice_sent: { labelKey: 'type_mark_invoice_sent', icon: Receipt, variant: 'outline' },
-  match_transaction_invoice: { labelKey: 'type_match_transaction_invoice', icon: ArrowLeftRight, variant: 'secondary' },
+// Short human label (i18n key in the "pending" namespace) for each staged
+// operation_type. Keep in sync with OPERATION_RISK_TIERS in
+// lib/pending-operations/risk-tiers.ts: every operation an agent can stage
+// needs a label here, otherwise the Granskning list falls back to the raw
+// snake_case tool name (e.g. "create_supplier_invoice_from_inbox"), which is
+// long and pushes the meta row to wrap awkwardly on mobile.
+const OPERATION_LABEL_KEYS: Record<string, string> = {
+  categorize_transaction: 'type_categorize_transaction',
+  create_customer: 'type_create_customer',
+  create_invoice: 'type_create_invoice',
+  create_transaction: 'type_create_transaction',
+  create_voucher: 'type_create_voucher',
+  correct_entry: 'type_correct_entry',
+  reverse_entry: 'type_reverse_entry',
+  mark_invoice_paid: 'type_mark_invoice_paid',
+  send_invoice: 'type_send_invoice',
+  mark_invoice_sent: 'type_mark_invoice_sent',
+  match_transaction_invoice: 'type_match_transaction_invoice',
+  // Master data
+  create_supplier: 'type_create_supplier',
+  create_article: 'type_create_article',
+  update_article: 'type_update_article',
+  create_account: 'type_create_account',
+  update_account: 'type_update_account',
+  create_dimension_value: 'type_create_dimension_value',
+  // Supplier invoices
+  create_supplier_invoice_from_inbox: 'type_create_supplier_invoice_from_inbox',
+  create_self_billed_supplier_invoice: 'type_create_self_billed_supplier_invoice',
+  approve_supplier_invoice: 'type_approve_supplier_invoice',
+  credit_supplier_invoice: 'type_credit_supplier_invoice',
+  // Invoices
+  credit_invoice: 'type_credit_invoice',
+  convert_invoice: 'type_convert_invoice',
+  // Documents & links
+  attach_document_to_transaction: 'type_attach_document_to_transaction',
+  link_document_to_voucher: 'type_link_document_to_voucher',
+  link_invoice_voucher: 'type_link_invoice_voucher',
+  link_supplier_invoice_voucher: 'type_link_supplier_invoice_voucher',
+  link_transaction_journal_entry: 'type_link_transaction_journal_entry',
+  uncategorize_transaction: 'type_uncategorize_transaction',
+  retag_line_dimensions: 'type_retag_line_dimensions',
+  set_voucher_note: 'type_set_voucher_note',
+  // Bulk booking / allocation
+  match_batch_allocate: 'type_match_batch_allocate',
+  bulk_book_transactions: 'type_bulk_book_transactions',
+  bulk_book_inbox_items: 'type_bulk_book_inbox_items',
+  // Periods, year-end, depreciation
+  close_period: 'type_close_period',
+  lock_period: 'type_lock_period',
+  unlock_period: 'type_unlock_period',
+  set_opening_balances: 'type_set_opening_balances',
+  run_year_end: 'type_run_year_end',
+  run_currency_revaluation: 'type_run_currency_revaluation',
+  post_annual_depreciation: 'type_post_annual_depreciation',
+  explain_voucher_gap: 'type_explain_voucher_gap',
+  // SIE
+  import_sie: 'type_import_sie',
+  undo_sie_import: 'type_undo_sie_import',
+  // Payroll & Skatteverket filings
+  create_salary_run: 'type_create_salary_run',
+  book_salary_run: 'type_book_salary_run',
+  generate_agi: 'type_generate_agi',
+  update_payslip_line: 'type_update_payslip_line',
+  register_absence: 'type_register_absence',
+  delete_absence: 'type_delete_absence',
+  create_employee: 'type_create_employee',
+  update_employee: 'type_update_employee',
+  set_employee_opening_balances: 'type_set_employee_opening_balances',
+  vacation_year_close: 'type_vacation_year_close',
+  submit_vat_declaration: 'type_submit_vat_declaration',
+  submit_agi: 'type_submit_agi',
+}
+
+// Fallback for an operation_type with no entry above (e.g. a newly added op
+// not yet given a label): turn "create_supplier_invoice_from_inbox" into
+// "Create supplier invoice from inbox" so it never surfaces as raw snake_case.
+function humanizeOperationType(operationType: string): string {
+  const spaced = operationType.replace(/_/g, ' ')
+  return spaced.charAt(0).toUpperCase() + spaced.slice(1)
+}
+
+function operationLabel(operationType: string, t: (key: string) => string): string {
+  const labelKey = OPERATION_LABEL_KEYS[operationType]
+  return labelKey ? t(labelKey) : humanizeOperationType(operationType)
 }
 
 // Terse per-type labels used in the bulk confirmation dialog list. Phrased so
@@ -95,9 +156,7 @@ const bulkActionDescriptions: Record<string, (count: number) => string> = {
 function bulkActionLabel(operationType: string, count: number, t: (key: string) => string): string {
   const fn = bulkActionDescriptions[operationType]
   if (fn) return fn(count)
-  const entry = OPERATION_LABEL_KEYS[operationType]
-  const fallback = entry ? t(entry.labelKey) : operationType
-  return `${count} × ${fallback}`
+  return `${count} × ${operationLabel(operationType, t)}`
 }
 
 // Full-sentence warning for the single-op confirmation dialog AND the inline
@@ -105,7 +164,7 @@ function bulkActionLabel(operationType: string, count: number, t: (key: string) 
 // one line; the dialog shows it in full. Order roughly low → high risk so
 // reviewers scanning the source see the destructive paths grouped together.
 const singleActionWarnings: Record<string, string> = {
-  // Low/medium risk — light verifikation work
+  // Low/medium risk: light verifikation work
   create_transaction: 'Genom att klicka godkänn så skapar du en transaktion.',
   create_customer: 'Genom att klicka godkänn så skapar du en kund.',
   create_invoice: 'Genom att klicka godkänn så skapas ett fakturautkast (det skickas inte).',
@@ -116,10 +175,10 @@ const singleActionWarnings: Record<string, string> = {
   send_invoice: 'Genom att klicka godkänn så skickas fakturan till kunden.',
   mark_invoice_paid: 'Genom att klicka godkänn så bokförs en betalning på fakturan.',
   mark_invoice_sent: 'Genom att klicka godkänn så märks fakturan som skickad och en verifikation skapas.',
-  // High risk — period/year-end/voucher edits. These are the ones the reviewer
+  // High risk: period/year-end/voucher edits. These are the ones the reviewer
   // really needs the warning for, so we keep them concrete: name the
   // irreversibility or compliance consequence, not the generic risk-level.
-  lock_period: 'Genom att klicka godkänn så låses perioden — inga nya verifikationer kan bokföras tills den låses upp.',
+  lock_period: 'Genom att klicka godkänn så låses perioden: inga nya verifikationer kan bokföras tills den låses upp.',
   unlock_period: 'Genom att klicka godkänn så låses perioden upp. Använd endast för rättelser; lås igen efter.',
   close_period: 'Genom att klicka godkänn så stängs perioden permanent (BFL). Stängningen kan inte ångras.',
   run_year_end: 'Genom att klicka godkänn så körs bokslut: resultatkonton nollställs, perioden låses, nästa period skapas.',
@@ -127,14 +186,14 @@ const singleActionWarnings: Record<string, string> = {
   run_currency_revaluation: 'Genom att klicka godkänn så bokförs valutaomvärdering (3960/7960).',
   create_voucher: 'Genom att klicka godkänn så bokförs verifikationen med ett nytt löpnummer.',
   correct_entry: 'Genom att klicka godkänn så stornas originalverifikationen och en rättelse bokförs (BFL 5 kap 5§).',
-  reverse_entry: 'Genom att klicka godkänn så stornas verifikationen — originalet behålls synligt (BFL 5 kap).',
+  reverse_entry: 'Genom att klicka godkänn så stornas verifikationen: originalet behålls synligt (BFL 5 kap).',
   credit_invoice: 'Genom att klicka godkänn så skapas en kreditfaktura och originalverifikationen stornas.',
   credit_supplier_invoice: 'Genom att klicka godkänn så krediteras leverantörsfakturan och registreringsverifikationen stornas.',
   approve_supplier_invoice: 'Genom att klicka godkänn så attesteras leverantörsfakturan och blir betalningsbar.',
   convert_invoice: 'Genom att klicka godkänn så konverteras proformafakturan till en riktig faktura med F-nummer.',
   import_sie: 'Genom att klicka godkänn så importeras SIE-filen: räkenskapsperiod, ingående balans och verifikationer skapas.',
   explain_voucher_gap: 'Genom att klicka godkänn så dokumenteras förklaringen för verifikationsluckan (BFNAR 2013:2).',
-  post_annual_depreciation: 'Genom att klicka godkänn så bokförs planenlig avskrivning — en verifikation per tillgång.',
+  post_annual_depreciation: 'Genom att klicka godkänn så bokförs planenlig avskrivning: en verifikation per tillgång.',
 }
 
 function singleActionWarning(operationType: string): string {
@@ -162,6 +221,16 @@ function getPeriodStatus(op: PendingOperation): PeriodStatusShape | null {
   }
 }
 
+// Concept gact buttons (scene 11): tinted outline pills under the op text.
+// The tint is sanctioned here by the concept spec: approve reads sage,
+// reject terracotta, details neutral.
+const GACT_CLASS =
+  'inline-flex items-center gap-1.5 rounded-full border px-3.5 py-[5px] text-xs transition-colors duration-150 disabled:pointer-events-none disabled:opacity-50'
+const GACT_OK_CLASS = 'border-success/40 text-success hover:bg-success/10'
+const GACT_NO_CLASS = 'border-destructive/40 text-destructive hover:bg-destructive/10'
+const GACT_NEUTRAL_CLASS =
+  'border-border text-muted-foreground hover:bg-secondary/40 hover:text-foreground'
+
 const REJECTION_CATEGORY_LABELS: Record<PendingOperationRejectionCategory, string> = {
   wrong_category: 'Fel kategori / konto',
   wrong_amount: 'Fel belopp',
@@ -173,7 +242,7 @@ const REJECTION_CATEGORY_LABELS: Record<PendingOperationRejectionCategory, strin
 /**
  * Human origin line for a staged operation. Many reviewers never used the AI
  * chat themselves (a colleague or consultant did), so the raw actor_label is
- * not enough context — spell out where the proposal came from.
+ * not enough context: spell out where the proposal came from.
  */
 function originLabel(
   op: PendingOperation,
@@ -183,7 +252,7 @@ function originLabel(
     case 'agent_chat':
       return t('origin_agent_chat')
     // The claude.ai MCP connector mints a gnubok_sk_ key, so MCP traffic
-    // arrives as actor_type='api_key' with the key name as actor_label —
+    // arrives as actor_type='api_key' with the key name as actor_label:
     // keep the label so users with several integrations can tell which one
     // staged the op. 'mcp_oauth' is declared but currently unreachable.
     case 'mcp_oauth':
@@ -203,6 +272,19 @@ function originLabel(
  * Strict on reason === 'expired' so commit-time auto-rejects (404/409, where
  * reason is the error text) do NOT read as "expired".
  */
+/**
+ * failed_partial rows (issue #842): the executor posted an irreversible
+ * voucher/credit note and then failed a later step. The dispatcher persisted
+ * the ids of what WAS posted in result_data.posted_ids; render them so the
+ * reviewer can locate the orphaned entity.
+ */
+function failedPartialPostedIds(op: PendingOperation): string | null {
+  const rd = op.result_data as { posted_ids?: Record<string, string> } | null
+  const entries = Object.entries(rd?.posted_ids ?? {})
+  if (entries.length === 0) return null
+  return entries.map(([key, value]) => `${key}: ${value}`).join(', ')
+}
+
 function isAutoExpired(op: PendingOperation): boolean {
   const rd = op.result_data as { auto_rejected?: boolean; reason?: string } | null
   return op.status === 'rejected' && rd?.auto_rejected === true && rd?.reason === 'expired'
@@ -223,8 +305,33 @@ function formatRelativeTime(dateStr: string): string {
 }
 
 function CategorizePreview({ data }: { data: Record<string, unknown> }) {
+  // The exact journal lines the approval will post (net cost line, VAT line,
+  // gross bank line, SEK) — staged by the server since the preview-lines fix.
+  const lines = (data.lines as Array<{ account_number?: string; debit_amount?: number; credit_amount?: number; description?: string }>) || []
   const vatLines = (data.vat_lines as Array<{ account_number: string; debit_amount: number; credit_amount: number; description: string }>) || []
 
+  if (lines.length > 0) {
+    return (
+      <div className="space-y-1 text-sm">
+        <p className="text-xs text-muted-foreground mb-1">Verifikat</p>
+        {lines.map((line, i) => {
+          const debitAmt = typeof line.debit_amount === 'number' ? line.debit_amount : 0
+          const creditAmt = typeof line.credit_amount === 'number' ? line.credit_amount : 0
+          return (
+            <div key={i} className="flex justify-between gap-4 font-mono text-xs">
+              <span className="truncate">{line.account_number ?? '?'}{line.description ? ` ${line.description}` : ''}</span>
+              <span className="tabular-nums shrink-0">
+                {debitAmt > 0 ? `D ${formatCurrency(debitAmt)}` : `K ${formatCurrency(creditAmt)}`}
+              </span>
+            </div>
+          )
+        })}
+      </div>
+    )
+  }
+
+  // Legacy summary for operations staged before the preview carried full
+  // lines: debit/credit accounts + gross amount + separate VAT rows.
   return (
     <div className="space-y-3 text-sm">
       <div className="grid grid-cols-2 gap-x-4 gap-y-1">
@@ -304,11 +411,11 @@ function InvoicePreview({ data }: { data: Record<string, unknown> }) {
       )}
       <div className="border-t pt-2 grid grid-cols-2 gap-x-4 gap-y-1">
         <span className="text-muted-foreground">Netto</span>
-        <span className="font-mono tabular-nums text-right">{formatCurrency(data.subtotal as number, (data.currency as string) || 'SEK')}</span>
+        <span className="tabular-nums text-right">{formatCurrency(data.subtotal as number, (data.currency as string) || 'SEK')}</span>
         <span className="text-muted-foreground">Moms</span>
-        <span className="font-mono tabular-nums text-right">{formatCurrency(data.vat_amount as number, (data.currency as string) || 'SEK')}</span>
+        <span className="tabular-nums text-right">{formatCurrency(data.vat_amount as number, (data.currency as string) || 'SEK')}</span>
         <span className="font-medium">Totalt</span>
-        <span className="font-mono tabular-nums font-medium text-right">{formatCurrency(data.total as number, (data.currency as string) || 'SEK')}</span>
+        <span className="tabular-nums font-medium text-right">{formatCurrency(data.total as number, (data.currency as string) || 'SEK')}</span>
       </div>
     </div>
   )
@@ -353,7 +460,7 @@ function VoucherLinesTable({ lines, currency }: { lines: VoucherLine[]; currency
         <div key={i} className="grid grid-cols-[auto_1fr_auto_auto] gap-x-3 text-xs items-baseline">
           <span className="font-mono text-muted-foreground">{line.account_number}</span>
           <span className="truncate">
-            {line.account_name || line.line_description || '—'}
+            {line.account_name || line.line_description || '-'}
           </span>
           <span className="font-mono tabular-nums text-right w-24">
             {line.debit_amount > 0 ? formatCurrency(line.debit_amount, currency || 'SEK') : ''}
@@ -427,7 +534,7 @@ function CorrectEntryPreview({ data }: { data: Record<string, unknown> }) {
     <div className="space-y-4 text-sm">
       <div>
         <p className="text-[11px] uppercase tracking-wider text-muted-foreground mb-1">
-          Originalverifikation V{original.voucher ?? ''} — {original.entry_date ?? ''}
+          Originalverifikation V{original.voucher ?? ''}, {original.entry_date ?? ''}
         </p>
         <p className="text-xs text-muted-foreground italic mb-2">{original.description ?? ''}</p>
         {original.lines && original.lines.length > 0 && (
@@ -468,20 +575,90 @@ function renderPrimitive(value: unknown): string {
   return String(value)
 }
 
+// A preview_data value that is a kontering (array of account/debit/credit
+// rows). Several staged op types carry one under keys like `preview_lines`
+// without a dedicated preview component; rendering it as the actual
+// verifikat rows is what makes the detail panel say what the agent will do.
+interface PreviewKonteringLine {
+  account?: string
+  account_number?: string
+  description?: string
+  debit?: number
+  credit?: number
+  debit_amount?: number
+  credit_amount?: number
+}
+
+function isKonteringLines(value: unknown): value is PreviewKonteringLine[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every(
+      (line) =>
+        line != null &&
+        typeof line === 'object' &&
+        ('account' in line || 'account_number' in line) &&
+        ('debit' in line || 'credit' in line || 'debit_amount' in line || 'credit_amount' in line),
+    )
+  )
+}
+
+function PreviewKonteringTable({ lines }: { lines: PreviewKonteringLine[] }) {
+  const amount = (n: number | undefined) =>
+    n && n > 0 ? n.toLocaleString('sv-SE', { minimumFractionDigits: 2 }) : ''
+  return (
+    <table className="w-full border-collapse text-[12.5px]" aria-label="Föreslagen kontering">
+      <thead>
+        <tr>
+          <th className={cn(VTH_CLASS, 'w-[70px]')}>Konto</th>
+          <th className={VTH_CLASS}>Beskrivning</th>
+          <th className={cn(VTH_CLASS, 'text-right')}>Debet</th>
+          <th className={cn(VTH_CLASS, 'text-right')}>Kredit</th>
+        </tr>
+      </thead>
+      <tbody>
+        {lines.map((line, i) => (
+          <tr key={i}>
+            <td className={cn(VTD_CLASS, 'whitespace-nowrap font-mono tabular-nums')}>
+              {line.account ?? line.account_number}
+            </td>
+            <td className={cn(VTD_CLASS, 'text-muted-foreground')}>{line.description ?? ''}</td>
+            <td className={cn(VTD_CLASS, 'whitespace-nowrap text-right tabular-nums')}>
+              {amount(line.debit ?? line.debit_amount)}
+            </td>
+            <td className={cn(VTD_CLASS, 'whitespace-nowrap text-right tabular-nums')}>
+              {amount(line.credit ?? line.credit_amount)}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  )
+}
+
 function GenericPreview({ data }: { data: Record<string, unknown> }) {
-  // Skip period_status here — it's surfaced in the dedicated banner, not the
+  // Skip period_status here: it's surfaced in the dedicated banner, not the
   // generic key-value dump (otherwise the approver sees the same fact twice).
   const entries = Object.entries(data).filter(([k, v]) => v != null && v !== '' && k !== 'period_status')
+  const konteringEntries = entries.filter(([, v]) => isKonteringLines(v))
+  const rest = entries.filter(([, v]) => !isKonteringLines(v))
   return (
-    <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
-      {entries.map(([key, value]) => (
-        <Fragment key={key}>
-          <span className="text-muted-foreground">{key.replace(/_/g, ' ')}</span>
-          <span className={typeof value === 'number' ? 'font-mono tabular-nums' : ''}>
-            {renderPrimitive(value)}
-          </span>
-        </Fragment>
+    <div className="space-y-3">
+      {konteringEntries.map(([key, value]) => (
+        <PreviewKonteringTable key={key} lines={value as PreviewKonteringLine[]} />
       ))}
+      {rest.length > 0 && (
+        <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
+          {rest.map(([key, value]) => (
+            <Fragment key={key}>
+              <span className="text-muted-foreground">{key.replace(/_/g, ' ')}</span>
+              <span className={typeof value === 'number' ? 'font-mono tabular-nums' : ''}>
+                {renderPrimitive(value)}
+              </span>
+            </Fragment>
+          ))}
+        </div>
+      )}
     </div>
   )
 }
@@ -514,7 +691,7 @@ function OperationPreview({ op }: { op: PendingOperation }) {
 
 /**
  * Inline period-lock banner. Renders when the staged operation touches a
- * period that's already locked or closed — the server's commit-time trigger
+ * period that's already locked or closed: the server's commit-time trigger
  * will reject it, so we tell the approver up front rather than letting them
  * click and see a generic "Misslyckades" toast. The fiscal_period_id link
  * goes to the periods management page where unlocking is possible.
@@ -527,7 +704,7 @@ function PeriodLockBanner({ period }: { period: PeriodStatusShape }) {
       <div className="flex-1">
         <p className="font-medium text-destructive">
           {period.status === 'closed'
-            ? 'Perioden är stängd permanent (BFL) — kan inte ändras.'
+            ? 'Perioden är stängd permanent (BFL): kan inte ändras.'
             : `Perioden är låst${lockedThrough ? ` t.o.m. ${lockedThrough}` : ''}.`}
         </p>
         <p className="text-xs text-muted-foreground mt-0.5">
@@ -550,31 +727,32 @@ const sourceFilterLabels = (
   high_risk: t('tab_high_risk'),
 })
 
-type TabStatus = Extract<PendingOperationStatus, 'pending' | 'committed' | 'rejected'>
-type StatusCounts = Record<TabStatus, number | null>
+// Concept scene 11: two views. Historik merges committed + rejected,
+// distinguished per row by a status chip.
+type ViewTab = 'pending' | 'history'
 
 export default function PendingOperationsPage() {
   const t = useTranslations('pending')
   const [operations, setOperations] = useState<PendingOperation[]>([])
   const [isLoading, setIsLoading] = useState(true)
-  const [activeTab, setActiveTab] = useState<PendingOperationStatus>('pending')
+  const [activeTab, setActiveTab] = useState<ViewTab>('pending')
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all')
   const [conversationFilter, setConversationFilter] = useState<string | null>(null)
-  const [counts, setCounts] = useState<StatusCounts>({
-    pending: null,
-    committed: null,
-    rejected: null,
-  })
-  const [expandedId, setExpandedId] = useState<string | null>(null)
+  const [pendingCount, setPendingCount] = useState<number | null>(null)
+  // Detail slide-over (convention 13): id rather than the row object, so the
+  // panel tracks realtime refetches and closes itself when the op leaves the
+  // current list (approved elsewhere, tab switch, filter change).
+  const [detailOpId, setDetailOpId] = useState<string | null>(null)
   const [selectedOp, setSelectedOp] = useState<PendingOperation | null>(null)
   const [showCommitDialog, setShowCommitDialog] = useState(false)
   const [isCommitting, setIsCommitting] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [showBulkDialog, setShowBulkDialog] = useState(false)
   const [isBulkCommitting, setIsBulkCommitting] = useState(false)
-  // Reject dialog state — separate from the generic destructive-confirm so we
+  // Reject dialog state: separate from the generic destructive-confirm so we
   // can ask for a category + free-text reason that feeds back to the agent.
-  const [rejectOp, setRejectOp] = useState<PendingOperation | null>(null)
+  // 'bulk' targets the current checkbox selection instead of a single op.
+  const [rejectTarget, setRejectTarget] = useState<PendingOperation | 'bulk' | null>(null)
   const [rejectCategory, setRejectCategory] = useState<PendingOperationRejectionCategory | ''>('')
   const [rejectReason, setRejectReason] = useState('')
   const [isRejecting, setIsRejecting] = useState(false)
@@ -592,65 +770,64 @@ export default function PendingOperationsPage() {
   const fetchOperations = useCallback(async () => {
     setIsLoading(true)
     try {
-      const res = await fetch(`/api/pending-operations?status=${activeTab}`)
-      const json = await res.json()
-      setOperations(json.data ?? [])
-      setCounts((prev) => ({ ...prev, [activeTab]: json.count ?? json.data?.length ?? 0 }))
+      if (activeTab === 'pending') {
+        const res = await fetch('/api/pending-operations?status=pending')
+        const json = await res.json()
+        setOperations(json.data ?? [])
+        setPendingCount(json.count ?? json.data?.length ?? 0)
+      } else {
+        // The API is single-status per fetch: Historik merges godkända and
+        // avvisade, newest resolution first.
+        const [committed, rejected] = await Promise.all([
+          fetch('/api/pending-operations?status=committed').then((r) => r.json()),
+          fetch('/api/pending-operations?status=rejected').then((r) => r.json()),
+        ])
+        const merged = ([...(committed.data ?? []), ...(rejected.data ?? [])] as PendingOperation[]).sort(
+          (a, b) => (b.resolved_at ?? b.created_at).localeCompare(a.resolved_at ?? a.created_at),
+        )
+        setOperations(merged)
+        const pc = committed.counts?.pending ?? rejected.counts?.pending
+        if (typeof pc === 'number') setPendingCount(pc)
+      }
     } catch {
       toast({ title: 'Kunde inte ladda operationer', variant: 'destructive' })
     }
     setIsLoading(false)
   }, [activeTab, toast])
 
-  const fetchAllCounts = useCallback(async () => {
-    const statuses: TabStatus[] = ['pending', 'committed', 'rejected']
-    try {
-      const results = await Promise.all(
-        statuses.map((s) =>
-          fetch(`/api/pending-operations?status=${s}&limit=1`).then((r) => r.json())
-        )
-      )
-      setCounts({
-        pending: results[0]?.count ?? 0,
-        committed: results[1]?.count ?? 0,
-        rejected: results[2]?.count ?? 0,
-      })
-    } catch {
-      // Counts are best-effort; the active tab's count will still update via fetchOperations
-    }
-  }, [])
-
   useEffect(() => {
     fetchOperations()
   }, [fetchOperations])
 
-  useEffect(() => {
-    fetchAllCounts()
-  }, [fetchAllCounts])
-
   // Realtime subscription: refetch when ANY pending_operations row changes for
-  // this company. RLS scopes the channel automatically — we don't see other
+  // this company. RLS scopes the channel automatically: we don't see other
   // tenants' events. We refetch the whole list (rather than patching state
   // in-place) so server-side filtering, sorting, and computed fields stay in
-  // sync with whatever the API route returned. The counts endpoint isn't
-  // pushed by the same trigger, so we also refresh counts on every change.
+  // sync with whatever the API route returned, including all tab counts.
+  // Trailing debounce: bulk actions emit one event per row, which previously
+  // stampeded 4 requests per event (list + 3 counts); the burst now collapses
+  // into a single refetch after the last event.
   useEffect(() => {
     const supabase = createClient()
+    let debounce: ReturnType<typeof setTimeout> | null = null
     const channel = supabase
       .channel('pending_operations:list')
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'pending_operations' },
         () => {
-          fetchOperations()
-          fetchAllCounts()
+          if (debounce) clearTimeout(debounce)
+          debounce = setTimeout(() => {
+            fetchOperations()
+          }, 400)
         }
       )
       .subscribe()
     return () => {
+      if (debounce) clearTimeout(debounce)
       void supabase.removeChannel(channel)
     }
-  }, [fetchOperations, fetchAllCounts])
+  }, [fetchOperations])
 
   // Clear selection when filters/tab change
   useEffect(() => {
@@ -662,17 +839,19 @@ export default function PendingOperationsPage() {
     setIsCommitting(true)
     try {
       const res = await fetch(`/api/pending-operations/${selectedOp.id}/commit`, { method: 'POST' })
-      const json = await res.json()
-      if (!res.ok) throw new Error(json.error || 'Misslyckades')
+      const json = await res.json().catch(() => ({}))
+      // getErrorMessage handles both `{ error: string }` and the structured
+      // `{ error: { code, message } }` envelope (the latter would otherwise
+      // toast "[object Object]") and never surfaces raw English.
+      if (!res.ok) throw new Error(getErrorMessage(json, { statusCode: res.status }))
       toast({ title: 'Godkänd', description: selectedOp.title })
       setShowCommitDialog(false)
       setSelectedOp(null)
       fetchOperations()
-      fetchAllCounts()
     } catch (err) {
       toast({
         title: 'Misslyckades',
-        description: err instanceof Error ? err.message : 'Okänt fel',
+        description: err instanceof Error ? getErrorMessage(err) : 'Okänt fel',
         variant: 'destructive',
       })
     }
@@ -688,8 +867,8 @@ export default function PendingOperationsPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ids }),
       })
-      const json = await res.json()
-      if (!res.ok) throw new Error(json.error || 'Misslyckades')
+      const json = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(getErrorMessage(json, { statusCode: res.status }))
 
       const summary = json.data?.summary as
         | { committed: number; failed: number; skipped: number; rejected: number }
@@ -714,52 +893,78 @@ export default function PendingOperationsPage() {
       setShowBulkDialog(false)
       setSelectedIds(new Set())
       fetchOperations()
-      fetchAllCounts()
     } catch (err) {
       toast({
         title: 'Misslyckades',
-        description: err instanceof Error ? err.message : 'Okänt fel',
+        description: err instanceof Error ? getErrorMessage(err) : 'Okänt fel',
         variant: 'destructive',
       })
     }
     setIsBulkCommitting(false)
   }
 
-  function openRejectDialog(op: PendingOperation) {
-    setRejectOp(op)
+  function openRejectDialog(target: PendingOperation | 'bulk') {
+    setRejectTarget(target)
     setRejectCategory('')
     setRejectReason('')
   }
 
   async function handleReject() {
-    if (!rejectOp) return
+    if (!rejectTarget) return
     setIsRejecting(true)
     try {
-      const body =
-        rejectCategory || rejectReason.trim()
-          ? {
-              ...(rejectCategory ? { rejection_category: rejectCategory } : {}),
-              ...(rejectReason.trim() ? { rejection_reason: rejectReason.trim() } : {}),
-            }
-          : undefined
-      const res = await fetch(`/api/pending-operations/${rejectOp.id}/reject`, {
-        method: 'POST',
-        ...(body
-          ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
-          : {}),
-      })
-      if (!res.ok) {
-        const json = await res.json().catch(() => ({}))
-        throw new Error(json.error || 'Misslyckades')
+      const feedback = {
+        ...(rejectCategory ? { rejection_category: rejectCategory } : {}),
+        ...(rejectReason.trim() ? { rejection_reason: rejectReason.trim() } : {}),
       }
-      toast({ title: 'Avvisad', description: rejectOp.title })
-      setRejectOp(null)
+
+      if (rejectTarget === 'bulk') {
+        const res = await fetch('/api/pending-operations/bulk-reject', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ids: Array.from(selectedIds), ...feedback }),
+        })
+        const json = await res.json().catch(() => ({}))
+        if (!res.ok) throw new Error(getErrorMessage(json, { statusCode: res.status }))
+
+        const summary = json.data?.summary as
+          | { rejected: number; skipped: number; failed: number }
+          | undefined
+        if (summary) {
+          const parts: string[] = []
+          if (summary.rejected > 0) parts.push(`${summary.rejected} avvisade`)
+          if (summary.skipped > 0) parts.push(`${summary.skipped} hoppades över`)
+          if (summary.failed > 0) parts.push(`${summary.failed} misslyckades`)
+          toast({
+            title: summary.failed > 0 ? 'Klart med fel' : 'Avvisade',
+            description: parts.join(', '),
+            variant: summary.failed > 0 ? 'destructive' : 'default',
+          })
+        } else {
+          toast({ title: 'Avvisade' })
+        }
+        setSelectedIds(new Set())
+      } else {
+        const hasFeedback = Object.keys(feedback).length > 0
+        const res = await fetch(`/api/pending-operations/${rejectTarget.id}/reject`, {
+          method: 'POST',
+          ...(hasFeedback
+            ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(feedback) }
+            : {}),
+        })
+        if (!res.ok) {
+          const json = await res.json().catch(() => ({}))
+          throw new Error(getErrorMessage(json, { statusCode: res.status }))
+        }
+        toast({ title: 'Avvisad', description: rejectTarget.title })
+      }
+
+      setRejectTarget(null)
       fetchOperations()
-      fetchAllCounts()
     } catch (err) {
       toast({
         title: 'Kunde inte avvisa',
-        description: err instanceof Error ? err.message : 'Okänt fel',
+        description: err instanceof Error ? getErrorMessage(err) : 'Okänt fel',
         variant: 'destructive',
       })
     }
@@ -789,7 +994,7 @@ export default function PendingOperationsPage() {
   const showBulkControls = activeTab === 'pending'
   // Pending ops that meet two criteria: not high risk AND the period covering
   // them is open. We exclude locked/closed periods from bulk because they will
-  // be rejected at commit time anyway — silently letting the user "select all"
+  // be rejected at commit time anyway: silently letting the user "select all"
   // and watching some fail is a worse UX than excluding them up front.
   const bulkEligible = useMemo(
     () =>
@@ -805,7 +1010,6 @@ export default function PendingOperationsPage() {
   const bulkEligibleIds = useMemo(() => bulkEligible.map((op) => op.id), [bulkEligible])
   const allSelected =
     bulkEligibleIds.length > 0 && bulkEligibleIds.every((id) => selectedIds.has(id))
-  const someSelected = bulkEligibleIds.some((id) => selectedIds.has(id))
 
   const pendingTotal = filteredOperations.filter((op) => op.status === 'pending').length
   const excludedFromBulk = pendingTotal - bulkEligible.length
@@ -827,7 +1031,7 @@ export default function PendingOperationsPage() {
     }
   }
 
-  // "Approve all of this type" — find ops with the same operation_type that are bulk-eligible
+  // "Approve all of this type": find ops with the same operation_type that are bulk-eligible
   function selectAllOfType(operationType: string) {
     const ids = bulkEligible
       .filter((op) => op.operation_type === operationType)
@@ -856,19 +1060,48 @@ export default function PendingOperationsPage() {
     return Array.from(counts.entries()).map(([type, count]) => ({ type, count }))
   }, [bulkEligible, selectedIds])
 
-  const tabLabel = (label: string, status: TabStatus) => {
-    const count = counts[status]
-    return count == null ? label : `${label} (${count})`
+  // Source/kicker line for a row and the detail panel: operation type,
+  // origin (when an agent staged it) and relative age.
+  const sourceLine = (op: PendingOperation) => {
+    const isAgent = op.actor_type && op.actor_type !== 'user'
+    return [
+      operationLabel(op.operation_type, t),
+      isAgent ? (originLabel(op, t) ?? op.actor_label ?? op.actor_type) : null,
+      formatRelativeTime(op.created_at),
+    ]
+      .filter(Boolean)
+      .join(' · ')
   }
 
-  const showFilterDot = sourceFilter !== 'all'
+  const detailOp = detailOpId
+    ? filteredOperations.find((op) => op.id === detailOpId) ?? null
+    : null
+  const detailPeriod = detailOp ? getPeriodStatus(detailOp) : null
+  const detailPeriodLocked = detailPeriod != null && detailPeriod.status !== 'open'
+  const detailConversationId = detailOp?.agent_metadata?.conversation_id ?? null
+
+  const SEG_TABS: Array<{ tab: ViewTab; labelKey: string }> = [
+    { tab: 'pending', labelKey: 'tab_pending' },
+    { tab: 'history', labelKey: 'tab_history' },
+  ]
 
   return (
-    <div className="space-y-6">
-      <PageHeader
-        title={t('title')}
-        description={t('subtitle')}
-      />
+    <div className="space-y-8">
+      {/* Page header (concept scene 11): title + Godkänn alla */}
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <h1 className="font-display text-2xl leading-8 tracking-tight">{t('title')}</h1>
+        {activeTab === 'pending' && bulkEligible.length > 0 && (
+          <Button
+            disabled={isBulkCommitting || isRejecting}
+            onClick={() => {
+              setSelectedIds(new Set(bulkEligibleIds))
+              setShowBulkDialog(true)
+            }}
+          >
+            {t('approve_all', { count: bulkEligible.length })}
+          </Button>
+        )}
+      </div>
 
       {conversationFilter && (
         <div className="flex items-center justify-between rounded-md border bg-muted/30 px-3 py-2 text-sm">
@@ -897,181 +1130,275 @@ export default function PendingOperationsPage() {
         </div>
       )}
 
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as PendingOperationStatus)}>
-          <TabsList>
-            <TabsTrigger value="pending">{tabLabel(t('tab_pending'), 'pending')}</TabsTrigger>
-            <TabsTrigger value="committed">{tabLabel(t('tab_committed'), 'committed')}</TabsTrigger>
-            <TabsTrigger value="rejected">{tabLabel(t('tab_rejected'), 'rejected')}</TabsTrigger>
-          </TabsList>
-        </Tabs>
-
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button variant="outline" size="sm" className="h-9 gap-2">
-              <span className="text-xs uppercase tracking-wider text-muted-foreground">
-                Filter
-              </span>
-              <span>{sourceFilterLabels(t)[sourceFilter]}</span>
-              {showFilterDot && (
-                <span className="h-1.5 w-1.5 rounded-full bg-primary" aria-hidden />
+      {/* Toolbar (concept): status seg left, source picker (convention 8)
+          far right. The count chip rides only on Väntar: it is the queue. */}
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="inline-flex shrink-0 gap-0.5 rounded-lg bg-muted/70 p-[3px]" role="tablist">
+          {SEG_TABS.map(({ tab, labelKey }) => (
+            <button
+              key={tab}
+              type="button"
+              role="tab"
+              aria-selected={activeTab === tab}
+              onClick={() => setActiveTab(tab)}
+              className={cn(
+                'inline-flex items-center gap-1.5 rounded-md px-3.5 py-[5px] text-[12.5px] transition-colors duration-150',
+                activeTab === tab
+                  ? 'border border-border bg-card font-medium text-foreground'
+                  : 'text-muted-foreground hover:text-foreground',
               )}
-              <ChevronDown className="h-3.5 w-3.5 opacity-50" />
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="min-w-[12rem]">
-            <DropdownMenuLabel>Källa</DropdownMenuLabel>
-            <DropdownMenuRadioGroup
-              value={sourceFilter}
-              onValueChange={(v) => setSourceFilter(v as SourceFilter)}
             >
-              <DropdownMenuRadioItem value="all">{t('tab_all')}</DropdownMenuRadioItem>
-              <DropdownMenuRadioItem value="agent">{t('tab_agent')}</DropdownMenuRadioItem>
-              <DropdownMenuRadioItem value="high_risk">{t('tab_high_risk')}</DropdownMenuRadioItem>
-            </DropdownMenuRadioGroup>
-          </DropdownMenuContent>
-        </DropdownMenu>
+              {t(labelKey)}
+              {tab === 'pending' && (pendingCount ?? 0) > 0 && (
+                <span className="rounded-full bg-secondary px-1.5 text-[10px] font-medium tabular-nums">
+                  {pendingCount}
+                </span>
+              )}
+            </button>
+          ))}
+        </div>
+        <div className="ml-auto">
+          <ContextPicker
+            value={sourceFilter}
+            onChange={(id) => setSourceFilter(id as SourceFilter)}
+            triggerLabel={sourceFilterLabels(t)[sourceFilter]}
+            items={[
+              { id: 'all', label: t('tab_all') },
+              { id: 'agent', label: t('tab_agent') },
+              { id: 'high_risk', label: t('tab_high_risk') },
+            ]}
+          />
+        </div>
       </div>
 
-      {/* First-time reviewers haven't necessarily used the AI chat that staged
-          these — say what the buttons do and that ignoring a proposal is safe. */}
-      {activeTab === 'pending' && (
-        <p className="text-xs text-muted-foreground">
-          {t('explainer')} {t('auto_expiry_note')}
-        </p>
-      )}
-
-      <DataList>
-        {showBulkControls && bulkEligible.length > 0 && (
-          <DataListHeader>
-            <div className="flex items-center gap-2">
-              <Checkbox
-                id="select-all"
-                checked={allSelected ? true : someSelected ? 'indeterminate' : false}
-                onCheckedChange={() => toggleSelectAll()}
-                aria-label={t('select_all_aria')}
-              />
-              <label htmlFor="select-all" className="text-sm cursor-pointer">
-                {selectedCount > 0
-                  ? t('selected_count', { count: selectedCount })
-                  : excludedFromBulk > 0
-                    ? t('select_all_count_partial', {
-                        eligible: bulkEligible.length,
-                        total: pendingTotal,
-                        excluded: excludedFromBulk,
-                      })
-                    : t('select_all_count', { count: bulkEligible.length })}
-              </label>
-            </div>
-
-            {/* Only worth showing when there's more than one type to pick from —
-                with a single type it just duplicates "Markera alla". */}
-            {typeCounts.length >= 2 && selectedCount === 0 && (
-              <div className="flex flex-wrap items-center gap-1">
-                <span className="text-xs text-muted-foreground">{t('quick_pick')}</span>
-                {typeCounts.map(([type, count]) => {
-                  const entry = OPERATION_LABEL_KEYS[type]
-                  const label = entry ? t(entry.labelKey) : type
-                  return (
-                    <Button
-                      key={type}
-                      size="sm"
-                      variant="outline"
-                      className="h-7 px-2 text-xs"
-                      onClick={() => selectAllOfType(type)}
-                    >
-                      {label} ({count})
-                    </Button>
-                  )
-                })}
-              </div>
-            )}
-
-            <div className="ml-auto flex items-center gap-2">
-              {selectedCount > 0 && (
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="h-8 px-3 text-xs"
-                  onClick={() => setSelectedIds(new Set())}
+      <div>
+        {/* Bulkbar (concept): hidden until at least one operation is selected
+            via the hover checkboxes, then it pops in with the count, the batch
+            actions, and the selection shortcuts as quiet links. */}
+        {showBulkControls && selectedCount > 0 && (
+          <div className="flex flex-wrap items-center gap-x-5 gap-y-2 border-b border-border px-1 py-2.5 text-[12.5px] animate-fade-in">
+            <span className="whitespace-nowrap">
+              <strong className="font-semibold tabular-nums">{selectedCount}</strong>{' '}
+              {t('bulkbar_selected', { count: selectedCount })}
+            </span>
+            <Button
+              size="sm"
+              disabled={isBulkCommitting || isRejecting}
+              onClick={() => setShowBulkDialog(true)}
+            >
+              {t('approve_count', { count: selectedCount })}
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={isRejecting || isBulkCommitting}
+              onClick={() => openRejectDialog('bulk')}
+            >
+              {t('reject_count', { count: selectedCount })}
+            </Button>
+            {typeCounts.length >= 2 &&
+              typeCounts.map(([type, count]) => (
+                <button
+                  key={type}
+                  type="button"
+                  className={QUIET_LINK_CLASS}
+                  onClick={() => selectAllOfType(type)}
                 >
-                  {t('deselect')}
-                </Button>
-              )}
-              <Button
-                size="sm"
-                className="h-8 px-3 text-xs"
-                disabled={selectedCount === 0 || isBulkCommitting}
-                onClick={() => setShowBulkDialog(true)}
-              >
-                {selectedCount > 0
-                  ? t('approve_selected', { count: selectedCount })
-                  : t('approve_selected_none')}
-              </Button>
-            </div>
-          </DataListHeader>
+                  {operationLabel(type, t)} ({count})
+                </button>
+              ))}
+            {!allSelected && (
+              <button type="button" className={QUIET_LINK_CLASS} onClick={toggleSelectAll}>
+                {t('select_all_count', { count: bulkEligible.length })}
+              </button>
+            )}
+            {excludedFromBulk > 0 && (
+              <span className="text-muted-foreground">
+                {t('bulk_excluded_note', { count: excludedFromBulk })}
+              </span>
+            )}
+            <button
+              type="button"
+              className={QUIET_LINK_CLASS}
+              onClick={() => setSelectedIds(new Set())}
+            >
+              {t('deselect')}
+            </button>
+          </div>
         )}
 
         {isLoading ? (
           <DataListLoading />
         ) : filteredOperations.length === 0 ? (
-          <DataListEmpty
-            icon={<ClipboardCheck className="h-6 w-6" />}
-            title={
-              activeTab === 'pending'
-                ? t('empty_pending_title')
-                : activeTab === 'committed'
-                  ? t('empty_committed_title')
-                  : t('empty_rejected_title')
-            }
-            description={
-              activeTab === 'pending'
-                ? t('empty_pending_description')
-                : t('empty_finished_description')
-            }
-          />
+          activeTab === 'pending' ? (
+            /* Concept empty state: the queue is the good news. */
+            <div className="flex flex-col items-center px-6 py-16 text-center">
+              <Check className="h-9 w-9 text-success" strokeWidth={2.5} aria-hidden />
+              <p className="mt-3 font-display text-xl">{t('empty_pending_title')}</p>
+              <p className="mt-1.5 max-w-[44ch] text-[13px] text-muted-foreground">
+                {t('empty_pending_description')}
+              </p>
+            </div>
+          ) : (
+            <DataListEmpty
+              icon={<ClipboardCheck className="h-6 w-6" />}
+              title={t('empty_history_title')}
+              description={t('empty_finished_description')}
+            />
+          )
         ) : (
-          filteredOperations.map((op) => {
-            const entry = OPERATION_LABEL_KEYS[op.operation_type]
-            const config = entry
-              ? { label: t(entry.labelKey), icon: entry.icon, variant: entry.variant }
-              : { label: op.operation_type, icon: ClipboardCheck, variant: 'default' as const }
-            const isExpanded = expandedId === op.id
-            const period = getPeriodStatus(op)
-            const periodLocked = period != null && period.status !== 'open'
-            const canBulkSelect =
-              showBulkControls && op.status === 'pending' && op.risk_level !== 'high' && !periodLocked
-            const isSelected = selectedIds.has(op.id)
-            const isAgent = op.actor_type && op.actor_type !== 'user'
-            const conversationId = op.agent_metadata?.conversation_id ?? null
-            const warningSentence = singleActionWarning(op.operation_type)
-            const showHighRiskWarning =
-              op.risk_level === 'high' && warningSentence && op.status === 'pending'
+          <div className="stagger-enter">
+            {filteredOperations.map((op) => {
+              const period = getPeriodStatus(op)
+              const periodLocked = period != null && period.status !== 'open'
+              const canBulkSelect =
+                showBulkControls && op.status === 'pending' && op.risk_level !== 'high' && !periodLocked
+              const isSelected = selectedIds.has(op.id)
+              const isAgent = op.actor_type && op.actor_type !== 'user'
+              const warningSentence = singleActionWarning(op.operation_type)
+              const showHighRiskWarning =
+                op.risk_level === 'high' && warningSentence && op.status === 'pending'
 
-            return (
-              <DataListRow
-                key={op.id}
-                selected={isSelected}
-                expanded={isExpanded}
-                onClick={() => setExpandedId(isExpanded ? null : op.id)}
-                leading={
-                  canBulkSelect ? (
-                    <div onClick={(e) => e.stopPropagation()}>
+              if (op.status !== 'pending') {
+                // Historik row (concept k-row): status chip + text + sub line.
+                const resolvedAt = op.resolved_at ?? op.created_at
+                const sub = [
+                  formatRelativeTime(resolvedAt),
+                  operationLabel(op.operation_type, t),
+                  originLabel(op, t),
+                ]
+                  .filter(Boolean)
+                  .join(' · ')
+                return (
+                  <div
+                    key={op.id}
+                    role="button"
+                    tabIndex={0}
+                    aria-label={op.title}
+                    onClick={() => setDetailOpId(op.id)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault()
+                        setDetailOpId(op.id)
+                      }
+                    }}
+                    className={cn(
+                      'group flex cursor-pointer items-start gap-3 border-b border-border px-1 py-3 transition-colors duration-150',
+                      detailOpId === op.id ? 'bg-secondary/25' : 'hover:bg-secondary/35',
+                    )}
+                  >
+                    <Badge
+                      variant={
+                        isAutoExpired(op)
+                          ? 'secondary'
+                          : op.status === 'committed'
+                            ? 'success'
+                            : op.status === 'failed_partial'
+                              ? 'warning'
+                              : 'destructive'
+                      }
+                      className="mt-0.5 shrink-0 font-normal"
+                    >
+                      {isAutoExpired(op)
+                        ? t('badge_auto_expired')
+                        : op.status === 'committed'
+                          ? t('badge_approved')
+                          : op.status === 'failed_partial'
+                            ? t('badge_failed_partial')
+                            : t('badge_rejected')}
+                    </Badge>
+                    <div className="min-w-0 flex-1">
+                      <div className="text-[13.5px] leading-snug">{op.title}</div>
+                      <div className="mt-0.5 text-xs text-muted-foreground">
+                        {sub}
+                        {op.status === 'rejected' && op.rejection_reason
+                          ? ` · ${t('history_reason', { reason: op.rejection_reason })}`
+                          : ''}
+                      </div>
+                      {op.status === 'failed_partial' && (
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          {t('failed_partial_detail')}
+                          {failedPartialPostedIds(op) && (
+                            <span className="font-mono"> ({failedPartialPostedIds(op)})</span>
+                          )}
+                        </p>
+                      )}
+                    </div>
+                    <ChevronRight
+                      className={cn(
+                        'mt-1 h-3.5 w-3.5 shrink-0 text-muted-foreground transition-all duration-200',
+                        detailOpId === op.id ? 'opacity-100' : 'opacity-0 group-hover:opacity-100',
+                      )}
+                    />
+                  </div>
+                )
+              }
+
+              return (
+                <div
+                  key={op.id}
+                  role="button"
+                  tabIndex={0}
+                  aria-label={op.title}
+                  onClick={() => setDetailOpId(op.id)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault()
+                      setDetailOpId(op.id)
+                    }
+                  }}
+                  className={cn(
+                    'group flex cursor-pointer items-start gap-3 border-b border-border px-1 py-4 transition-colors duration-150',
+                    detailOpId === op.id ? 'bg-secondary/25' : 'hover:bg-secondary/35',
+                    isSelected && 'bg-secondary/40',
+                  )}
+                >
+                  {/* Hover-revealed selection checkbox (concept .cb) */}
+                  <span
+                    className="w-[18px] shrink-0 pt-1.5"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    {canBulkSelect && (
                       <Checkbox
                         checked={isSelected}
                         onCheckedChange={() => toggleSelected(op.id)}
                         aria-label={t('select_operation_aria')}
+                        className={cn(
+                          'transition-opacity duration-150',
+                          isSelected
+                            ? 'opacity-100'
+                            : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100',
+                        )}
                       />
+                    )}
+                  </span>
+                  {/* Actor column with the curved thread (concept op-thread):
+                      drops from the icon and elbows toward the action row. */}
+                  <span className="flex w-7 shrink-0 flex-col self-stretch" aria-hidden>
+                    <span className="flex h-7 w-7 items-center justify-center rounded-full border border-border text-muted-foreground">
+                      {isAgent ? <Bot className="h-3.5 w-3.5" /> : <ClipboardCheck className="h-3.5 w-3.5" />}
+                    </span>
+                    <span className="relative min-h-0 flex-1">
+                      <span className="absolute bottom-[11px] left-1/2 top-1 w-3 rounded-bl-lg border-b border-l border-border" />
+                    </span>
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="pt-0.5 text-[11px] uppercase tracking-[0.07em] text-muted-foreground">
+                      {sourceLine(op)}
                     </div>
-                  ) : undefined
-                }
-                trailing={
-                  op.status === 'pending' ? (
-                    <>
-                      <Button
-                        size="sm"
-                        className="h-8 px-3 text-xs"
-                        disabled={periodLocked}
+                    <div className="mt-1 text-[13.5px] leading-snug">{op.title}</div>
+                    {showHighRiskWarning && (
+                      <p className="mt-1 flex items-start gap-1 text-xs text-destructive">
+                        <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+                        <span>{warningSentence}</span>
+                      </p>
+                    )}
+                    {/* Action pills under the text (concept gact) */}
+                    <div className="mt-2.5 flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        className={cn(GACT_CLASS, GACT_OK_CLASS)}
+                        disabled={periodLocked || isCommitting || isBulkCommitting}
                         title={periodLocked ? 'Perioden är låst' : undefined}
                         onClick={(e) => {
                           e.stopPropagation()
@@ -1080,96 +1407,141 @@ export default function PendingOperationsPage() {
                           setShowCommitDialog(true)
                         }}
                       >
+                        <Check className="h-3.5 w-3.5" />
                         {t('approve')}
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        className="h-8 px-3 text-xs"
+                      </button>
+                      <button
+                        type="button"
+                        className={cn(GACT_CLASS, GACT_NO_CLASS)}
+                        disabled={isRejecting}
                         onClick={(e) => {
                           e.stopPropagation()
                           openRejectDialog(op)
                         }}
                       >
+                        <X className="h-3.5 w-3.5" />
                         {t('reject')}
-                      </Button>
-                    </>
-                  ) : undefined
-                }
-                expandedContent={
-                  <>
-                    {/* Period-lock banner sits ABOVE the preview so the reviewer
-                        sees the blocker as soon as they expand the row. */}
-                    {periodLocked && period && op.status === 'pending' && (
-                      <div className="mb-3">
-                        <PeriodLockBanner period={period} />
-                      </div>
-                    )}
-                    <OperationPreview op={op} />
-                  </>
-                }
-              >
-                <DataListPrimary>{op.title}</DataListPrimary>
-                <DataListMeta>
-                  <span className="font-medium text-foreground/70">{config.label}</span>
-                  {isAgent && (
-                    <>
-                      <DataListMetaSeparator />
-                      <span className="inline-flex items-center gap-1">
-                        <Bot className="h-3 w-3" />
-                        {/* The origin line doubles as the deep-link into the
-                            originating conversation — no separate strip needed. */}
-                        {conversationId ? (
-                          <a
-                            href={`/pending?conversation=${conversationId}`}
-                            className="hover:underline"
-                            onClick={(e) => e.stopPropagation()}
-                          >
-                            {originLabel(op, t) ?? op.actor_label ?? op.actor_type}
-                          </a>
-                        ) : (
-                          originLabel(op, t) ?? op.actor_label ?? op.actor_type
-                        )}
-                      </span>
-                    </>
-                  )}
-                  <DataListMetaSeparator />
-                  <span>{formatRelativeTime(op.created_at)}</span>
-                  {op.risk_level === 'high' && (
-                    <Badge variant="destructive" className="ml-1 h-4 px-1.5 py-0 text-[10px]">
-                      {t('badge_high_risk')}
-                    </Badge>
-                  )}
-                  {isAutoExpired(op) && (
-                    <Badge variant="secondary" className="ml-1 h-4 px-1.5 py-0 text-[10px]">
-                      {t('badge_auto_expired')}
-                    </Badge>
-                  )}
-                </DataListMeta>
-                {showHighRiskWarning && (
-                  <p className="mt-1 flex items-start gap-1 text-xs text-destructive">
-                    <AlertTriangle className="h-3 w-3 mt-0.5 shrink-0" />
-                    <span>{warningSentence}</span>
-                  </p>
-                )}
-                {op.status === 'rejected' && op.rejection_category && (
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    Avvisad: {REJECTION_CATEGORY_LABELS[op.rejection_category]}
-                    {op.rejection_reason ? ` — "${op.rejection_reason}"` : ''}
-                  </p>
-                )}
-                {/* rejection_category is always NULL on auto-expired rows, so
-                    this never collides with the manual-rejection line above. */}
-                {isAutoExpired(op) && (
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    {t('auto_expired_detail')}
-                  </p>
-                )}
-              </DataListRow>
-            )
-          })
+                      </button>
+                      <button
+                        type="button"
+                        className={cn(GACT_CLASS, GACT_NEUTRAL_CLASS)}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          setDetailOpId(op.id)
+                        }}
+                      >
+                        <Info className="h-3.5 w-3.5" />
+                        {t('details_btn')}
+                      </button>
+                    </div>
+                  </div>
+                  {/* Risk chip (concept op-risk) */}
+                  <Badge
+                    variant={op.risk_level === 'high' ? 'destructive' : 'outline'}
+                    className="mt-1 shrink-0 font-normal"
+                  >
+                    {op.risk_level === 'high'
+                      ? t('badge_high_risk')
+                      : op.risk_level === 'medium'
+                        ? t('badge_medium_risk')
+                        : t('badge_low_risk')}
+                  </Badge>
+                </div>
+              )
+            })}
+          </div>
         )}
-      </DataList>
+      </div>
+
+      {/* Detail slide-over (convention 13): the review surface. Derived from
+          the live list, so a realtime refetch that resolves the op closes it. */}
+      <SlideOver
+        open={detailOp != null}
+        onOpenChange={(open) => {
+          if (!open) setDetailOpId(null)
+        }}
+      >
+        <SlideOverContent aria-describedby={undefined}>
+          {detailOp && (
+            <>
+              <SlideOverHeader kicker={sourceLine(detailOp)} title={detailOp.title} />
+              <SlideOverBody className="space-y-4">
+                {detailPeriodLocked && detailPeriod && detailOp.status === 'pending' && (
+                  <PeriodLockBanner period={detailPeriod} />
+                )}
+                {/* The operation itself in its own box (concept): what the
+                    agent is about to do, clearly framed. */}
+                <div className="rounded-lg border border-border p-4">
+                  <OperationPreview op={detailOp} />
+                </div>
+                {detailOp.status === 'pending' && singleActionWarning(detailOp.operation_type) && (
+                  <div className="rounded-lg border border-border bg-secondary/25 px-3 py-2">
+                    <p className="text-xs leading-snug text-muted-foreground">
+                      {singleActionWarning(detailOp.operation_type)}
+                    </p>
+                  </div>
+                )}
+                {detailOp.status === 'rejected' && detailOp.rejection_category && (
+                  <div className="rounded-lg border border-border bg-secondary/25 px-3 py-2">
+                    <p className="text-xs leading-snug text-muted-foreground">
+                      Avvisad: {REJECTION_CATEGORY_LABELS[detailOp.rejection_category]}
+                      {detailOp.rejection_reason ? `, "${detailOp.rejection_reason}"` : ''}
+                    </p>
+                  </div>
+                )}
+                {isAutoExpired(detailOp) && (
+                  <p className="text-xs text-muted-foreground">{t('auto_expired_detail')}</p>
+                )}
+                {detailOp.status === 'failed_partial' && (
+                  <div className="rounded-lg border border-border bg-secondary/25 px-3 py-2">
+                    <p className="text-xs leading-snug text-muted-foreground">
+                      {t('failed_partial_detail')}
+                      {failedPartialPostedIds(detailOp) && (
+                        <span className="font-mono"> ({failedPartialPostedIds(detailOp)})</span>
+                      )}
+                    </p>
+                  </div>
+                )}
+              </SlideOverBody>
+              <SlideOverFooter>
+                {detailConversationId && (
+                  <button
+                    type="button"
+                    className={cn(QUIET_LINK_CLASS, 'mr-auto')}
+                    onClick={() => {
+                      setConversationFilter(detailConversationId)
+                      setDetailOpId(null)
+                    }}
+                  >
+                    {t('show_conversation')}
+                  </button>
+                )}
+                {detailOp.status === 'pending' && (
+                  <>
+                    <Button
+                      variant="outline"
+                      onClick={() => openRejectDialog(detailOp)}
+                      disabled={isRejecting}
+                    >
+                      {t('reject')}
+                    </Button>
+                    <Button
+                      disabled={detailPeriodLocked || isCommitting}
+                      title={detailPeriodLocked ? 'Perioden är låst' : undefined}
+                      onClick={() => {
+                        setSelectedOp(detailOp)
+                        setShowCommitDialog(true)
+                      }}
+                    >
+                      {t('approve')}
+                    </Button>
+                  </>
+                )}
+              </SlideOverFooter>
+            </>
+          )}
+        </SlideOverContent>
+      </SlideOver>
 
       {/* Commit confirmation dialog */}
       <ConfirmationDialog
@@ -1210,14 +1582,21 @@ export default function PendingOperationsPage() {
         </div>
       </ConfirmationDialog>
 
-      {/* Reject dialog — category + free-text reason. Both optional so the user
-          can still reject quickly without filling anything in. */}
-      <Dialog open={rejectOp != null} onOpenChange={(open) => { if (!open) setRejectOp(null) }}>
+      {/* Reject dialog: category + free-text reason. Both optional so the user
+          can still reject quickly without filling anything in. Doubles as the
+          bulk-reject confirmation; the feedback then applies to every selected op. */}
+      <Dialog open={rejectTarget != null} onOpenChange={(open) => { if (!open) setRejectTarget(null) }}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>Avvisa operation</DialogTitle>
+            <DialogTitle>
+              {rejectTarget === 'bulk'
+                ? t('reject_bulk_title', { count: selectedCount })
+                : 'Avvisa operation'}
+            </DialogTitle>
             <DialogDescription>
-              {rejectOp?.title}
+              {rejectTarget === 'bulk'
+                ? t('reject_bulk_description')
+                : rejectTarget?.title}
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-3">
@@ -1252,16 +1631,22 @@ export default function PendingOperationsPage() {
                 maxLength={2000}
               />
               <p className="text-xs text-muted-foreground">
-                Synlig för agenten via gnubok_get_recent_rejections — hjälper den att korrigera nästa förslag.
+                Synlig för agenten via gnubok_get_recent_rejections: hjälper den att korrigera nästa förslag.
               </p>
             </div>
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setRejectOp(null)} disabled={isRejecting}>
+            <Button variant="outline" onClick={() => setRejectTarget(null)} disabled={isRejecting}>
               Avbryt
             </Button>
             <Button variant="destructive" onClick={handleReject} disabled={isRejecting}>
-              {isRejecting ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Avvisa'}
+              {isRejecting ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : rejectTarget === 'bulk' ? (
+                t('reject_count', { count: selectedCount })
+              ) : (
+                'Avvisa'
+              )}
             </Button>
           </DialogFooter>
         </DialogContent>

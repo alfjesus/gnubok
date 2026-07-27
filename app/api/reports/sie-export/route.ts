@@ -1,7 +1,8 @@
 import { NextResponse } from 'next/server'
-import { generateSIEExport } from '@/lib/reports/sie-export'
+import { generateSIEExport, encodeSIEToCP437 } from '@/lib/reports/sie-export'
 import { withRouteContext } from '@/lib/api/with-route-context'
 import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 export const GET = withRouteContext(
   'report.sie_export',
@@ -11,6 +12,7 @@ export const GET = withRouteContext(
     const { searchParams } = new URL(request.url)
     const periodId = searchParams.get('period_id')
     const excludeClosing = searchParams.get('exclude_closing') === 'true'
+    const useCP437 = searchParams.get('encoding') === 'cp437'
 
     if (!periodId) {
       return errorResponseFromCode('REPORT_PERIOD_REQUIRED', log, { requestId })
@@ -34,12 +36,16 @@ export const GET = withRouteContext(
         company_name: company.company_name || 'Unknown',
         org_number: company.org_number,
         exclude_year_end_closing: excludeClosing,
+        emit_format_pc8: useCP437,
       })
 
-      return new NextResponse(sieContent, {
+      const body = useCP437 ? Buffer.from(encodeSIEToCP437(sieContent)) : sieContent
+      const contentType = useCP437 ? 'application/octet-stream' : 'text/plain; charset=utf-8'
+
+      return new NextResponse(body, {
         status: 200,
         headers: {
-          'Content-Type': 'text/plain; charset=utf-8',
+          'Content-Type': contentType,
           'Content-Disposition': `attachment; filename="export_${periodId}.se"`,
           'X-Request-Id': requestId,
         },
@@ -48,7 +54,7 @@ export const GET = withRouteContext(
       opLog.error('sie export generation failed', err as Error)
       return errorResponseFromCode('SIE_EXPORT_FAILED', opLog, {
         requestId,
-        details: { reason: err instanceof Error ? err.message : 'unknown' },
+        details: { reason: err instanceof Error ? getUserErrorMessage(err) : 'unknown' },
       })
     }
   },

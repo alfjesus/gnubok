@@ -1,14 +1,51 @@
 import type { ComponentType } from 'react'
-import { AccountSettingsContent } from './AccountSettingsContent'
-import { CompanySettingsContent } from './CompanySettingsContent'
-import { BookkeepingSettingsContent } from './BookkeepingSettingsContent'
-import { TaxSettingsContent } from './TaxSettingsContent'
-import { SalarySettingsContent } from './SalarySettingsContent'
-import { InvoicingSettingsContent } from './InvoicingSettingsContent'
-import { TemplatesSettingsContent } from './TemplatesSettingsContent'
-import { BankingSettingsContent } from './BankingSettingsContent'
-import { AssistantSettingsContent } from './AssistantSettingsContent'
-import { ApiSettingsContent } from './ApiSettingsContent'
+import dynamic from 'next/dynamic'
+import { SettingsLoadingSkeleton } from '../SettingsLoadingSkeleton'
+
+const AccountSettingsContent = dynamic(() =>
+  import('./AccountSettingsContent').then((module) => ({ default: module.AccountSettingsContent })),
+  { loading: SettingsLoadingSkeleton },
+)
+const CompanySettingsContent = dynamic(() =>
+  import('./CompanySettingsContent').then((module) => ({ default: module.CompanySettingsContent })),
+  { loading: SettingsLoadingSkeleton },
+)
+const BookkeepingSettingsContent = dynamic(() =>
+  import('./BookkeepingSettingsContent').then((module) => ({ default: module.BookkeepingSettingsContent })),
+  { loading: SettingsLoadingSkeleton },
+)
+const TaxSettingsContent = dynamic(() =>
+  import('./TaxSettingsContent').then((module) => ({ default: module.TaxSettingsContent })),
+  { loading: SettingsLoadingSkeleton },
+)
+const SalarySettingsContent = dynamic(() =>
+  import('./SalarySettingsContent').then((module) => ({ default: module.SalarySettingsContent })),
+  { loading: SettingsLoadingSkeleton },
+)
+const InvoicingSettingsContent = dynamic(() =>
+  import('./InvoicingSettingsContent').then((module) => ({ default: module.InvoicingSettingsContent })),
+  { loading: SettingsLoadingSkeleton },
+)
+const TemplatesSettingsContent = dynamic(() =>
+  import('./TemplatesSettingsContent').then((module) => ({ default: module.TemplatesSettingsContent })),
+  { loading: SettingsLoadingSkeleton },
+)
+const BankingSettingsContent = dynamic(() =>
+  import('./BankingSettingsContent').then((module) => ({ default: module.BankingSettingsContent })),
+  { loading: SettingsLoadingSkeleton },
+)
+const AssistantSettingsContent = dynamic(() =>
+  import('./AssistantSettingsContent').then((module) => ({ default: module.AssistantSettingsContent })),
+  { loading: SettingsLoadingSkeleton },
+)
+const ApiSettingsContent = dynamic(() =>
+  import('./ApiSettingsContent').then((module) => ({ default: module.ApiSettingsContent })),
+  { loading: SettingsLoadingSkeleton },
+)
+const BillingSettingsContent = dynamic(() =>
+  import('./BillingSettingsContent').then((module) => ({ default: module.BillingSettingsContent })),
+  { loading: SettingsLoadingSkeleton },
+)
 
 /**
  * Single source of truth mapping a settings section id to the component that
@@ -28,6 +65,7 @@ export const SETTINGS_SECTIONS: Record<string, ComponentType> = {
   banking: BankingSettingsContent,
   assistant: AssistantSettingsContent,
   api: ApiSettingsContent,
+  billing: BillingSettingsContent,
 }
 
 export type SettingsSectionId = keyof typeof SETTINGS_SECTIONS

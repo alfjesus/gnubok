@@ -3,7 +3,7 @@
  *
  * Mirror of voucher-matching.ts but targets 2440 (Leverantörsskulder) debits
  * instead of 151x credits. Used when the GL already contains a verifikat that
- * pays down AP — e.g. an SIE-imported payment voucher, a manually entered
+ * pays down AP, e.g. an SIE-imported payment voucher, a manually entered
  * bank-transfer voucher, or any flow where the bookkeeping landed without
  * supplier-invoice linkage. No new journal entry is created. Only a
  * supplier_invoice_payments row is inserted pointing at the existing
@@ -13,7 +13,7 @@
  * Vouchers that book the supplier expense directly without going through 2440
  * (e.g. Dr 4010 / Cr 1930 for a non-invoiced purchase) are rejected with
  * LINK_SI_VOUCHER_NO_AP_DEBIT. The proper fix for those is a storno+correction
- * via gnubok_correct_entry — out of scope for V1.
+ * via gnubok_correct_entry: out of scope for V1.
  */
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { eventBus } from '@/lib/events/bus'
@@ -25,15 +25,17 @@ import {
   customerNameMatches,
 } from './invoice-matching'
 import { autoReconcileTransactionForLinkedVoucher } from '@/lib/reconciliation/bank-reconciliation'
+import { documentCurrency, ledgerLineSideAmountIn } from '@/lib/bookkeeping/ledger-line-amount'
 import type { SupplierInvoice, Supplier } from '@/types'
+import { fetchEntryLines, type EntryLinesQuery } from '@/lib/bookkeeping/entry-lines'
 
 const log = createLogger('supplier-voucher-matching')
 
-/** AP account class. BAS 2026 reserves 2440–2449 for Leverantörsskulder
+/** AP account class. BAS 2026 reserves 2440-2449 for Leverantörsskulder
  *  (2440 SEK, 2441 utländsk valuta, 2443 Skuldfakturor, 2448 övriga). The
  *  supplier sub-ledger lives in the supplier_invoices table, not in per-
  *  supplier accounts. A samlingsverifikat that pays mixed SEK + EUR
- *  suppliers will legitimately debit both 2440 and 2441 — summing across
+ *  suppliers will legitimately debit both 2440 and 2441: summing across
  *  the 244x range catches that. PR #602 Swedish-compliance fix. */
 const AP_ACCOUNT_PREFIX = '244'
 
@@ -52,12 +54,17 @@ export interface SupplierVoucherCandidate {
   voucher_number: number | null
   entry_date: string
   description: string
-  /** Total debit on the AP account (2440) on this voucher, always positive. */
+  /** Total debit on the AP account (2440) on this voucher, always positive.
+   *  Expressed in `currency` below (the INVOICE's currency), never in the raw
+   *  SEK ledger column: see ledgerLineSideAmountIn. */
   ap_debit_amount: number
+  /** The unit `ap_debit_amount` is quoted in: always the invoice's currency. */
   currency: string
   /** Currency of the AP-debit line; nullable when the line stores SEK only. */
   ap_line_currency: string | null
-  /** True when the voucher's fiscal period is closed or locked. */
+  /** True when the voucher's fiscal period is closed (`is_closed`) or locked
+   *  (`locked_at`), and also when that state could not be read: the flag never
+   *  reports "open" on a failed lookup. */
   period_locked: boolean
   /** Confidence score 0..1 (or 0.99 for OCR match). */
   confidence: number
@@ -71,7 +78,10 @@ interface JournalEntryLine {
   account_number: string
   debit_amount: number | null
   credit_amount: number | null
+  /** Labels the DOCUMENT, NOT the unit of debit_amount/credit_amount. */
   currency: string | null
+  /** The line's amount in `currency`: the only non-SEK figure on the row. */
+  amount_in_currency: number | string | null
 }
 
 interface VoucherRow {
@@ -85,9 +95,14 @@ interface VoucherRow {
   fiscal_period_id: string
 }
 
+/** fiscal_periods carries no `status` column: lock state is the (is_closed,
+ *  locked_at) pair, which is exactly what enforce_period_lock() reads in
+ *  migration 20240101000017 and what resolvePeriodStatusForDate() uses in
+ *  lib/core/bookkeeping/period-service.ts. */
 interface FiscalPeriodRow {
   id: string
-  status: string
+  is_closed: boolean | null
+  locked_at: string | null
 }
 
 interface CandidateContext {
@@ -121,37 +136,51 @@ export async function findMatchingVouchersForSupplierInvoice(
   const dateTo = new Date(dueDate)
   dateTo.setDate(dateTo.getDate() + windowDays)
 
-  const { data: lines, error } = await supabase
-    .from('journal_entry_lines')
-    .select(
-      `
-      id,
-      journal_entry_id,
-      account_number,
-      debit_amount,
-      credit_amount,
-      currency,
-      journal_entries!inner (
-        id,
-        voucher_series,
-        voucher_number,
-        entry_date,
-        description,
-        status,
-        source_type,
-        fiscal_period_id,
-        company_id
-      )
-      `,
-    )
-    .eq('journal_entries.company_id', companyId)
-    .eq('journal_entries.status', 'posted')
-    .like('account_number', `${AP_ACCOUNT_PREFIX}%`)
-    .gt('debit_amount', 0)
-    .gte('journal_entries.entry_date', dateFrom.toISOString().slice(0, 10))
-    .lte('journal_entries.entry_date', dateTo.toISOString().slice(0, 10))
-    .limit(limit * 10)
-  if (error || !lines) return []
+  // Driven from the journal_entries side (lib/bookkeeping/entry-lines.ts):
+  // the scope filters used to sit on a `journal_entries!inner` embed, which
+  // PostgREST compiles into a correlated LATERAL join that walks the ENTIRE
+  // journal_entry_lines table across all tenants. The old `.limit(limit * 10)`
+  // went with the embed: the match set is one company's AP debits inside a
+  // date window around the due date, and an arbitrary cap could drop the
+  // exact-amount voucher the ranking below is looking for.
+  // `amount_in_currency` is part of the column list on purpose: on a foreign
+  // invoice it is the ONLY column quoted in the invoice's currency (debit_amount
+  // is always SEK). Dropping it here would make every FX line unconvertible and
+  // this matcher would silently return no candidates.
+  // `documentCurrency()` and not `invoice.currency` directly: a NULL code would
+  // test `!== 'SEK'` and send a plain domestic invoice down the FX path where
+  // nothing is convertible. The label guard in scoreCandidate still compares
+  // the RAW `invoice.currency`, so such a row behaves as it did before.
+  const invoiceCurrency = documentCurrency(invoice.currency)
+  const isForeignInvoice = invoiceCurrency !== 'SEK'
+  let lines: Array<JournalEntryLine & { journal_entries: VoucherRow }>
+  try {
+    lines = await fetchEntryLines({
+      supabase,
+      entryColumns:
+        'id, voucher_series, voucher_number, entry_date, description, status, source_type, fiscal_period_id, company_id',
+      lineColumns:
+        'id, journal_entry_id, account_number, debit_amount, credit_amount, currency, amount_in_currency',
+      filterEntries: (q: EntryLinesQuery) =>
+        q
+          .eq('company_id', companyId)
+          .eq('status', 'posted')
+          .gte('entry_date', dateFrom.toISOString().slice(0, 10))
+          .lte('entry_date', dateTo.toISOString().slice(0, 10)),
+      filterLines: (q: EntryLinesQuery) => {
+        const scoped = q.like('account_number', `${AP_ACCOUNT_PREFIX}%`).gt('debit_amount', 0)
+        // Only lines actually labelled with the invoice's currency can be
+        // expressed in it at all; everything else is unscoreable, so this is a
+        // strict superset of what survives scoring and keeps the FX candidate
+        // set small. No-op on a SEK invoice.
+        return isForeignInvoice ? scoped.eq('currency', invoiceCurrency) : scoped
+      },
+    })
+  } catch {
+    // Unchanged posture: a candidate-search failure returns no candidates
+    // rather than breaking the reconciliation screen.
+    return []
+  }
 
   // Sum the AP debit per voucher across multiple 2440 lines (a samlings-
   // verifikation paying several supplier invoices in one shot will have one
@@ -161,16 +190,17 @@ export async function findMatchingVouchersForSupplierInvoice(
     { entry: VoucherRow; apDebitTotal: number; lineCurrency: string | null }
   >()
 
-  for (const raw of lines) {
-    const line = raw as unknown as JournalEntryLine & {
-      journal_entries: VoucherRow
-    }
+  for (const line of lines) {
     const entry = line.journal_entries
     if (!entry) continue
     if (EXCLUDED_SOURCE_TYPES.includes(entry.source_type ?? '')) continue
 
-    const debit = Number(line.debit_amount ?? 0)
-    if (debit <= 0) continue
+    // The AP debit quoted in the INVOICE's currency. On SEK this reads
+    // debit_amount exactly as before; on a foreign invoice it reads
+    // amount_in_currency and returns null for a line that carries no figure
+    // in that currency.
+    const debit = ledgerLineSideAmountIn(line, invoiceCurrency, 'debit')
+    if (debit === null || debit <= 0) continue
 
     const existing = byEntry.get(entry.id)
     if (existing) {
@@ -203,23 +233,34 @@ export async function findMatchingVouchersForSupplierInvoice(
   for (const id of alreadyLinked) byEntry.delete(id)
   if (byEntry.size === 0) return []
 
-  // Period-lock flags (informational — linking is allowed in locked periods
+  // Period-lock flags (informational, linking is allowed in locked periods
   // because no JE is mutated).
   const periodIds = Array.from(
     new Set(Array.from(byEntry.values()).map((v) => v.entry.fiscal_period_id)),
   )
-  const { data: periods } = await supabase
+  const { data: periods, error: periodsError } = await supabase
     .from('fiscal_periods')
-    .select('id, status')
+    .select('id, is_closed, locked_at')
     .in('id', periodIds)
+
+  // Fail closed when the period state cannot be read: the flag is advisory
+  // (linking mutates no journal entry), so over-flagging costs a badge, while
+  // claiming "open" would tell the user a period is writable right before the
+  // enforce_period_lock trigger refuses the write.
+  const periodStateUnknown = !!periodsError || !periods
+  if (periodStateUnknown) {
+    log.warn('fiscal period lock state unavailable, flagging candidates as locked', {
+      companyId,
+      supplierInvoiceId: invoice.id,
+      reason: periodsError?.message,
+    })
+  }
   const lockedPeriods = new Set(
-    (periods ?? [])
-      .filter(
-        (p) =>
-          (p as FiscalPeriodRow).status === 'closed' ||
-          (p as FiscalPeriodRow).status === 'locked',
-      )
-      .map((p) => (p as FiscalPeriodRow).id),
+    periodStateUnknown
+      ? periodIds
+      : (periods as FiscalPeriodRow[])
+          .filter((p) => Boolean(p.is_closed) || Boolean(p.locked_at))
+          .map((p) => p.id),
   )
 
   const ctx: CandidateContext = { invoice, remainingAmount }
@@ -270,8 +311,14 @@ function scoreCandidate(
     }
   }
 
-  // Currency check — 2440 line currency must match invoice currency (or be
-  // unset, which we treat as the invoice currency).
+  // Label guard, unchanged in shape. It is no longer what makes the amounts
+  // comparable (that used to be the bug: `lineCurrency ?? invoice.currency`
+  // passes on exactly the FX rows it existed to catch, and the SEK
+  // debit_amount was then compared against a foreign remainder).
+  // `apDebitTotal` already arrives expressed in ctx.invoice.currency, and any
+  // line that could not be expressed there was dropped before summing. What
+  // survives here is the counterparty discriminator: a 244x debit stamped with
+  // another document's currency belongs to another supplier invoice.
   const lineCurrencyEffective = lineCurrency ?? ctx.invoice.currency
   if (lineCurrencyEffective !== ctx.invoice.currency) {
     return null
@@ -285,7 +332,7 @@ function scoreCandidate(
     !exactTotal &&
     amountsMatchFuzzy(apDebitTotal, ctx.remainingAmount)
 
-  // Supplier name in description — reuse customer-side helper since the logic
+  // Supplier name in description: reuse customer-side helper since the logic
   // (significant tokens of the counterparty name appearing in free text) is
   // identical regardless of AR vs AP.
   const supplierMatch = customerNameMatches(
@@ -393,35 +440,68 @@ export async function validateVoucherForSupplierInvoiceLink(
     }
   }
 
+  // `amount_in_currency` is not optional here: on a foreign invoice it is the
+  // ONLY column quoted in the invoice's currency. Omitting it from the column
+  // list would leave every FX line unconvertible and this guard would reject
+  // vouchers it should accept.
   const { data: lines, error: linesError } = await supabase
     .from('journal_entry_lines')
-    .select('account_number, debit_amount, credit_amount, currency')
+    .select('account_number, debit_amount, credit_amount, currency, amount_in_currency')
     .eq('journal_entry_id', journalEntryId)
   if (linesError || !lines || lines.length === 0) {
     return { ok: false, code: 'LINK_SI_VOUCHER_NO_AP_DEBIT' }
   }
 
+  // Nullable column, non-null type: see documentCurrency(). The label guard
+  // below still compares the RAW invoice.currency, so a NULL row is rejected
+  // exactly as before rather than newly failing as "unconvertible".
+  const invoiceCurrency = documentCurrency(invoice.currency)
   let apDebitTotal = 0
   let lineCurrency: string | null = null
+  // A 244x debit line that carries no amount in the invoice's currency. Fail
+  // CLOSED on it: summing only the convertible lines would silently understate
+  // a voucher that settles more than we can read.
+  let unconvertibleLineCurrency: string | null | undefined
   for (const raw of lines) {
     const line = raw as {
       account_number: string
       debit_amount: number | null
       credit_amount: number | null
       currency: string | null
+      amount_in_currency: number | string | null
     }
     if (!line.account_number?.startsWith(AP_ACCOUNT_PREFIX)) continue
-    const debit = Number(line.debit_amount ?? 0)
+    const debit = ledgerLineSideAmountIn(line, invoiceCurrency, 'debit')
+    if (debit === null) {
+      if ((Number(line.debit_amount) || 0) > 0 && unconvertibleLineCurrency === undefined) {
+        unconvertibleLineCurrency = line.currency
+      }
+      continue
+    }
     if (debit <= 0) continue
     apDebitTotal += debit
     if (!lineCurrency) lineCurrency = line.currency
   }
   apDebitTotal = round2(apDebitTotal)
 
+  if (unconvertibleLineCurrency !== undefined) {
+    return {
+      ok: false,
+      code: 'LINK_SI_VOUCHER_CURRENCY_MISMATCH',
+      details: {
+        invoice_currency: invoice.currency,
+        line_currency: unconvertibleLineCurrency,
+      },
+    }
+  }
+
   if (apDebitTotal <= 0) {
     return { ok: false, code: 'LINK_SI_VOUCHER_NO_AP_DEBIT' }
   }
 
+  // Label guard, unchanged: a counterparty discriminator, not a unit check
+  // (see scoreCandidate). Always passes on a foreign invoice, because only
+  // same-labelled lines could be converted at all.
   const lineCurrencyEffective = lineCurrency ?? invoice.currency
   if (lineCurrencyEffective !== invoice.currency) {
     return {
@@ -526,7 +606,7 @@ export async function linkSupplierInvoiceToVoucher(
   // and applies UPDATE + INSERT in a single PG transaction so a failure on
   // either rolls back automatically. The previous TS implementation did
   // UPDATE-then-INSERT with a manual rollback that could overwrite a
-  // concurrent sibling's successful write — PR #602 review fix.
+  // concurrent sibling's successful write: PR #602 review fix.
   const { data, error } = await supabase.rpc('link_supplier_invoice_to_voucher', {
     p_supplier_invoice_id: params.supplierInvoiceId,
     p_journal_entry_id: params.journalEntryId,
@@ -560,7 +640,7 @@ export async function linkSupplierInvoiceToVoucher(
 
   // Fetch the now-updated invoice for event emission. Lightweight; the RPC
   // committed before this read so the row reflects post-link state.
-  // select('*') is intentional — the supplier_invoice.paid event payload is
+  // select('*') is intentional: the supplier_invoice.paid event payload is
   // typed as `supplierInvoice: SupplierInvoice` in lib/events/types.ts, so
   // narrowing here would either break the subscriber contract or require a
   // separate event payload type. The event stays in-process (eventBus is a
@@ -588,7 +668,7 @@ export async function linkSupplierInvoiceToVoucher(
     } catch (err) {
       // Event emission failure must not block the response, but should leave
       // an audit trail (ISO 27001:2022 A.8.15 / OWASP V16). Logged at warn
-      // because the link itself succeeded — the downstream reminder/audit
+      // because the link itself succeeded: the downstream reminder/audit
       // subscriber will need separate intervention.
       log.warn('supplier_invoice.paid event emission failed', {
         err,
@@ -600,7 +680,7 @@ export async function linkSupplierInvoiceToVoucher(
 
   // Close the loop on the bank feed: the link above only advanced the supplier
   // invoice, leaving the bank transaction that paid it in the Transactions
-  // inbox. Reconcile it to the same verifikat when unambiguous. Best-effort —
+  // inbox. Reconcile it to the same verifikat when unambiguous. Best-effort:
   // the link RPC has already committed.
   let reconciledTransactionId: string | null = null
   try {

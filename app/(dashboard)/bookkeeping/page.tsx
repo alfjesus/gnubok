@@ -1,27 +1,40 @@
 'use client'
 
 import { useState, useEffect, useMemo } from 'react'
-import Link from 'next/link'
+import dynamic from 'next/dynamic'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { useTranslations } from 'next-intl'
-import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
-import { Button } from '@/components/ui/button'
 import JournalEntryList from '@/components/bookkeeping/JournalEntryList'
 import { type FormLine } from '@/components/bookkeeping/JournalEntryForm'
-import NewJournalEntryDialog, { type CopyPrefill } from '@/components/bookkeeping/NewJournalEntryDialog'
-import ChartOfAccountsManager from '@/components/bookkeeping/ChartOfAccountsManager'
+import type { CopyPrefill } from '@/components/bookkeeping/NewJournalEntryDialog'
+import { DialogLoadingSkeleton } from '@/components/ui/dialog-loading-skeleton'
+import { SplitButton } from '@/components/ui/split-button'
+import { useAgentSheet } from '@/components/agent/AgentSheetProvider'
+import { useUiState } from '@/lib/hooks/use-ui-state'
+import { resolveInitialMode } from '@/lib/ui-state/client'
 import { useToast } from '@/components/ui/use-toast'
-import { Lock, Plus } from 'lucide-react'
+import { Plus, LayoutTemplate, Sparkles } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { formatVoucher } from '@/lib/bookkeeping/voucher-series-resolver'
 import type { JournalEntry, JournalEntryLine } from '@/types'
+
+const NewJournalEntryDialog = dynamic(
+  () => import('@/components/bookkeeping/NewJournalEntryDialog'),
+  { loading: DialogLoadingSkeleton },
+)
+const TemplateBookDialog = dynamic(
+  () => import('@/components/bookkeeping/TemplateBookDialog'),
+  { loading: DialogLoadingSkeleton },
+)
+
+// SplitButton modes for "Nytt verifikat" (concept scene 9). The last-used
+// mode persists per user in ui_state.create_mode.bookkeeping.
+const CREATE_MODES = ['tomt', 'mall', 'assistent'] as const
 
 interface NextVoucher {
   next: number
   series: string
 }
-
-type TabValue = 'journal' | 'accounts'
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
@@ -35,12 +48,14 @@ export default function BookkeepingPage() {
   }, [searchParams])
 
   const [refreshKey, setRefreshKey] = useState(0)
-  const [activeTab, setActiveTab] = useState<TabValue>('journal')
   const [showNewEntry, setShowNewEntry] = useState(false)
+  const [showTemplateDialog, setShowTemplateDialog] = useState(false)
   const [copyPrefill, setCopyPrefill] = useState<CopyPrefill | null>(null)
   const [isLoadingCopy, setIsLoadingCopy] = useState(false)
   const [nextVoucher, setNextVoucher] = useState<NextVoucher | null>(null)
   const t = useTranslations('bookkeeping')
+  const { openAgentSheet } = useAgentSheet()
+  const { uiState, loaded: uiStateLoaded } = useUiState()
 
   // React to copy_from in URL: switch tab, fetch source entry, then clean URL.
   // useSearchParams keeps this reactive even when navigation happens within the
@@ -129,61 +144,74 @@ export default function BookkeepingPage() {
       <PageHeader
         title={t('title')}
         action={
-          <div className="flex gap-2 w-full sm:w-auto">
-            <Button
-              className="w-full sm:w-auto"
-              onClick={() => {
-                setCopyPrefill(null)
-                setShowNewEntry(true)
-              }}
-            >
-              <Plus className="mr-2 h-4 w-4" />
-              {t('tab_new_entry')}
-              {nextVoucher && (
-                <span className="ml-1 text-primary-foreground/70 tabular-nums">
-                  ({nextVoucher.series}{nextVoucher.next})
-                </span>
-              )}
-            </Button>
-            <Button variant="outline" asChild className="w-full sm:w-auto">
-              <Link href="/bookkeeping/year-end">
-                <Lock className="mr-2 h-4 w-4" />
-                {t('year_end')}
-              </Link>
-            </Button>
-          </div>
+          <SplitButton
+            // Remount once ui_state loads so the primary face re-resolves
+            // to the persisted last-used mode.
+            key={uiStateLoaded ? 'loaded' : 'initial'}
+            persistKey="bookkeeping"
+            initialModeKey={resolveInitialMode(uiState, 'bookkeeping', CREATE_MODES, 'tomt')}
+            options={[
+              {
+                key: 'tomt',
+                label: nextVoucher
+                  ? `${t('create_tomt')} (${nextVoucher.series}${nextVoucher.next})`
+                  : t('create_tomt'),
+                icon: Plus,
+                description: t('create_tomt_desc'),
+                onSelect: () => {
+                  setCopyPrefill(null)
+                  setShowNewEntry(true)
+                },
+              },
+              {
+                key: 'mall',
+                label: t('create_mall'),
+                icon: LayoutTemplate,
+                description: t('create_mall_desc'),
+                onSelect: () => setShowTemplateDialog(true),
+              },
+              {
+                key: 'assistent',
+                label: t('create_with_assistant'),
+                icon: Sparkles,
+                description: t('create_assistent_desc'),
+                onSelect: () =>
+                  openAgentSheet({
+                    intentId: 'verifikation.draft',
+                    contextRef: 'verifikation:new',
+                  }),
+              },
+            ]}
+          />
         }
       />
 
-      <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as TabValue)}>
-        <TabsList>
-          <TabsTrigger value="journal">{t('tab_journal')}</TabsTrigger>
-          <TabsTrigger value="accounts">{t('tab_accounts')}</TabsTrigger>
-        </TabsList>
+      <JournalEntryList key={refreshKey} />
 
-        <TabsContent value="journal" forceMount className="space-y-4">
-          <JournalEntryList key={refreshKey} />
-        </TabsContent>
+      {showTemplateDialog && (
+        <TemplateBookDialog
+          open
+          onOpenChange={setShowTemplateDialog}
+          onCreated={() => setRefreshKey((k) => k + 1)}
+        />
+      )}
 
-        <TabsContent value="accounts" forceMount>
-          <ChartOfAccountsManager />
-        </TabsContent>
-      </Tabs>
-
-      <NewJournalEntryDialog
-        open={showNewEntry}
-        onOpenChange={(o) => {
-          setShowNewEntry(o)
-          if (!o) setCopyPrefill(null)
-        }}
-        onCreated={() => {
-          setRefreshKey((k) => k + 1)
-          setShowNewEntry(false)
-          setCopyPrefill(null)
-        }}
-        copyPrefill={copyPrefill}
-        isLoading={isLoadingCopy}
-      />
+      {showNewEntry && (
+        <NewJournalEntryDialog
+          open
+          onOpenChange={(o) => {
+            setShowNewEntry(o)
+            if (!o) setCopyPrefill(null)
+          }}
+          onCreated={() => {
+            setRefreshKey((k) => k + 1)
+            setShowNewEntry(false)
+            setCopyPrefill(null)
+          }}
+          copyPrefill={copyPrefill}
+          isLoading={isLoadingCopy}
+        />
+      )}
     </div>
   )
 }

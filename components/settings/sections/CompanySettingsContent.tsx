@@ -1,6 +1,7 @@
 'use client'
 
 import { useRouter } from 'next/navigation'
+import { useTranslations } from 'next-intl'
 import { CompanyDangerZone } from '@/components/settings/CompanyDangerZone'
 import { CompanyInfoForm } from '@/components/settings/CompanyInfoForm'
 import { CompanyMembersSection } from '@/components/settings/CompanyMembersSection'
@@ -10,17 +11,29 @@ import { LogoUpload } from '@/components/settings/LogoUpload'
 import { SettingsFormWrapper } from '@/components/settings/SettingsFormWrapper'
 import { SettingsLoadError } from '@/components/settings/SettingsLoadError'
 import { SettingsLoadingSkeleton } from '@/components/settings/SettingsLoadingSkeleton'
+import { SettingsSectionHeader } from '@/components/settings/SettingsRows'
+import { ShareCapitalForm } from '@/components/settings/ShareCapitalForm'
 import { useSettings } from '@/components/settings/useSettings'
 import type { CompanySettings } from '@/types'
 
 export function CompanySettingsContent() {
   const router = useRouter()
+  const tNav = useTranslations('settings_nav')
+  const tIntro = useTranslations('settings_intro')
   const { settings, isLoading, updateSettings, refetch } = useSettings()
 
   if (isLoading) return <SettingsLoadingSkeleton />
   if (!settings) return <SettingsLoadError onRetry={refetch} />
 
   function handleSave(formData: FormData) {
+    // Empty string clears the value (schema accepts null, not '').
+    const numberOrNull = (name: string) => {
+      const raw = String(formData.get(name) ?? '').trim()
+      if (raw === '') return null
+      const parsed = Number(raw)
+      // NaN would serialize to null in JSON and silently clear the value.
+      return Number.isFinite(parsed) ? parsed : null
+    }
     const updates: Record<string, unknown> = {
       ...(formData.has('company_name') && { company_name: formData.get('company_name') as string }),
       ...(formData.has('org_number') && { org_number: formData.get('org_number') as string }),
@@ -30,6 +43,8 @@ export function CompanySettingsContent() {
       phone: (formData.get('phone') as string) || '',
       email: (formData.get('email') as string) || '',
       website: (formData.get('website') as string) || '',
+      ...(formData.has('aktiekapital') && { aktiekapital: numberOrNull('aktiekapital') }),
+      ...(formData.has('antal_aktier') && { antal_aktier: numberOrNull('antal_aktier') }),
     }
     return {
       updates,
@@ -45,21 +60,24 @@ export function CompanySettingsContent() {
   }
 
   return (
-    <div className="space-y-8">
-      <SettingsFormWrapper onSave={handleSave} className="space-y-8">
+    <div>
+      <SettingsSectionHeader title={tNav('company')} intro={tIntro('company')} />
+
+      <SettingsFormWrapper onSave={handleSave}>
         <CompanyInfoForm settings={settings} />
+        {settings.entity_type === 'aktiebolag' && (
+          <ShareCapitalForm
+            settings={{ aktiekapital: settings.aktiekapital, antal_aktier: settings.antal_aktier }}
+          />
+        )}
       </SettingsFormWrapper>
 
-      <div className="border-t border-border pt-8">
-        <LogoUpload
-          logoUrl={settings.logo_url}
-          onUpdate={(url) => updateSettings({ logo_url: url })}
-        />
-      </div>
+      <LogoUpload
+        logoUrl={settings.logo_url}
+        onUpdate={(url) => updateSettings({ logo_url: url })}
+      />
 
-      <div className="border-t border-border pt-8">
-        <CompanyMembersSection />
-      </div>
+      <CompanyMembersSection />
 
       <FiscalPeriodEditor />
 

@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useTranslations } from 'next-intl'
 import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
 import {
   Dialog,
   DialogContent,
@@ -12,6 +13,7 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog'
 import { useToast } from '@/components/ui/use-toast'
+import { openDeferredTab } from '@/lib/browser/deferred-tab'
 import {
   FileText,
   ImageIcon,
@@ -38,6 +40,7 @@ interface DocumentRecord {
   storage_path: string
   created_at: string
   download_url?: string
+  referenced?: boolean
 }
 
 interface JournalEntryAttachmentsProps {
@@ -68,6 +71,7 @@ export default function JournalEntryAttachments({
   onCountChange,
 }: JournalEntryAttachmentsProps) {
   const t = useTranslations('journal_attachments')
+  const tCommon = useTranslations('common')
   const { toast } = useToast()
   const [documents, setDocuments] = useState<DocumentRecord[]>([])
   const [loading, setLoading] = useState(true)
@@ -77,7 +81,7 @@ export default function JournalEntryAttachments({
   const [uploadFiles, setUploadFiles] = useState<UploadedFile[]>([])
 
   // Docs listed here are filtered by journal_entry_id, so every row is bound
-  // to a verifikation — BFL 7 kap 2§ blocks deletion. "Ta bort" therefore
+  // to a verifikation: BFL 7 kap 2§ blocks deletion. "Ta bort" therefore
   // surfaces the educational modal; "Ersätt" goes through createNewVersion()
   // so the original stays in the version chain.
   const [blockedDoc, setBlockedDoc] = useState<DocumentRecord | null>(null)
@@ -90,14 +94,47 @@ export default function JournalEntryAttachments({
 
   const fetchDocuments = useCallback(async () => {
     try {
-      const res = await fetch(
-        `/api/documents?journal_entry_id=${journalEntryId}&current_only=true`
-      )
-      const { data } = await res.json()
-      setDocuments(data || [])
-      onCountChangeRef.current?.(data?.length || 0)
+      const [documentsRes, referencesRes] = await Promise.all([
+        fetch(`/api/documents?journal_entry_id=${journalEntryId}&current_only=true`),
+        fetch(`/api/bookkeeping/journal-entries/${journalEntryId}/references`),
+      ])
+      const { data: directDocuments } = await documentsRes.json()
+      const direct = (directDocuments || []) as DocumentRecord[]
+      const directIds = new Set(direct.map((document) => document.id))
+
+      let referenced: DocumentRecord[] = []
+      if (referencesRes.ok) {
+        const { data: referenceData } = await referencesRes.json()
+        const documentIds = Array.from(new Set<string>(
+          (referenceData?.references || [])
+            .map((reference: { document_id?: string }) => reference.document_id)
+            .filter((documentId: string | undefined): documentId is string => (
+              Boolean(documentId) && !directIds.has(documentId as string)
+            )),
+        ))
+
+        const referencedDocuments = await Promise.all(
+          documentIds.map(async (documentId) => {
+            try {
+              const response = await fetch(`/api/documents/${documentId}`)
+              if (!response.ok) return null
+              const { data } = await response.json()
+              return data ? { ...data, referenced: true } as DocumentRecord : null
+            } catch {
+              return null
+            }
+          }),
+        )
+        referenced = referencedDocuments.filter(
+          (document): document is DocumentRecord => document !== null,
+        )
+      }
+
+      const allDocuments = [...direct, ...referenced]
+      setDocuments(allDocuments)
+      onCountChangeRef.current?.(allDocuments.length)
     } catch {
-      // Non-critical — silently ignore
+      // Non-critical: silently ignore
     } finally {
       setLoading(false)
     }
@@ -119,14 +156,23 @@ export default function JournalEntryAttachments({
   }, [uploadFiles, fetchDocuments])
 
   const handleDownload = async (docId: string) => {
+    // Pre-open inside the click's user activation: a window.open after the
+    // await is popup-blocked when the signed-URL fetch is slow.
+    const tab = openDeferredTab(tCommon('loading'))
     try {
       const res = await fetch(`/api/documents/${docId}`)
       const { data } = await res.json()
-      if (data?.download_url) {
-        window.open(data.download_url, '_blank')
+      if (!data?.download_url || !tab.navigate(data.download_url)) {
+        tab.close()
+        toast({
+          title: t('download_failed'),
+          description: tab.blocked ? tCommon('popup_blocked_description') : undefined,
+          variant: 'destructive',
+        })
       }
     } catch {
-      // Non-critical — silently ignore
+      tab.close()
+      toast({ title: t('download_failed'), variant: 'destructive' })
     }
   }
 
@@ -286,36 +332,45 @@ export default function JournalEntryAttachments({
                   )}
 
                   <span className="truncate flex-1">{doc.file_name}</span>
+                  {doc.referenced && (
+                    <Badge variant="secondary" className="shrink-0">
+                      {t('via_supplier_invoice')}
+                    </Badge>
+                  )}
                   <span className="text-xs text-muted-foreground shrink-0">
                     {formatFileSize(doc.file_size_bytes)}
                   </span>
 
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="h-6 w-6 p-0 shrink-0 min-h-[44px] min-w-[44px]"
-                    onClick={() => handleOpenReplacePicker(doc.id)}
-                    disabled={isReplacing}
-                    title={t('replace')}
-                    aria-label={t('replace')}
-                  >
-                    {isReplacing ? (
-                      <Loader2 className="h-3 w-3 animate-spin" />
-                    ) : (
-                      <RefreshCw className="h-3 w-3" />
-                    )}
-                  </Button>
+                  {!doc.referenced && (
+                    <>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-6 w-6 p-0 shrink-0 min-h-[44px] min-w-[44px]"
+                        onClick={() => handleOpenReplacePicker(doc.id)}
+                        disabled={isReplacing}
+                        title={t('replace')}
+                        aria-label={t('replace')}
+                      >
+                        {isReplacing ? (
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                        ) : (
+                          <RefreshCw className="h-3 w-3" />
+                        )}
+                      </Button>
 
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="h-6 w-6 p-0 shrink-0 min-h-[44px] min-w-[44px]"
-                    onClick={() => handleRequestRemove(doc)}
-                    title={t('remove')}
-                    aria-label={t('remove')}
-                  >
-                    <Trash2 className="h-3 w-3" />
-                  </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-6 w-6 p-0 shrink-0 min-h-[44px] min-w-[44px]"
+                        onClick={() => handleRequestRemove(doc)}
+                        title={t('remove')}
+                        aria-label={t('remove')}
+                      >
+                        <Trash2 className="h-3 w-3" />
+                      </Button>
+                    </>
+                  )}
 
                   <Button
                     variant="ghost"

@@ -9,13 +9,13 @@ const log = createLogger('skattekonto-drift-email')
 /**
  * Email handler for `skattekonto.drift_detected`. Notifies the company contact
  * that their cached Skatteverket saldo and the bookkeeping have diverged
- * beyond the configured tolerance — without putting the saldo or drift figures
+ * beyond the configured tolerance: without putting the saldo or drift figures
  * in the email body. The actual numbers are surfaced behind authenticated UI
  * (the dashboard SkattekontoDriftTile) so a misdelivered mail doesn't leak
  * financial figures.
  *
  * Recipient resolution is restricted to active members of the company. A
- * stale company_settings.contact_email that no longer corresponds to a
+ * stale company_settings.tax_contact_email that no longer corresponds to a
  * member is never used. Falls back to the syncing user only if they're
  * still an active member.
  *
@@ -27,7 +27,7 @@ export async function handleSkattekontoDriftDetected(
   ctx?: ExtensionContext,
 ): Promise<void> {
   if (!ctx) {
-    log.warn('drift event fired without ctx — cannot resolve recipient', {
+    log.warn('drift event fired without ctx: cannot resolve recipient', {
       companyId: payload.companyId,
     })
     return
@@ -35,7 +35,7 @@ export async function handleSkattekontoDriftDetected(
 
   const email = getEmailService()
   if (!email.isConfigured()) {
-    log.info('email service not configured — skipping drift alert', {
+    log.info('email service not configured: skipping drift alert', {
       companyId: payload.companyId,
     })
     return
@@ -56,7 +56,7 @@ export async function handleSkattekontoDriftDetected(
 
   const subject = 'Skattekontot stämmer inte med bokföringen'
 
-  // Body intentionally carries no figures — only a notification that the
+  // Body intentionally carries no figures: only a notification that the
   // user should look at the dashboard tile. ISO 27001 A.8.11 / A.5.34: avoid
   // outbound financial data to addresses that may be stale.
   const lines = [
@@ -66,8 +66,8 @@ export async function handleSkattekontoDriftDetected(
     dashboardLink,
     '',
     'Vanliga orsaker att differensen syns redan innan en åtgärd behövs:',
-    '• Anstånd — saldot förskjuts hos Skatteverket men bokföringen påverkas inte.',
-    '• Tidsskillnad — F-skatt debiteras den 12:e men förfaller senare, så Skatteverkets saldo kan ligga före bokföringen.',
+    '• Anstånd: saldot förskjuts hos Skatteverket men bokföringen påverkas inte.',
+    '• Tidsskillnad: F-skatt debiteras den 12:e men förfaller senare, så Skatteverkets saldo kan ligga före bokföringen.',
     '• Obokförda skattekonto-rader som väntar på din kategorisering.',
     '',
     'Skapa inte en rättelseverifikation innan du har granskat raderna i gnubok.',
@@ -79,8 +79,8 @@ export async function handleSkattekontoDriftDetected(
 <p><a href="${escapeHtml(dashboardLink)}">Logga in på Accounted</a> för att se beloppen och granska skattekonto-raderna.</p>
 <p><strong>Vanliga orsaker att differensen syns redan innan en åtgärd behövs:</strong></p>
 <ul>
-  <li>Anstånd — saldot förskjuts hos Skatteverket men bokföringen påverkas inte.</li>
-  <li>Tidsskillnad — F-skatt debiteras den 12:e men förfaller senare, så Skatteverkets saldo kan ligga före bokföringen.</li>
+  <li>Anstånd: saldot förskjuts hos Skatteverket men bokföringen påverkas inte.</li>
+  <li>Tidsskillnad: F-skatt debiteras den 12:e men förfaller senare, så Skatteverkets saldo kan ligga före bokföringen.</li>
   <li>Obokförda skattekonto-rader som väntar på din kategorisering.</li>
 </ul>
 <p>Skapa inte en rättelseverifikation innan du har granskat raderna i gnubok.</p>
@@ -109,10 +109,15 @@ export async function handleSkattekontoDriftDetected(
 
 /**
  * Resolve the recipient address for the drift alert and verify it belongs to
- * an active member of the company. A stale company_settings.contact_email
+ * an active member of the company. A stale company_settings.tax_contact_email
  * (set when a now-revoked admin still owned the company) must never receive
  * a drift notification because the bare existence of one is sensitive
  * financial signal.
+ *
+ * `tax_contact_email` is the "Kontaktperson för skatteärenden" field in
+ * Inställningar > Skatt (components/settings/TaxSettingsForm.tsx): the only
+ * place a company routes Skatteverket correspondence to someone other than
+ * whoever happened to trigger the sync.
  */
 async function resolveAuthorisedRecipient(
   ctx: ExtensionContext,
@@ -120,10 +125,19 @@ async function resolveAuthorisedRecipient(
 ): Promise<string | null> {
   // 1. Build the set of active member emails for this company. We accept
   //    only addresses that appear here.
-  const { data: members } = await ctx.supabase
+  const { data: members, error: membersError } = await ctx.supabase
     .from('company_members')
     .select('user_id, profiles!inner(email)')
     .eq('company_id', ctx.companyId)
+
+  if (membersError) {
+    // Without the allowlist every candidate is rejected below, so a failed
+    // lookup silently cancels the alert. Say so out loud.
+    log.warn('could not read company members for drift alert', {
+      companyId: ctx.companyId,
+      error: membersError.message,
+    })
+  }
 
   type MemberRow = { user_id: string; profiles: { email?: string | null } | { email?: string | null }[] | null }
   const allowedEmails = new Set<string>()
@@ -134,24 +148,46 @@ async function resolveAuthorisedRecipient(
 
   if (allowedEmails.size === 0) return null
 
-  // 2. Prefer the configured contact email IF it matches an active member.
-  const { data: settings } = await ctx.supabase
+  // 2. Prefer the configured tax contact email IF it matches an active member.
+  const { data: settings, error: settingsError } = await ctx.supabase
     .from('company_settings')
-    .select('contact_email')
+    .select('tax_contact_email')
     .eq('company_id', ctx.companyId)
     .maybeSingle()
 
-  const contactEmail = (settings as { contact_email?: string | null } | null)?.contact_email
-  if (contactEmail && allowedEmails.has(contactEmail.toLowerCase())) {
-    return contactEmail
+  if (settingsError) {
+    // Falling back to the syncing user is correct, but doing it without a
+    // trace is how a company silently stops getting alerts where it asked
+    // for them.
+    log.warn('could not read tax contact email: falling back to syncing user', {
+      companyId: ctx.companyId,
+      error: settingsError.message,
+    })
+  }
+
+  const contactEmail = (settings as { tax_contact_email?: string | null } | null)?.tax_contact_email
+  if (contactEmail) {
+    if (allowedEmails.has(contactEmail.toLowerCase())) {
+      return contactEmail
+    }
+    log.warn('configured tax contact is not an active member: falling back to syncing user', {
+      companyId: ctx.companyId,
+    })
   }
 
   // 3. Fall back to the syncing user's email if they're still a member.
-  const { data: profile } = await ctx.supabase
+  const { data: profile, error: profileError } = await ctx.supabase
     .from('profiles')
     .select('email')
     .eq('id', userId)
     .maybeSingle()
+  if (profileError) {
+    log.warn('could not read syncing user profile for drift alert', {
+      companyId: ctx.companyId,
+      userId,
+      error: profileError.message,
+    })
+  }
   const userEmail = (profile as { email?: string | null } | null)?.email
   if (userEmail && allowedEmails.has(userEmail.toLowerCase())) {
     return userEmail

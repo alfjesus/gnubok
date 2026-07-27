@@ -1,7 +1,7 @@
 /**
  * Integration tests for the v1 reports + imports surface (Phase 5 PR-3).
  *
- * Most report routes are thin wrappers over `lib/reports/*` generators —
+ * Most report routes are thin wrappers over `lib/reports/*` generators:
  * the lib functions have their own unit tests, so these specs focus on
  * the route-layer contract: auth / scope, period_id validation, the
  * shared `loadPeriodFromQuery` helper, and the safeGenerate error path.
@@ -431,7 +431,6 @@ describe('GET /reports/vat-declaration', () => {
       'monthly',
       2026,
       4,
-      undefined,
     )
   })
 })

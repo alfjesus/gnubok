@@ -15,7 +15,12 @@ import { cn, formatCurrency, formatDate } from '@/lib/utils'
 import { getVatTreatmentLabel } from '@/lib/invoices/vat-rules'
 import { Loader2, ArrowLeft, AlertTriangle, Lock } from 'lucide-react'
 import { useCanWrite } from '@/lib/hooks/use-can-write'
+import SendInvoiceDialog from '@/components/invoices/SendInvoiceDialog'
+import { useCompany, useCapability } from '@/contexts/CompanyContext'
+import { CAPABILITY } from '@/lib/entitlements/keys'
+import { getCreditNoteSendMode } from '@/lib/invoices/credit-note-send-mode'
 import type { Invoice, InvoiceItem, Customer } from '@/types'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 interface InvoiceWithRelations extends Invoice {
   customer: Customer
@@ -24,6 +29,8 @@ interface InvoiceWithRelations extends Invoice {
 
 export default function CreateCreditNotePage({ params }: { params: Promise<{ id: string }> }) {
   const { canWrite } = useCanWrite()
+  const { isSandbox } = useCompany()
+  const canEmail = useCapability(CAPABILITY.email_send)
   const { id } = use(params)
   const router = useRouter()
   const { toast } = useToast()
@@ -35,10 +42,8 @@ export default function CreateCreditNotePage({ params }: { params: Promise<{ id:
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [reason, setReason] = useState('')
   const [confirmText, setConfirmText] = useState('')
-
-  useEffect(() => {
-    fetchInvoice()
-  }, [id])
+  const [createdCreditNote, setCreatedCreditNote] = useState<InvoiceWithRelations | null>(null)
+  const [showSendPrompt, setShowSendPrompt] = useState(false)
 
   async function fetchInvoice() {
     setIsLoading(true)
@@ -94,6 +99,10 @@ export default function CreateCreditNotePage({ params }: { params: Promise<{ id:
     setIsLoading(false)
   }
 
+  useEffect(() => {
+    fetchInvoice()
+  }, [id])
+
   async function handleSubmit() {
     if (!invoice) return
 
@@ -110,22 +119,36 @@ export default function CreateCreditNotePage({ params }: { params: Promise<{ id:
       })
 
       if (!response.ok) {
-        const data = await response.json()
-        throw new Error(data.error || t('create_failed_fallback'))
+        // Map the parsed body plus the status, never `new Error(data.error)`:
+        // the route answers thrown errors with the canonical envelope
+        // `{ error: { code, message } }`, and the Error constructor would
+        // stringify that object to "[object Object]", discarding the route's
+        // own Swedish reason.
+        const body = await response.json().catch(() => null)
+        toast({
+          title: t('create_failed_title'),
+          description: getUserErrorMessage(body, { statusCode: response.status }),
+          variant: 'destructive',
+        })
+        setIsSubmitting(false)
+        return
       }
 
-      const { data: creditNote } = await response.json()
+      const { data: creditNote } = await response.json() as { data: InvoiceWithRelations }
 
       toast({
         title: t('created_toast_title'),
-        description: t('created_toast_description', { number: creditNote.invoice_number }),
+        description: creditNote.invoice_number
+          ? t('created_toast_description', { number: creditNote.invoice_number })
+          : undefined,
       })
 
-      router.push(`/invoices/${creditNote.id}`)
+      setCreatedCreditNote(creditNote)
+      setShowSendPrompt(true)
     } catch (error) {
       toast({
         title: t('create_failed_title'),
-        description: error instanceof Error ? error.message : t('try_again'),
+        description: error instanceof Error ? getUserErrorMessage(error) : t('try_again'),
         variant: 'destructive',
       })
     }
@@ -146,16 +169,37 @@ export default function CreateCreditNotePage({ params }: { params: Promise<{ id:
   }
 
   const customer = invoice.customer
+  const sendMode = getCreditNoteSendMode({
+    customerHasEmail: !!createdCreditNote?.customer.email,
+    isSandbox,
+    canEmail,
+  })
+
+  function handleSendPromptOpenChange(open: boolean) {
+    setShowSendPrompt(open)
+    if (!open && createdCreditNote) {
+      router.push(`/invoices/${createdCreditNote.id}`)
+    }
+  }
 
   return (
     <div className="space-y-6 max-w-3xl mx-auto">
+      {createdCreditNote && (
+        <SendInvoiceDialog
+          open={showSendPrompt}
+          onOpenChange={handleSendPromptOpenChange}
+          invoice={createdCreditNote}
+          mode={sendMode}
+          onSuccess={() => undefined}
+        />
+      )}
       {/* Header */}
       <div className="flex items-center gap-4">
         <Button variant="ghost" size="icon" onClick={() => router.back()} aria-label={t('back')}>
           <ArrowLeft className="h-5 w-5" />
         </Button>
         <div>
-          <h1 className="font-display text-2xl md:text-3xl font-medium tracking-tight">{t('title')}</h1>
+          <h1 className="font-display text-2xl leading-8 tracking-tight">{t('title')}</h1>
           <p className="text-muted-foreground">
             {t('subtitle', { number: invoice.invoice_number ?? '' })}
           </p>
@@ -179,9 +223,6 @@ export default function CreateCreditNotePage({ params }: { params: Promise<{ id:
       <Card>
         <CardHeader>
           <CardTitle>{t('original_card_title')}</CardTitle>
-          <CardDescription>
-            {t('original_card_description')}
-          </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="grid grid-cols-2 gap-4 text-sm">

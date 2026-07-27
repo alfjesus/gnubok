@@ -8,6 +8,7 @@ import { checkRevenueAccount } from '@/lib/articles/validate-revenue-account'
 import { AccountsNotInChartError, accountsNotInChartResponse } from '@/lib/bookkeeping/errors'
 import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
 import type { Article } from '@/types'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 ensureInitialized()
 
@@ -32,7 +33,7 @@ export const GET = withRouteContext(
       opLog.error('article fetch failed', error)
       return errorResponseFromCode('INTERNAL_ERROR', opLog, {
         requestId,
-        details: { reason: error.message },
+        details: { reason: getUserErrorMessage(error) },
       })
     }
 
@@ -54,7 +55,7 @@ export const PATCH = withRouteContext(
     if (!result.success) return result.response
     const body = result.data
 
-    // Same activate-and-retry contract as POST /api/articles: a class-3 account
+    // Same activate-and-retry contract as POST /api/articles: a class 1-3 account
     // that just isn't activated yet returns ACCOUNTS_NOT_IN_CHART.
     if (body.revenue_account) {
       const status = await checkRevenueAccount(supabase, companyId!, body.revenue_account)
@@ -66,12 +67,12 @@ export const PATCH = withRouteContext(
       }
     }
 
-    // Sparse update — only the fields the caller actually sent.
+    // Sparse update: only the fields the caller actually sent.
     const updateData: Record<string, unknown> = {}
     for (const key of [
       'name', 'name_en', 'type', 'unit', 'price_excl_vat', 'vat_rate',
-      'revenue_account', 'cost_price', 'ean', 'housework_type', 'notes',
-      'article_number', 'active',
+      'currency', 'revenue_account', 'cost_price', 'ean', 'housework_type',
+      'notes', 'article_number', 'active',
     ] as const) {
       if (body[key] !== undefined) updateData[key] = body[key]
     }
@@ -97,7 +98,7 @@ export const PATCH = withRouteContext(
       opLog.error('article update failed', error)
       return errorResponseFromCode('ARTICLE_UPDATE_FAILED', opLog, {
         requestId,
-        details: { reason: error.message },
+        details: { reason: getUserErrorMessage(error) },
       })
     }
 
@@ -111,10 +112,9 @@ export const PATCH = withRouteContext(
   { requireWrite: true },
 )
 
-// DELETE soft-deactivates (active = false) rather than hard-deleting. Articles
-// are master data referenced by historical invoice lines via a (frozen) copy;
-// keeping the row preserves the register's audit trail and the article number.
-// Re-activate by PATCHing { active: true }.
+// Articles are master data, while invoice lines hold frozen copies of the
+// accounting values. An article may therefore be deleted only while no invoice
+// line references it. The preflight also covers draft invoices.
 export const DELETE = withRouteContext(
   'article.delete',
   async (_request, ctx, { params }: { params: Promise<{ id: string }> }) => {
@@ -122,28 +122,69 @@ export const DELETE = withRouteContext(
     const { user, supabase, companyId, log, requestId } = ctx
     const opLog = log.child({ articleId: id })
 
-    const { data, error } = await supabase
+    const { error: articleError } = await supabase
       .from('articles')
-      .update({ active: false })
+      .select('id')
       .eq('id', id)
       .eq('company_id', companyId)
-      .select()
       .single()
 
-    if (error) {
-      if (error.code === 'PGRST116') {
+    if (articleError) {
+      if (articleError.code === 'PGRST116') {
         return errorResponseFromCode('ARTICLE_NOT_FOUND', opLog, { requestId })
       }
-      opLog.error('article deactivate failed', error)
-      return errorResponseFromCode('ARTICLE_UPDATE_FAILED', opLog, {
+      opLog.error('article lookup before delete failed', articleError)
+      return errorResponseFromCode('ARTICLE_DELETE_FAILED', opLog, {
         requestId,
-        details: { reason: error.message },
+        details: { reason: getUserErrorMessage(articleError) },
       })
     }
 
+    // invoice_items has NO company_id column: filtering on it made PostgREST
+    // 42703 here, which the error branch below turned into ARTICLE_DELETE_FAILED
+    // for EVERY delete (support: odinaero.se). Tenancy is already enforced by
+    // the article lookup above: article_id is a UUID owned by this company.
+    const { count: usageCount, error: usageError } = await supabase
+      .from('invoice_items')
+      .select('id', { count: 'exact', head: true })
+      .eq('article_id', id)
+
+    if (usageError) {
+      opLog.error('article usage check failed', usageError)
+      return errorResponseFromCode('ARTICLE_DELETE_FAILED', opLog, {
+        requestId,
+        details: { reason: getUserErrorMessage(usageError) },
+      })
+    }
+
+    if ((usageCount ?? 0) > 0) {
+      return errorResponseFromCode('ARTICLE_IN_USE', opLog, { requestId })
+    }
+
+    const { error: deleteError, count: deletedCount } = await supabase
+      .from('articles')
+      .delete({ count: 'exact' })
+      .eq('id', id)
+      .eq('company_id', companyId)
+
+    if (deleteError) {
+      if (deleteError.code === '23503') {
+        return errorResponseFromCode('ARTICLE_IN_USE', opLog, { requestId })
+      }
+      opLog.error('article delete failed', deleteError)
+      return errorResponseFromCode('ARTICLE_DELETE_FAILED', opLog, {
+        requestId,
+        details: { reason: getUserErrorMessage(deleteError) },
+      })
+    }
+
+    if (deletedCount === 0) {
+      return errorResponseFromCode('ARTICLE_NOT_FOUND', opLog, { requestId })
+    }
+
     await eventBus.emit({
-      type: 'article.updated',
-      payload: { article: data as Article, companyId: companyId!, userId: user.id },
+      type: 'article.deleted',
+      payload: { articleId: id, companyId, userId: user.id },
     })
 
     return NextResponse.json({ success: true })

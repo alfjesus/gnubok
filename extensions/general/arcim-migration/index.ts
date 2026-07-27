@@ -5,6 +5,7 @@ import {
   getConsent,
   listConsents,
   generateOtc,
+  consumeOAuthState,
   getAuthUrl,
   exchangeAuthToken,
   submitProviderToken,
@@ -18,12 +19,13 @@ import {
 import { providerSupportsSie, fetchProviderSieFiles, getAllowedFiscalYears } from './lib/sie-fetcher'
 import { mapCompanyInfo } from './lib/entity-mapper'
 import { executeMigration } from './lib/migration-orchestrator'
+import { importProviderDocuments } from './lib/import-documents'
 import { reconcileSupplierInvoiceVouchers } from '@/lib/invoices/bulk-reconcile-supplier-vouchers'
 import type { ArcimProvider } from './types'
 import { ARCIM_PROVIDERS } from './types'
 import { parseSIEFile, validateSIEFile } from '@/lib/import/sie-parser'
 import { suggestMappings, getMappingStats, isSystemAccount } from '@/lib/import/account-mapper'
-import { loadMappings, generateImportPreview, executeSIEImport, saveMappings } from '@/lib/import/sie-import'
+import { loadMappings, generateImportPreview, executeSIEImport } from '@/lib/import/sie-import'
 import { BAS_REFERENCE } from '@/lib/bookkeeping/bas-reference'
 import type { ProviderName } from '@/lib/providers/types'
 import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
@@ -31,6 +33,15 @@ import { classifyProviderError } from '@/lib/providers/with-provider-call'
 import { createLogger } from '@/lib/logger'
 
 const moduleLog = createLogger('extensions/arcim-migration')
+
+/**
+ * The one answer the unauthenticated OAuth callback gives for every state
+ * failure: forged, unknown, expired, replayed, or pointing at a consent that no
+ * longer exists. Distinguishing them would turn the callback into a probe for
+ * other tenants' consent ids.
+ */
+const STATE_REJECTED_MESSAGE =
+  'Ingen giltig migrationssession hittades. Starta om anslutningen.'
 
 /**
  * Map known OAuth error codes from providers (Fortnox, Visma) to actionable
@@ -53,6 +64,43 @@ function translateOAuthError(error: string, description: string | null): string 
   }
 
   return description ? `${error}: ${description}` : error
+}
+
+/**
+ * Build a provider OAuth authorization URL bound to an EXISTING consent id.
+ * Used by both first-time connect and reconnect (token revival): the callback
+ * runs exchangeAuthToken(consentId, …) which upserts the fresh tokens keyed by
+ * consent_id, so re-running OAuth against the same consent overwrites a dead
+ * refresh-token pair in place: no disconnect/recreate needed.
+ */
+async function buildArcimOAuthUrl(consentId: string, provider: ArcimProvider): Promise<string> {
+  // Server-side state row: consent id, provider (via the consent), expiry and a
+  // consumed marker all live in provider_otc. The `state` handed to the provider
+  // is that row's opaque random primary key, nothing more.
+  const otc = await generateOtc(consentId)
+
+  // Prefer a provider-specific redirect override (e.g. VISMA_REDIRECT_URI) when
+  // set: lets dev environments route through a single registered URI rather
+  // than registering every ngrok URL on the OAuth client. Falls back to
+  // NEXT_PUBLIC_APP_URL + the canonical callback path.
+  const appUrl = process.env.NEXT_PUBLIC_APP_URL || ''
+  const providerRedirectEnv =
+    provider === 'visma'
+      ? process.env.VISMA_REDIRECT_URI
+      : provider === 'fortnox'
+        ? process.env.FORTNOX_REDIRECT_URI
+        : undefined
+  const callbackUrl =
+    providerRedirectEnv && providerRedirectEnv.trim().length > 0
+      ? providerRedirectEnv
+      : `${appUrl}/api/extensions/ext/arcim-migration/callback`
+
+  // The state is the one-time code itself: an unguessable pointer to the row
+  // above. It deliberately encodes NOTHING. The previous base64url JSON payload
+  // was attacker-authored input the callback trusted, so anyone who learned a
+  // consent id could redirect their own provider tokens onto that consent.
+  const { url } = await getAuthUrl(provider, otc.code, callbackUrl)
+  return url
 }
 
 /**
@@ -96,7 +144,7 @@ export const arcimMigrationExtension: Extension = {
         const companyId = ctx?.companyId ?? user.id
 
         try {
-          // Get accepted consents only (status 1) — not abandoned/created ones
+          // Get accepted consents only (status 1): not abandoned/created ones
           const allConsents = await listConsents(companyId)
           const consents = allConsents.filter(c => c.status === 1)
 
@@ -158,10 +206,11 @@ export const arcimMigrationExtension: Extension = {
 
         const companyId = ctx?.companyId ?? user.id
 
-        const { provider, companyName, orgNumber } = await request.json() as {
+        const { provider, companyName, orgNumber, reconnect } = await request.json() as {
           provider: ArcimProvider
           companyName?: string
           orgNumber?: string
+          reconnect?: boolean
         }
 
         if (!provider) {
@@ -180,12 +229,47 @@ export const arcimMigrationExtension: Extension = {
         try {
           const { createServiceClient: createSvc } = await import('@/lib/supabase/server')
 
-          // Reuse existing accepted consent if one exists for this provider
           const existingConsents = await listConsents(companyId)
+
+          // Reconnect: an existing connection's stored tokens are dead (refresh
+          // failed → PROVIDER_AUTH_EXPIRED). Re-run auth against the SAME consent
+          // so fresh tokens overwrite the dead pair in place: no disconnect, no
+          // duplicate consent, import history preserved. Bypasses the
+          // alreadyConnected short-circuit below (which would otherwise skip the
+          // auth that's the whole point here).
+          if (reconnect) {
+            const stale = existingConsents.find(
+              c => c.provider === provider && (c.status === 0 || c.status === 1),
+            )
+            if (stale) {
+              if (ctx?.settings) {
+                await ctx.settings.set('consent_id', stale.id)
+                await ctx.settings.set('provider', provider)
+              }
+              if (providerInfo.authType === 'oauth') {
+                const authUrl = await buildArcimOAuthUrl(stale.id, provider)
+                return NextResponse.json({
+                  consentId: stale.id,
+                  authType: 'oauth',
+                  authUrl,
+                  reconnect: true,
+                })
+              }
+              // Token-based providers re-authorize by re-entering credentials
+              return NextResponse.json({
+                consentId: stale.id,
+                authType: 'token',
+                reconnect: true,
+              })
+            }
+            // No existing consent to revive: fall through to a normal connect.
+          }
+
+          // Reuse existing accepted consent if one exists for this provider
           const accepted = existingConsents.find(c => c.provider === provider && c.status === 1)
 
           if (accepted) {
-            // Already connected — skip OAuth, go straight to preview
+            // Already connected: skip OAuth, go straight to preview
             if (ctx?.settings) {
               await ctx.settings.set('consent_id', accepted.id)
               await ctx.settings.set('provider', provider)
@@ -205,11 +289,15 @@ export const arcimMigrationExtension: Extension = {
             for (const p of pending) {
               const { data: tokens } = await svc
                 .from('provider_consent_tokens')
-                .select('id')
+                // consent_id is the PK: there is no `id` column. Selecting `id`
+                // errors silently (only `data` is read), so `tokens` was always
+                // null and the reuse branch below never fired, deleting valid
+                // status-0 consents as "abandoned".
+                .select('consent_id')
                 .eq('consent_id', p.id)
                 .limit(1)
               if (tokens && tokens.length > 0) {
-                // Tokens exist — reuse this consent, skip credential entry
+                // Tokens exist: reuse this consent, skip credential entry
                 if (ctx?.settings) {
                   await ctx.settings.set('consent_id', p.id)
                   await ctx.settings.set('provider', provider)
@@ -221,7 +309,7 @@ export const arcimMigrationExtension: Extension = {
                 })
               }
             }
-            // No tokens found — clean up abandoned consents
+            // No tokens found: clean up abandoned consents
             for (const p of pending) {
               await deleteConsent(p.id)
             }
@@ -242,37 +330,12 @@ export const arcimMigrationExtension: Extension = {
           }
 
           if (providerInfo.authType === 'oauth') {
-            // Generate OTC for OAuth flow
-            const otc = await generateOtc(consent.id)
-
-            // Build the OAuth callback URL. Prefer a provider-specific override
-            // (e.g. VISMA_REDIRECT_URI) when set — this lets dev environments
-            // route through a single registered URI (production) rather than
-            // requiring every ngrok URL to be registered on the OAuth client.
-            // Falls back to NEXT_PUBLIC_APP_URL + the canonical callback path.
-            const appUrl = process.env.NEXT_PUBLIC_APP_URL || ''
-            const providerRedirectEnv =
-              provider === 'visma'
-                ? process.env.VISMA_REDIRECT_URI
-                : provider === 'fortnox'
-                  ? process.env.FORTNOX_REDIRECT_URI
-                  : undefined
-            const callbackUrl =
-              providerRedirectEnv && providerRedirectEnv.trim().length > 0
-                ? providerRedirectEnv
-                : `${appUrl}/api/extensions/ext/arcim-migration/callback`
-
-            // Encode consentId + provider in state
-            const statePayload = JSON.stringify({ otc: otc.code, consentId: consent.id, provider })
-            const stateEncoded = Buffer.from(statePayload).toString('base64url')
-
-            const { url } = await getAuthUrl(provider, stateEncoded, callbackUrl)
+            const authUrl = await buildArcimOAuthUrl(consent.id, provider)
 
             return NextResponse.json({
               consentId: consent.id,
               authType: 'oauth',
-              authUrl: url,
-              otcCode: otc.code,
+              authUrl,
             })
           } else {
             // Token-based providers: consent is ready for direct use
@@ -303,7 +366,7 @@ export const arcimMigrationExtension: Extension = {
           return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
         }
 
-        // The caller's tenant — NOT the provider-side company id below.
+        // The caller's tenant: NOT the provider-side company id below.
         const ownerCompanyId = ctx?.companyId ?? user.id
 
         // `companyId` in the body is the PROVIDER-side company identifier
@@ -321,7 +384,7 @@ export const arcimMigrationExtension: Extension = {
           })
         }
 
-        // BL uses server-side client credentials — only needs companyId
+        // BL uses server-side client credentials: only needs companyId
         if (provider !== 'bjornlunden' && !apiToken) {
           return errorResponseFromCode('PROVIDER_TOKEN_REQUIRED', moduleLog, {
             details: { provider },
@@ -347,13 +410,13 @@ export const arcimMigrationExtension: Extension = {
           return NextResponse.json({ success: true, consentId })
         } catch (error) {
           log.error('arcim submit-token failed', error as Error, { provider })
-          // Consent missing or owned by another company — same 404 either way.
+          // Consent missing or owned by another company: same 404 either way.
           if (error instanceof ConsentNotFoundError) {
             return errorResponseFromCode('PROVIDER_CONSENT_NOT_FOUND', moduleLog, {
               details: { consentId },
             })
           }
-          // Wrong credentials (provider actively rejected them) — tell the
+          // Wrong credentials (provider actively rejected them): tell the
           // user to re-check the pasted values instead of a generic 500.
           if (error instanceof ProviderTokenInvalidError) {
             return errorResponseFromCode('PROVIDER_TOKEN_INVALID', moduleLog, {
@@ -433,35 +496,27 @@ export const arcimMigrationExtension: Extension = {
         }
 
         try {
-          let consentId: string | null = null
-          let provider: ArcimProvider | null = null
+          // Single source of truth for who this callback belongs to: the
+          // server-written provider_otc row, consumed atomically here. The row
+          // carries the consent; the consent carries the provider. Nothing is
+          // read from the query string except the opaque state token itself, so
+          // an attacker who knows a victim's consent id still cannot steer their
+          // own provider tokens onto it.
+          const resolvedState = await consumeOAuthState(stateRaw)
 
-          try {
-            const decoded = JSON.parse(Buffer.from(stateRaw, 'base64url').toString())
-            if (decoded.consentId && decoded.provider) {
-              consentId = decoded.consentId
-              provider = decoded.provider as ArcimProvider
-            }
-          } catch {
-            // Legacy fallback
-          }
-
-          if (!consentId || !provider) {
-            consentId = ctx?.settings
-              ? await ctx.settings.get<string>('consent_id')
-              : null
-            provider = ctx?.settings
-              ? await ctx.settings.get<ArcimProvider>('provider')
-              : null
-          }
-
-          if (!consentId || !provider) {
-            log.error('OAuth callback could not resolve consent or provider', {
-              hasConsentId: !!consentId,
-              hasProvider: !!provider,
+          if (!resolvedState) {
+            // Unknown/forged state, expired state, replayed state and deleted
+            // consent all end here with the SAME message: this route is
+            // unauthenticated, so telling the caller which one it was would
+            // disclose whether a given consent exists.
+            log.error('OAuth callback state rejected', {
+              hasCode: !!code,
+              stateLength: stateRaw.length,
             })
-            return respondWithError('Ingen aktiv migrationssession hittades. Starta om anslutningen.')
+            return respondWithError(STATE_REJECTED_MESSAGE)
           }
+
+          const { consentId, provider } = resolvedState
 
           const redirectUri = `${appUrl}/api/extensions/ext/arcim-migration/callback`
 
@@ -516,7 +571,11 @@ export const arcimMigrationExtension: Extension = {
         }
 
         try {
-          const consent = await getConsent(consentId)
+          // Company-scoped read: the status below is returned to the caller, so
+          // an unscoped lookup would let any authenticated user probe another
+          // tenant's consent id for existence and connection state. A foreign
+          // consent throws ConsentNotFoundError, same as a nonexistent one.
+          const consent = await getConsent(consentId, companyId)
           if (consent.status !== 0 && consent.status !== 1) {
             return errorResponseFromCode('PROVIDER_CONSENT_NOT_READY', moduleLog, {
               details: { consentId, status: consent.status },
@@ -585,6 +644,12 @@ export const arcimMigrationExtension: Extension = {
           })
         } catch (error) {
           log.error('arcim preview failed', error as Error)
+          // Consent missing or owned by another company: same 404 either way.
+          if (error instanceof ConsentNotFoundError) {
+            return errorResponseFromCode('PROVIDER_CONSENT_NOT_FOUND', moduleLog, {
+              details: { consentId },
+            })
+          }
           // Classify HTTP failures into typed codes so the toast can suggest
           // reconnect / retry instead of a generic "preview failed".
           const classified = classifyProviderError(error)
@@ -640,10 +705,10 @@ export const arcimMigrationExtension: Extension = {
 
           if (sieFiles.length === 0) {
             // The allowed window is rolling (current year and the two before
-            // it) — interpolate the actual range instead of the static
+            // it): interpolate the actual range instead of the static
             // registry message so the text never goes stale.
             const allowedYears = [...getAllowedFiscalYears()].sort((a, b) => a - b)
-            const range = `${allowedYears[0]}–${allowedYears[allowedYears.length - 1]}`
+            const range = `${allowedYears[0]}-${allowedYears[allowedYears.length - 1]}`
             return errorResponseFromCode('PROVIDER_SIE_NO_YEARS', moduleLog, {
               messageSv: `Inga räkenskapsår ${range} hittades hos leverantören.`,
               messageEn: `No fiscal years available for ${range}.`,
@@ -659,7 +724,7 @@ export const arcimMigrationExtension: Extension = {
           if (!validation.valid) {
             log.warn(
               `arcim sie-data validation failed for ${provider} fiscal year ${sieFile.fiscalYear}: ` +
-              `${validation.errors.length} error(s) — ${validation.errors.slice(0, 3).join(' | ')}`,
+              `${validation.errors.length} error(s): ${validation.errors.slice(0, 3).join(' | ')}`,
             )
             return NextResponse.json({
               error: 'validation',
@@ -778,7 +843,7 @@ export const arcimMigrationExtension: Extension = {
             allImported: false,
             newFileCount: fileStatuses.length - replacedFileCount,
             replacedFileCount,
-            // Allowed years whose provider export failed — the wizard warns
+            // Allowed years whose provider export failed: the wizard warns
             // the user before proceeding so an IB/UB gap cannot slip through.
             failedYears,
             basAccounts: BAS_REFERENCE,
@@ -844,10 +909,14 @@ export const arcimMigrationExtension: Extension = {
           }
 
           // Account creation (and #KONTO renames) happen inside
-          // executeSIEImport via syncMappedAccounts — the auto-activate block
-          // that used to live here was a duplicate of that logic.
-          await saveMappings(supabase, user.id, mappings)
-
+          // executeSIEImport via syncMappedAccounts: the auto-activate block
+          // that used to live here was a duplicate of that logic. Mapping
+          // persistence ALSO happens inside executeSIEImport, with the
+          // correct companyId + userId and non-fatal warning handling: the
+          // direct saveMappings call that used to sit here passed user.id in
+          // the companyId slot, which throws on RLS/FK now that the helper
+          // surfaces upsert failures, 500ing every provider-migration import
+          // before a single voucher was written. Do not re-add it.
           const result = await executeSIEImport(supabase, companyId, user.id, parsed, mappings, {
             filename: `migration-sie-${Date.now()}.se`,
             fileContent: rawContent,
@@ -856,7 +925,7 @@ export const arcimMigrationExtension: Extension = {
             importTransactions: options.importTransactions,
             voucherSeries: options.voucherSeries,
             // Default ON: re-syncs keep account names current with the source
-            // system (idempotent — equal names are a no-op in the rename pass).
+            // system (idempotent: equal names are a no-op in the rename pass).
             updateAccountNames: options.updateAccountNames ?? true,
             // Provider re-sync semantics: a prior completed import for the
             // same fiscal year is automatically replaced (its imported
@@ -925,7 +994,11 @@ export const arcimMigrationExtension: Extension = {
         }
 
         try {
-          const consent = await getConsent(consentId)
+          // Company-scoped read: the status below is returned to the caller, so
+          // an unscoped lookup would let any authenticated user probe another
+          // tenant's consent id for existence and connection state. A foreign
+          // consent throws ConsentNotFoundError, same as a nonexistent one.
+          const consent = await getConsent(consentId, companyId)
           if (consent.status !== 0 && consent.status !== 1) {
             return errorResponseFromCode('PROVIDER_CONSENT_NOT_READY', moduleLog, {
               details: { consentId, status: consent.status },
@@ -934,10 +1007,10 @@ export const arcimMigrationExtension: Extension = {
 
           // ── Guard: a completed SIE import is required before entity import ──
           // Most providers expose ONLY entity data (customers, suppliers,
-          // invoices) via API — never the general ledger. Fortnox pulls the GL
+          // invoices) via API: never the general ledger. Fortnox pulls the GL
           // itself via SIE-over-API and is exempt. Briox and Björn Lundén also
           // serve SIE over the API, but the wizard runs /import-sie before
-          // /migrate, so this guard stays satisfied — and keeps protecting
+          // /migrate, so this guard stays satisfied, and keeps protecting
           // against a skipped SIE step. Importing entities without the
           // SIE-derived ledger (kontoplan,
           // ingående balanser, verifikationer) would leave an incomplete
@@ -983,6 +1056,12 @@ export const arcimMigrationExtension: Extension = {
           return NextResponse.json({ success: true, results })
         } catch (error) {
           log.error('arcim migration failed', error as Error)
+          // Consent missing or owned by another company: same 404 either way.
+          if (error instanceof ConsentNotFoundError) {
+            return errorResponseFromCode('PROVIDER_CONSENT_NOT_FOUND', moduleLog, {
+              details: { consentId },
+            })
+          }
           const classified = classifyProviderError(error)
           return errorResponseFromCode(classified ?? 'PROVIDER_MIGRATE_FAILED', moduleLog, {
             details: {
@@ -997,7 +1076,7 @@ export const arcimMigrationExtension: Extension = {
     // ── Reconcile supplier invoices to GL payment vouchers ────────
     // Re-runnable maintenance endpoint. The migration runs this automatically as
     // its final step, but SIE (the GL) and entity import are two separate HTTP
-    // requests whose order is UI-driven — so if the GL lands after the entity
+    // requests whose order is UI-driven: so if the GL lands after the entity
     // import, or a company was migrated before this feature existed, call this to
     // auto-link settled supplier invoices to their existing vouchers. Pass
     // { dryRun: true } to preview the plan (incl. items needing manual review)
@@ -1021,7 +1100,7 @@ export const arcimMigrationExtension: Extension = {
           const body = (await request.json()) as { dryRun?: boolean }
           dryRun = body?.dryRun === true
         } catch {
-          // empty body is fine — default to a real run
+          // empty body is fine: default to a real run
         }
 
         try {
@@ -1042,6 +1121,69 @@ export const arcimMigrationExtension: Extension = {
         } catch (error) {
           log.error('arcim reconcile failed', error as Error)
           return errorResponseFromCode('PROVIDER_MIGRATE_FAILED', moduleLog, {
+            details: { reason: error instanceof Error ? error.message : 'unknown' },
+          })
+        }
+      },
+    },
+
+    // ── Import provider underlag (receipts) and link to verifikat ──
+    // Best-effort, re-runnable. Kept off the migration's critical path: the
+    // Bokio document API is rate-limited (200 req/60s) and a full receipt
+    // sweep issues hundreds of download calls, which would blow the 300s
+    // migration window. Pages /uploads, resolves each receipt's verifikat via
+    // the SIE-preserved Bokio voucher number, and archives it idempotently
+    // (skips content already stored for the company). Pass { dryRun: true } to
+    // preview the match plan without downloading or writing.
+    {
+      method: 'POST',
+      path: '/import-documents',
+      handler: async (request: Request, ctx?: ExtensionContext) => {
+        const log = ctx?.log ?? console
+        const supabase = ctx?.supabase ?? await (await import('@/lib/supabase/server')).createClient()
+        const { data: { user } } = await supabase.auth.getUser()
+
+        if (!user) {
+          return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+        }
+
+        const companyId = ctx?.companyId ?? user.id
+
+        let consentId: string | undefined
+        let dryRun = false
+        try {
+          const body = (await request.json()) as { consentId?: string; dryRun?: boolean }
+          consentId = body?.consentId
+          dryRun = body?.dryRun === true
+        } catch {
+          // empty/invalid body: consentId check below rejects it
+        }
+
+        if (!consentId) {
+          return NextResponse.json({ error: 'consentId is required' }, { status: 400 })
+        }
+
+        try {
+          const result = await importProviderDocuments({
+            supabase,
+            companyId,
+            userId: user.id,
+            consentId,
+            dryRun,
+          })
+          log.info('arcim import-documents completed', {
+            companyId,
+            dryRun,
+            scanned: result.scanned,
+            linked: result.linked,
+            skipped: result.skipped,
+            unmatched: result.unmatched,
+            failed: result.failed,
+          })
+          return NextResponse.json({ success: true, dryRun, result })
+        } catch (error) {
+          log.error('arcim import-documents failed', error as Error)
+          return errorResponseFromCode('PROVIDER_IMPORT_DOCUMENTS_FAILED', moduleLog, {
             details: { reason: error instanceof Error ? error.message : 'unknown' },
           })
         }

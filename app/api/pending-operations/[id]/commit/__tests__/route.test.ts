@@ -100,7 +100,9 @@ describe('POST /api/pending-operations/:id/commit', () => {
     const { status, body } = await parseJsonResponse<{ error: string }>(response)
 
     expect(status).toBe(409)
-    expect(body.error).toMatch(/already (committed|claimed|resolved)/i)
+    // The executor's English error string maps to the Swedish HTTP-409
+    // fallback: raw English never reaches the toast (issue #337).
+    expect(body.error).toBe('En konflikt uppstod. Ladda om sidan och försök igen.')
   })
 
   describe('categorize_transaction', () => {
@@ -147,7 +149,7 @@ describe('POST /api/pending-operations/:id/commit', () => {
       // not active in the chart. The engine throws AccountsNotInChartError; the
       // dispatcher must release the op back to 'pending' (retryable, see the
       // 6th enqueued response) and the route must return the structured error
-      // with code + account_numbers so the chat can offer activation — NOT a
+      // with code + account_numbers so the chat can offer activation: NOT a
       // raw error string.
       const tx = makeTransaction({ id: 'tx-1', amount: -500, journal_entry_id: null })
       const settings = makeCompanySettings()
@@ -181,6 +183,7 @@ describe('POST /api/pending-operations/:id/commit', () => {
         { data: pendingOp },                         // fetch pending op
         { data: { id: 'op-1' } },                    // CAS claim
         { data: tx },                                 // fetch transaction (already has JE)
+        { data: { status: 'posted' } },              // hasLiveJournalEntryLink: existing JE is live
         { data: null, error: null },                  // auto-reject update
       ])
 
@@ -189,7 +192,10 @@ describe('POST /api/pending-operations/:id/commit', () => {
       const { status, body } = await parseJsonResponse<{ error: string }>(response)
 
       expect(status).toBe(409)
-      expect(body.error).toContain('already has a journal entry')
+      // Known-pattern translation of the executor's English message (#337).
+      expect(body.error).toBe(
+        'Transaktionen är redan bokförd. Ångra kategoriseringen om du vill ändra den.',
+      )
     })
   })
 
@@ -256,7 +262,7 @@ describe('POST /api/pending-operations/:id/commit', () => {
         { data: { id: 'op-1' } },                     // CAS claim
         { data: customer },                           // fetch customer
         { data: { vat_registered: true } },           // company_settings VAT registration gate
-        { data: { id: 'inv-1', invoice_number: null } }, // insert invoice (no number — assigned at send)
+        { data: { id: 'inv-1', invoice_number: null } }, // insert invoice (no number: assigned at send)
         { data: null, error: null },                  // insert items
         { data: { id: 'inv-1', invoice_number: null, customer: customer, items: [] } }, // fetch complete invoice
         { data: null, error: null },                  // update pending op status
@@ -268,7 +274,7 @@ describe('POST /api/pending-operations/:id/commit', () => {
 
       expect(status).toBe(200)
       expect(body.data.invoice_id).toBe('inv-1')
-      // Drafts no longer reserve a number — assigned at send time instead
+      // Drafts no longer reserve a number: assigned at send time instead
       expect(body.data.invoice_number).toBeNull()
     })
 
@@ -285,7 +291,8 @@ describe('POST /api/pending-operations/:id/commit', () => {
       const { status, body } = await parseJsonResponse<{ error: string }>(response)
 
       expect(status).toBe(404)
-      expect(body.error).toContain('Customer not found')
+      // English executor message → Swedish HTTP-404 fallback (issue #337).
+      expect(body.error).toBe('Resursen kunde inte hittas.')
     })
   })
 })

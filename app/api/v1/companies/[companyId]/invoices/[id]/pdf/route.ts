@@ -7,23 +7,29 @@
  *
  * Behavior:
  *   - Drafts (no invoice_number): the filename uses `utkast-<id-slice>`. The
- *     PDF is still rendered — useful for "preview before send" workflows.
+ *     PDF is still rendered: useful for "preview before send" workflows.
  *   - Sent / paid / overdue / cancelled / credit notes: full PDF with the
  *     persisted invoice number.
- *   - Credit notes: filename uses `kreditfaktura-` prefix and the original
- *     invoice's löpnummer is embedded (ML 17 kap 22–23§ back-reference).
+ *   - Credit notes: the filename identifies the document as a kreditfaktura and the original
+ *     invoice's löpnummer is embedded (ML 17 kap 22-23§ back-reference).
  *   - Delivery notes: PDF is permitted (read-only, no compliance side effect).
  *
- * Read-only — no Idempotency-Key, no dry-run, scope `invoices:read`.
+ * Read-only: no Idempotency-Key, no dry-run, scope `invoices:read`.
  */
 
 import { z } from 'zod'
 import { renderToBuffer } from '@react-pdf/renderer'
 import { InvoicePDF } from '@/lib/invoices/pdf-template'
-import { prepareInvoicePdfRender } from '@/lib/invoices/pdf-render-helpers'
+import { prepareInvoicePdfRender, buildSwishQrDataUrl } from '@/lib/invoices/pdf-render-helpers'
+import { invoicePdfFilename } from '@/lib/invoices/pdf-filename'
+import { contentDisposition } from '@/lib/api/content-disposition'
 import { registerEndpoint } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
 import { v1ErrorResponse, v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
+import {
+  hasRequiredInvoicePaymentAccount,
+  invoiceRequiresPaymentAccount,
+} from '@/lib/invoices/payment-accounts'
 import type { CompanySettings, Customer, Invoice, InvoiceItem } from '@/types'
 
 const INVOICE_PDF_COLUMNS =
@@ -44,19 +50,19 @@ registerEndpoint({
   path: '/api/v1/companies/:companyId/invoices/:id/pdf',
   summary: 'Download the rendered invoice PDF.',
   description:
-    'Returns the invoice as application/pdf. The filename in Content-Disposition reflects the document type: faktura-<number>.pdf for sent invoices, kreditfaktura-<number>.pdf for credit notes, utkast-<id-slice>.pdf for drafts. This endpoint is byte-equivalent to the dashboard download.',
+    'Returns the invoice as application/pdf. The descriptive filename contains company, customer, document type, invoice number or draft identifier, and invoice date. This endpoint is byte-equivalent to the dashboard download.',
   useWhen:
     'You need to fetch an invoice PDF for archival, forwarding to a customer outside the Accounted send flow, or attaching to an external workflow.',
   doNotUseFor:
-    'Sending the invoice to the customer — use POST /invoices/{id}/send, which renders the PDF, emails it, and archives it as a verifikationsunderlag in one atomic step.',
+    'Sending the invoice to the customer: use POST /invoices/{id}/send, which renders the PDF, emails it, and archives it as a verifikationsunderlag in one atomic step.',
   pitfalls: [
-    'Drafts (no invoice_number yet) render with an "utkast" filename. The PDF carries no F-series number — do not treat it as a finalized invoice.',
+    'Drafts (no invoice_number yet) render with an "utkast" filename. The PDF carries no F-series number: do not treat it as a finalized invoice.',
     'PDF rendering can take several hundred milliseconds for invoices with many line items. Cache on the client if requesting repeatedly.',
-    'Credit notes embed the original invoice\'s löpnummer per ML 17 kap 22–23§ — if the original was hard-deleted (not possible via Accounted but theoretically via a manual DB edit), the reference is omitted.',
+    'Credit notes embed the original invoice\'s löpnummer per ML 17 kap 22-23§: if the original was hard-deleted (not possible via Accounted but theoretically via a manual DB edit), the reference is omitted.',
   ],
   example: {
     response: {
-      // Binary response — OpenAPI declares format: binary via response.contentType.
+      // Binary response: OpenAPI declares format: binary via response.contentType.
       // Documented here for human readers.
       _note: 'Returns application/pdf binary stream.',
     },
@@ -67,7 +73,7 @@ registerEndpoint({
   reversible: false,
   dryRunSupported: false,
   response: {
-    success: z.unknown(), // Marker — binary response, see contentType.
+    success: z.unknown(), // Marker: binary response, see contentType.
     contentType: 'application/pdf',
   },
 })
@@ -110,7 +116,7 @@ export const GET = withApiV1<{ params: Promise<{ companyId: string; id: string }
     }
 
     // company_settings is required by the PDF template (header, bank info,
-    // entity-type-driven layout). Select * is intentional — see the rationale
+    // entity-type-driven layout). Select * is intentional: see the rationale
     // in the :send route. Same flat owner-facing config object, no sensitive
     // columns.
     const { data: company, error: companyErr } = await ctx.supabase
@@ -129,9 +135,16 @@ export const GET = withApiV1<{ params: Promise<{ companyId: string; id: string }
       })
     }
 
+    if (!hasRequiredInvoicePaymentAccount(company as CompanySettings, typed)) {
+      return v1ErrorResponseFromCode('INVOICE_SEND_PAYMENT_ACCOUNT_MISSING', ctx.log, {
+        requestId: ctx.requestId,
+        details: { currency: typed.currency },
+      })
+    }
+
     const items = (typed.items ?? []).slice().sort((a, b) => a.sort_order - b.sort_order)
 
-    // Credit-note back-reference per ML 17 kap 22–23§. Best-effort — if the
+    // Credit-note back-reference per ML 17 kap 22-23§. Best-effort: if the
     // original invoice was somehow deleted, the PDF template tolerates an
     // undefined value (the back-reference field is omitted from the layout).
     let originalInvoiceNumber: string | undefined
@@ -149,15 +162,21 @@ export const GET = withApiV1<{ params: Promise<{ companyId: string; id: string }
 
     let pdfBuffer: Buffer
     try {
-      const { branding } = prepareInvoicePdfRender(company as CompanySettings)
+      const { branding, company: renderCompany } = await prepareInvoicePdfRender(
+        company as CompanySettings,
+        typed.currency,
+        { paymentAccountRequired: invoiceRequiresPaymentAccount(typed) },
+      )
+      const swishQrDataUrl = await buildSwishQrDataUrl(renderCompany, typed as Invoice)
       pdfBuffer = await renderToBuffer(
         InvoicePDF({
           invoice: typed as Invoice,
           customer: typed.customer as Customer,
           items,
-          company: company as CompanySettings,
+          company: renderCompany,
           originalInvoiceNumber,
           branding,
+          swishQrDataUrl,
         }),
       )
     } catch (err) {
@@ -171,22 +190,24 @@ export const GET = withApiV1<{ params: Promise<{ companyId: string; id: string }
     }
 
     const isCreditNote = !!typed.credited_invoice_id
-    const filenameNumber = typed.invoice_number ?? `utkast-${invoiceId.slice(0, 8)}`
-    const filename = isCreditNote
-      ? `kreditfaktura-${filenameNumber}.pdf`
-      : typed.document_type === 'proforma'
-        ? `proformafaktura-${filenameNumber}.pdf`
-        : typed.document_type === 'delivery_note'
-          ? `följesedel-${filenameNumber}.pdf`
-          : `faktura-${filenameNumber}.pdf`
+    const filename = invoicePdfFilename({
+      companyName: (company as CompanySettings).company_name,
+      customerName: typed.customer?.name,
+      invoiceNumber: typed.invoice_number,
+      invoiceId,
+      invoiceDate: typed.invoice_date,
+      documentType: typed.document_type,
+      isCreditNote,
+    })
 
     const uint8Array = new Uint8Array(pdfBuffer)
     return new Response(uint8Array, {
       status: 200,
       headers: {
         'Content-Type': 'application/pdf',
-        'Content-Disposition': `attachment; filename="${filename}"`,
+        'Content-Disposition': contentDisposition('attachment', filename),
         'Content-Length': String(pdfBuffer.length),
+        'Cache-Control': 'private, no-store',
         'X-Request-Id': ctx.requestId,
       },
     })

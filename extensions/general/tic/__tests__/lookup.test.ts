@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
 // Mock the tic-client functions. /lookup now only calls
-// searchCompanyByOrgNumber — the Phase 2 fetchers stay mocked because the
+// searchCompanyByOrgNumber: the Phase 2 fetchers stay mocked because the
 // /profile handler shares the module, but we don't expect /lookup to invoke
 // them.
 vi.mock('../lib/tic-client', () => ({
@@ -42,7 +42,7 @@ function makeRequest(orgNumber?: string): Request {
 const lookupHandler = ticExtension.apiRoutes![0].handler
 
 // Search-public document now carries everything /lookup needs at the top
-// level — sniCodes, bankAccounts, emailAddresses, phoneNumbers,
+// level: sniCodes, bankAccounts, emailAddresses, phoneNumbers,
 // mostRecentFinancialSummary. The previous Phase 2 fan-out duplicated these.
 const mockDoc: TICCompanyDocument = {
   companyId: 42,
@@ -52,7 +52,8 @@ const mockDoc: TICCompanyDocument = {
     { nameOrIdentifier: 'Test AB', companyNamingType: 'name' },
   ],
   legalEntityType: 'AB',
-  registrationDate: 0,
+  // 2026-02-02 in Unix seconds (TIC's native unit; the route converts to ms)
+  registrationDate: Math.floor(Date.UTC(2026, 1, 2) / 1000),
   mostRecentRegisteredAddress: {
     streetAddress: 'Storgatan 1',
     postalCode: '111 22',
@@ -114,6 +115,28 @@ describe('TIC lookup route', () => {
     expect(data.email).toBe('info@test.se')
     expect(data.phone).toBe('08-1234567')
     expect(data.fiscalYear).toEqual({ startMonthDay: '01-01', endMonthDay: '12-31' })
+    expect(data.registrationDate).toBe(Date.UTC(2026, 1, 2))
+  })
+
+  it('converts registrationDate from Unix seconds to a millisecond epoch', async () => {
+    mockSearch.mockResolvedValue(mockDoc)
+
+    const res = await lookupHandler(makeRequest('556036-0793'))
+    const { data } = await res.json()
+    // Regression: fed raw seconds into `new Date()`, a 2026 registration
+    // rendered as 1970-01-21 in onboarding's fiscal-year step.
+    expect(new Date(data.registrationDate).toISOString().slice(0, 10)).toBe('2026-02-02')
+  })
+
+  it('returns registrationDate null when the doc lacks one', async () => {
+    mockSearch.mockResolvedValue({
+      ...mockDoc,
+      registrationDate: undefined as unknown as number,
+    })
+
+    const res = await lookupHandler(makeRequest('556036-0793'))
+    const { data } = await res.json()
+    expect(data.registrationDate).toBeNull()
   })
 
   it('does NOT fan out to Phase 2 endpoints', async () => {

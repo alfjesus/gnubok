@@ -1,5 +1,6 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { fetchAllRows } from '@/lib/supabase/fetch-all'
+import { loadTaxAdjustmentSnapshot } from '@/lib/bokslut/tax-provision/tax-adjustment-service'
 import type {
   FiscalPeriod,
   JournalEntry,
@@ -562,7 +563,7 @@ export const INK2R_ACCOUNT_MAPPINGS: INK2AccountMapping[] = [
     normalBalance: 'debit',
     accountRanges: [{ start: '8500', end: '8599' }],
   },
-  // Bokslutsdispositioner — account numbers per BAS 2020 (verified against
+  // Bokslutsdispositioner: account numbers per BAS 2020 (verified against
   // lib/bookkeeping/bas-data/class-8-financial.ts).
   {
     sruCode: '7525',
@@ -727,17 +728,26 @@ export async function generateINK2Declaration(
     throw new Error('INK2 declaration is only for aktiebolag (limited company)')
   }
 
-  // Fetch all posted journal entries with lines for this period
-  const { data: entries, error: entriesError } = await supabase
-    .from('journal_entries')
-    .select('*, lines:journal_entry_lines(*)')
-    .eq('company_id', companyId)
-    .eq('fiscal_period_id', fiscalPeriodId)
-    .in('status', ['posted', 'reversed'])
+  const taxAdjustments = await loadTaxAdjustmentSnapshot(
+    supabase,
+    companyId,
+    fiscalPeriodId,
+  )
 
-  if (entriesError) {
-    throw new Error(`Failed to fetch journal entries: ${entriesError.message}`)
-  }
+  // Fetch all posted journal entries with lines for this period.
+  // Paginated: a period can exceed PostgREST's 1000-row cap, and a silent
+  // truncation here would under-report the INK2 tax declaration. PostgREST
+  // ranges count parent rows, so the embedded lines come with each entry.
+  const entries = await fetchAllRows<JournalEntry>(({ from, to }) =>
+    supabase
+      .from('journal_entries')
+      .select('*, lines:journal_entry_lines(*)')
+      .eq('company_id', companyId)
+      .eq('fiscal_period_id', fiscalPeriodId)
+      .in('status', ['posted', 'reversed'])
+      .order('id', { ascending: true })
+      .range(from, to)
+  , { dedupeBy: (e) => e.id })
 
   // Fetch chart of accounts for account names
   const accounts = await fetchAllRows<{ account_number: string; account_name: string }>(({ from, to }) =>
@@ -745,6 +755,7 @@ export async function generateINK2Declaration(
       .from('chart_of_accounts')
       .select('account_number, account_name')
       .eq('company_id', companyId)
+      .order('account_number', { ascending: true })
       .range(from, to)
   )
 
@@ -779,7 +790,7 @@ export async function generateINK2Declaration(
   for (const [accountNumber, balance] of accountBalances) {
     if (Math.abs(balance) < 0.01) continue
 
-    // Skip account 8999 — årets resultat is calculated
+    // Skip account 8999: årets resultat is calculated
     if (accountNumber === '8999') continue
 
     let mapped = false
@@ -877,7 +888,7 @@ export async function generateINK2Declaration(
   }
 
   // Add calculated result to fritt eget kapital for balance
-  // During open fiscal year, 2099 may have no balance — the result only exists
+  // During open fiscal year, 2099 may have no balance; the result only exists
   // as net of income statement accounts. Adding it here handles both cases.
   const adjustedEquityLiabilities = totalEquityLiabilities + resultAfterFinancial
 
@@ -886,10 +897,17 @@ export async function generateINK2Declaration(
   const fyEnd = (period.period_end as string).replace(/-/g, '')
 
   // Build INK2 (huvudblankett)
-  // Auto-derive from INK2S result (simplified: result + non-deductible tax)
+  // Auto-derive from INK2S result and the saved tax-only adjustments.
   // 7528 is already positive per Skatteverket convention
   const taxAmount = ink2r['7528']
-  const taxableResult = resultAfterFinancial + taxAmount
+  // INK2/SRU amounts are declared in whole kronor with ören omitted. Use the
+  // same whole-krona values in both the adjustment fields and the tax result
+  // so the worksheet remains internally consistent.
+  const nonDeductibleExpenses = Math.trunc(taxAdjustments.nonDeductibleExpenses)
+  const nonTaxableIncome = Math.trunc(taxAdjustments.nonTaxableIncome)
+  const taxableResult =
+    resultAfterFinancial + taxAmount
+    + nonDeductibleExpenses - nonTaxableIncome
 
   const ink2: INK2Rutor = {
     '7011': fyStart,
@@ -898,20 +916,22 @@ export async function generateINK2Declaration(
     '7114': taxableResult < 0 ? Math.abs(taxableResult) : 0,
   }
 
-  // Build INK2S (skattemässiga justeringar — auto-derived basics only)
+  // Build INK2S (skattemässiga justeringar, auto-derived basics only)
   const ink2s: INK2SRutor = {
     '7011': fyStart,
     '7012': fyEnd,
     '7650': resultAfterFinancial >= 0 ? resultAfterFinancial : 0,
     '7750': resultAfterFinancial < 0 ? Math.abs(resultAfterFinancial) : 0,
     '7651': taxAmount, // Skatt (ej avdragsgill)
+    '7653': nonDeductibleExpenses,
+    '7754': nonTaxableIncome,
     '8020': taxableResult >= 0 ? taxableResult : 0,
     '8021': taxableResult < 0 ? Math.abs(taxableResult) : 0,
   }
 
   // Add warnings
   if (!(period as FiscalPeriod).is_closed) {
-    warnings.push('Räkenskapsåret är inte stängt — deklarationen kan genereras, men siffrorna kan ändras om fler bokföringar görs.')
+    warnings.push('Räkenskapsåret är inte stängt; deklarationen kan genereras, men siffrorna kan ändras om fler bokföringar görs.')
   }
 
   if (totalAssets === 0 && totalEquityLiabilities === 0 && ink2r['7410'] === 0) {

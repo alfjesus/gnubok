@@ -3,13 +3,15 @@
 import { useState } from 'react'
 import Link from 'next/link'
 import { useTranslations } from 'next-intl'
-import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { EmptyState } from '@/components/ui/empty-state'
 import { useToast } from '@/components/ui/use-toast'
 import { cn, formatCurrency, formatDate } from '@/lib/utils'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
+import { useCapability } from '@/contexts/CompanyContext'
+import { CAPABILITY } from '@/lib/entitlements/keys'
+import { visibleWorklistTotal } from '@/lib/worklist/visible-total'
 import {
   ArrowLeftRight,
   ArrowRight,
@@ -21,19 +23,19 @@ import {
   Inbox,
   Landmark,
   Loader2,
-  Receipt,
+  ReceiptText,
   ShieldCheck,
   Stamp,
 } from 'lucide-react'
 import type { SuggestedMatch, WorklistCounts } from '@/lib/worklist/types'
 
 /**
- * AttGoraSection — the dashboard's unified worklist ("Att göra").
+ * AttGoraSection: the dashboard's unified worklist ("Att göra").
  *
  * One flat ledger of everything actionable, grouped into three bands by
  * session intent: Bokför (the daily loop), Granska & komplettera (close the
- * gaps), Bevaka (time-driven). Every count comes from lib/worklist — the same
- * source as the sidebar badges — so the numbers can never disagree.
+ * gaps), Bevaka (time-driven). Every count comes from lib/worklist (the same
+ * source as the sidebar badges) so the numbers can never disagree.
  *
  * Suggested transaction↔invoice matches render inline with one-click confirm:
  * the row posts to the existing match endpoints, fades out optimistically,
@@ -50,7 +52,6 @@ interface AttGoraSectionProps {
   worklist: WorklistCounts
   suggestedMatches: SuggestedMatch[]
   expiringBankConnections?: ExpiringBankConnection[]
-  staleUncategorizedCount: number
 }
 
 interface WorklistRowProps {
@@ -66,23 +67,29 @@ function WorklistRow({ href, icon: Icon, label, detail, count, badge }: Worklist
   return (
     <Link
       href={href}
-      className="flex items-center gap-3 px-4 py-3 hover:bg-secondary/60 transition-colors duration-150"
+      className="group flex w-full items-start gap-3 border-b border-border px-1 py-3.5 transition-colors duration-150 hover:bg-secondary/30"
     >
-      <Icon className="h-4 w-4 text-muted-foreground shrink-0" />
-      <div className="flex-1 min-w-0">
-        <p className="text-sm truncate">{label}</p>
-        {detail && <p className="text-xs text-muted-foreground mt-0.5 truncate">{detail}</p>}
+      <span className="mt-px w-[18px] shrink-0 text-muted-foreground" aria-hidden>
+        <Icon className="h-[15px] w-[15px]" />
+      </span>
+      <div className="min-w-0 flex-1">
+        <p className="truncate text-[13.5px]">{label}</p>
+        {detail && <p className="mt-0.5 truncate text-xs text-muted-foreground">{detail}</p>}
       </div>
-      {badge}
-      <span className="font-display text-base tabular-nums shrink-0">{count}</span>
-      <ChevronRight className="h-3.5 w-3.5 text-muted-foreground/50 shrink-0" />
+      <span className="ml-auto flex shrink-0 items-center gap-2.5 pt-px">
+        {badge}
+        <Badge variant="secondary" className="font-normal tabular-nums">
+          {count}
+        </Badge>
+        <ChevronRight className="h-3.5 w-3.5 text-muted-foreground opacity-0 transition-opacity duration-150 group-hover:opacity-100" />
+      </span>
     </Link>
   )
 }
 
 function BandHeader({ children }: { children: React.ReactNode }) {
   return (
-    <p className="px-4 pt-4 pb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+    <p className="px-1 pt-5 pb-1 text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground/80">
       {children}
     </p>
   )
@@ -92,10 +99,13 @@ export default function AttGoraSection({
   worklist,
   suggestedMatches,
   expiringBankConnections = [],
-  staleUncategorizedCount,
 }: AttGoraSectionProps) {
   const t = useTranslations('dashboard')
   const { toast } = useToast()
+  // The Dokumentinkorg is a paid (AI) surface: a non-payer's home to-do list
+  // must not offer a row that jumps to the gated workspace. Mirrors the sidebar
+  // + command palette gate; the page itself enforces it server-side.
+  const hasAi = useCapability(CAPABILITY.ai)
 
   const [counts, setCounts] = useState(worklist.counts)
   const [total, setTotal] = useState(worklist.total)
@@ -113,10 +123,11 @@ export default function AttGoraSection({
         setTotal(json.data.total)
       }
     } catch (err) {
-      // Stale counts self-correct on the next page load — never block the
-      // flow, but keep the failure observable (Sentry captures console.error)
-      // so a systematically broken counts endpoint doesn't hide behind
-      // silently frozen numbers.
+      // Stale counts self-correct on the next page load: never block the
+      // flow. Note this is a browser console.error and nothing collects it:
+      // the observability sink (lib/observability) is server-side and has no
+      // client adapter, so a systematically broken counts endpoint currently
+      // hides behind silently frozen numbers until someone reports it.
       console.error('[att-gora] worklist counts refetch failed', err)
     }
   }
@@ -166,7 +177,8 @@ export default function AttGoraSection({
     }
   }
 
-  const bokforRows = counts.book_transaction > 0 || counts.inbox_document > 0 || matches.length > 0
+  const showInboxDocuments = hasAi && counts.inbox_document > 0
+  const bokforRows = counts.book_transaction > 0 || showInboxDocuments || matches.length > 0
   const granskaRows =
     counts.supplier_invoice_approval > 0 ||
     counts.verifikat_missing_document > 0 ||
@@ -177,22 +189,28 @@ export default function AttGoraSection({
     expiringBankConnections.length > 0
   const allClear = !bokforRows && !granskaRows && !bevakaRows
 
-  // The header total must equal what the section actually shows: the worklist
-  // total plus expiring bank connections, which are dashboard-only (not a
-  // lib/worklist category). Every count that feeds this number has a row.
-  const displayTotal = total + expiringBankConnections.length
+  // The header total must equal what the section actually shows, computed off
+  // the same visibleWorklistTotal helper as the dashboard KPI tile so the two
+  // can never drift: the hidden paid inbox row is subtracted for non-payers,
+  // else the header would count work the section no longer renders.
+  const displayTotal = visibleWorklistTotal({
+    total,
+    inboxDocumentCount: counts.inbox_document,
+    hasAi,
+    extra: expiringBankConnections.length,
+  })
 
   return (
     <section aria-label={t('att_gora_title')}>
-      <div className="flex items-baseline justify-between mb-4">
-        <h2 className="font-display text-lg">{t('att_gora_title')}</h2>
-        <p className="text-sm text-muted-foreground tabular-nums" role="status" aria-live="polite">
+      {/* Pane header: Geist title + quiet count over a hairline */}
+      <div className="flex items-baseline justify-between border-b border-border px-1 pb-2.5">
+        <h2 className="font-sans text-sm font-medium">{t('att_gora_title')}</h2>
+        <p className="text-xs text-muted-foreground tabular-nums" role="status" aria-live="polite">
           {allClear ? t('all_done') : t('att_gora_left', { count: displayTotal })}
         </p>
       </div>
 
-      <Card>
-        <CardContent className="p-0">
+      <div>
           {allClear ? (
             <EmptyState
               icon={CheckCircle2}
@@ -205,20 +223,13 @@ export default function AttGoraSection({
               {bokforRows && (
                 <div>
                   <BandHeader>{t('band_bokfor')}</BandHeader>
-                  <div className="divide-y divide-border/50">
+                  <div>
                     {counts.book_transaction > 0 && (
                       <WorklistRow
                         href="/transactions"
                         icon={ArrowLeftRight}
                         label={t('row_book_transactions')}
                         count={counts.book_transaction}
-                        badge={
-                          staleUncategorizedCount > 0 ? (
-                            <Badge variant="warning" className="shrink-0">
-                              {t('row_book_transactions_stale', { count: staleUncategorizedCount })}
-                            </Badge>
-                          ) : undefined
-                        }
                       />
                     )}
                     {matches.length > 0 && (
@@ -289,7 +300,7 @@ export default function AttGoraSection({
                         </div>
                       </div>
                     )}
-                    {counts.inbox_document > 0 && (
+                    {showInboxDocuments && (
                       <WorklistRow
                         href="/e/general/invoice-inbox"
                         icon={Inbox}
@@ -305,7 +316,7 @@ export default function AttGoraSection({
               {granskaRows && (
                 <div>
                   <BandHeader>{t('band_granska')}</BandHeader>
-                  <div className="divide-y divide-border/50">
+                  <div>
                     {counts.supplier_invoice_approval > 0 && (
                       <WorklistRow
                         href="/supplier-invoices"
@@ -337,11 +348,11 @@ export default function AttGoraSection({
               {bevakaRows && (
                 <div>
                   <BandHeader>{t('band_bevaka')}</BandHeader>
-                  <div className="divide-y divide-border/50">
+                  <div>
                     {counts.overdue_invoice > 0 && (
                       <WorklistRow
                         href="/invoices?status=unpaid"
-                        icon={Receipt}
+                        icon={ReceiptText}
                         label={t('row_overdue_invoices')}
                         count={counts.overdue_invoice}
                       />
@@ -378,8 +389,7 @@ export default function AttGoraSection({
               )}
             </div>
           )}
-        </CardContent>
-      </Card>
+      </div>
     </section>
   )
 }

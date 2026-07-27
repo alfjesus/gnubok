@@ -34,7 +34,6 @@ function toSwedishError(msg: string): string {
   if (msg.includes('1st of a month')) return 'Startdatum måste vara den första i månaden.'
   if (msg.includes('last day of a month')) return 'Slutdatum måste vara den sista i månaden.'
   if (msg.includes('exceeds maximum 18 months')) return 'Räkenskapsåret får vara högst 18 månader (BFL 3 kap.).'
-  if (msg.includes('at least 6 months')) return 'Första räkenskapsåret måste vara minst 6 månader (BFL 3 kap.).'
   return msg
 }
 
@@ -48,7 +47,7 @@ export interface FiscalPeriodValidation {
 }
 
 /**
- * Shared validation for the first fiscal period — used by both onboarding Step 3
+ * Shared validation for the first fiscal period: used by both onboarding Step 3
  * and the settings FiscalPeriodEditor. Returns Swedish error copy.
  */
 export function validateFirstPeriod(
@@ -112,7 +111,7 @@ interface FiscalPeriodDateFieldsProps {
 /**
  * Shared first-fiscal-period date entry: day-level start (native date input),
  * caller-provided end-date control, and a Swedish summary card with inline
- * validation errors (6–18 months, EF calendar-year rule, last-day-of-month).
+ * validation errors (max 18 months, EF calendar-year rule, last-day-of-month).
  *
  * Used by onboarding Step 3 and the settings FiscalPeriodEditor so the two
  * screens stay in lockstep.
@@ -155,7 +154,7 @@ export function FiscalPeriodDateFields({
           </div>
           {startDate && endDate && (
             <p className="text-sm text-muted-foreground">
-              {formatSwedishDate(startDate)} – {formatSwedishDate(endDate)}
+              {formatSwedishDate(startDate)}: {formatSwedishDate(endDate)}
             </p>
           )}
           {validation.months !== null && (
@@ -163,7 +162,7 @@ export function FiscalPeriodDateFields({
               className={`text-xs ${validation.error ? 'text-destructive' : 'text-muted-foreground'}`}
             >
               {validation.months} månader
-              {validation.error ? ` — ${validation.error}` : ''}
+              {validation.error ? `: ${validation.error}` : ''}
             </p>
           )}
           {validation.error && validation.months === null && (

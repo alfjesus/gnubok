@@ -1,22 +1,21 @@
-import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
 import { ensureInitialized } from '@/lib/init'
-import { requireCompanyId } from '@/lib/company/context'
-import { requireWritePermission } from '@/lib/auth/require-write'
+import { withRouteContext } from '@/lib/api/with-route-context'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 ensureInitialized()
 
 /**
  * Mark the AGI period's tax payment (skatt + avgifter) as paid.
  *
- * This is a manual confirmation by the user — bank reconciliation against
- * Skattekontot transactions can also flip this flag automatically (handled
- * elsewhere via the Skattekonto sync).
+ * This is a manual confirmation by the user. The Skattekonto sync also flips
+ * the flag automatically when the period's AGI debit row is booked with the
+ * exact declared amount and the account is not in deficit (see
+ * extensions/general/skatteverket/lib/agi-tax-settlement.ts).
  */
-export async function POST(
-  request: Request,
-  { params }: { params: Promise<{ period: string }> }
-) {
+export const POST = withRouteContext<{ params: Promise<{ period: string }> }>(
+  'tax_payment.mark_paid',
+  async (request, { supabase, companyId }, { params }) => {
   const { period } = await params
   const periodMatch = /^(\d{4})-(\d{2})$/.exec(period)
   if (!periodMatch) {
@@ -27,15 +26,6 @@ export async function POST(
   }
   const periodYear = parseInt(periodMatch[1], 10)
   const periodMonth = parseInt(periodMatch[2], 10)
-
-  const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
-  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-
-  const writeCheck = await requireWritePermission(supabase, user.id)
-  if (!writeCheck.ok) return writeCheck.response
-
-  const companyId = await requireCompanyId(supabase, user.id)
 
   const { data: agi } = await supabase
     .from('agi_declarations')
@@ -58,8 +48,10 @@ export async function POST(
     .eq('id', agi.id)
 
   if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 })
+    return NextResponse.json({ error: getUserErrorMessage(error) }, { status: 500 })
   }
 
   return NextResponse.json({ data: { ok: true } })
-}
+  },
+  { requireWrite: true },
+)

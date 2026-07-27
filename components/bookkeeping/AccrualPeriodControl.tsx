@@ -17,6 +17,7 @@ import {
   computeInstallmentAmounts,
   countCalendarMonths,
 } from '@/lib/bookkeeping/accruals/compute'
+import { shouldShowK2AccrualHint } from '@/components/bookkeeping/accrual-k2-hint'
 import type { AccrualDirection } from '@/types'
 
 export interface AccrualFormValue {
@@ -25,7 +26,7 @@ export interface AccrualFormValue {
   balanceAccount: string
 }
 
-// The statutory BAS interim accounts per direction — a fixed list reads
+// The statutory BAS interim accounts per direction: a fixed list reads
 // better than a full account combobox and mirrors the DB CHECK (17xx/29xx).
 const BALANCE_ACCOUNT_OPTIONS: Record<AccrualDirection, Array<{ value: string; label: string }>> = {
   expense: [
@@ -47,19 +48,29 @@ const BALANCE_ACCOUNT_OPTIONS: Record<AccrualDirection, Array<{ value: string; l
  * Per-line periodisering panel for the invoice editors: service period +
  * interim balance account + a live "N månader × X kr" preview. The parent
  * owns the toggle; this renders only while periodisering is active on the
- * line. VAT is never affected — only the net amount is deferred.
+ * line. VAT is never affected: only the net amount is deferred.
  */
 export default function AccrualPeriodControl({
   direction,
   amount,
+  currency,
+  exchangeRate,
   value,
   onChange,
   onRemove,
   idPrefix,
 }: {
   direction: AccrualDirection
-  /** Net line amount (ex VAT) — drives the preview and the K2 hint. */
+  /** Net line amount (ex VAT), in `currency`: drives the preview and the K2 hint. */
   amount: number
+  /** ISO code of `amount`. Missing is treated as SEK (the editors' default). */
+  currency?: string | null
+  /**
+   * SEK per unit of `currency`. Only the supplier-invoice form has one; the
+   * customer-invoice editor carries no rate, so the K2 hint stays hidden on
+   * its foreign-currency lines instead of comparing kronor to euros.
+   */
+  exchangeRate?: number | null
   value: AccrualFormValue
   onChange: (next: AccrualFormValue) => void
   onRemove: () => void
@@ -81,7 +92,7 @@ export default function AccrualPeriodControl({
           const amounts = computeInstallmentAmounts(amount, months)
           preview = t('preview', {
             months,
-            amount: formatCurrency(amounts[0]),
+            amount: formatCurrency(amounts[0], currency || 'SEK'),
           })
         }
       } catch {
@@ -90,7 +101,11 @@ export default function AccrualPeriodControl({
     }
   }
 
-  const showK2Hint = amount > 0 && amount < 5000
+  // K2's 5 000 kr vasentlighetsgrans is measured in kronor, and it is a
+  // simplification the company may use, not an obligation. So when the line
+  // is in a foreign currency and no rate is available, show nothing at all
+  // rather than compare the raw foreign amount against a SEK threshold.
+  const showK2Hint = shouldShowK2AccrualHint({ amount, currency, exchangeRate })
 
   return (
     <div className="rounded-md border bg-muted/30 p-3 space-y-3">

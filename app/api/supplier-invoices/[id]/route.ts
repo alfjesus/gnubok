@@ -1,28 +1,19 @@
-import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
+import { withRouteContext } from '@/lib/api/with-route-context'
 import { validateBody } from '@/lib/api/validate'
 import { UpdateSupplierInvoiceSchema } from '@/lib/api/schemas'
-import { requireCompanyId } from '@/lib/company/context'
-import { requireWritePermission } from '@/lib/auth/require-write'
 import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
-import { createLogger } from '@/lib/logger'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
+import { getSwedishLocalDate } from '@/lib/bookkeeping/engine'
+import {
+  isUnsettledSupplierInvoiceStatus,
+  resolveUnsettledStatus,
+} from '@/lib/supplier-invoices/lifecycle'
 
-const log = createLogger('api.supplier_invoices.id')
-
-export async function GET(
-  _request: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
-  const supabase = await createClient()
+export const GET = withRouteContext<{ params: Promise<{ id: string }> }>(
+  'supplier_invoice.get',
+  async (_request, { supabase, companyId }, { params }) => {
   const { id } = await params
-
-  const { data: { user } } = await supabase.auth.getUser()
-
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const companyId = await requireCompanyId(supabase, user.id)
 
   const { data: invoice, error } = await supabase
     .from('supplier_invoices')
@@ -38,30 +29,23 @@ export async function GET(
   }
 
   return NextResponse.json({ data: invoice })
-}
+  },
+)
 
-export async function PUT(
-  request: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
-  const supabase = await createClient()
+export const PUT = withRouteContext<{ params: Promise<{ id: string }> }>(
+  'supplier_invoice.update',
+  async (request, { supabase, companyId, log, requestId }, { params }) => {
   const { id } = await params
 
-  const { data: { user } } = await supabase.auth.getUser()
-
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const writeCheck = await requireWritePermission(supabase, user.id)
-  if (!writeCheck.ok) return writeCheck.response
-
-  const companyId = await requireCompanyId(supabase, user.id)
-
-  // Only allow editing registered invoices
+  // Editing is allowed while the invoice is unsettled. 'overdue' is included
+  // because the daily cron flips unbooked invoices there just by aging, and a
+  // registered-only gate then made them permanently read-only: you could not
+  // even extend the due date to un-overdue them (#1206). The update body only
+  // carries metadata (numbers, dates, reference, notes), never amounts or
+  // accounts, so a posted registration verifikat cannot be desynced by money.
   const { data: existing } = await supabase
     .from('supplier_invoices')
-    .select('status')
+    .select('status, due_date, remaining_amount, is_credit_note, approved_at')
     .eq('id', id)
     .eq('company_id', companyId)
     .single()
@@ -70,49 +54,76 @@ export async function PUT(
     return NextResponse.json({ error: 'Not found' }, { status: 404 })
   }
 
-  if (existing.status !== 'registered') {
-    return NextResponse.json(
-      { error: 'Kan bara redigera registrerade fakturor' },
-      { status: 400 }
-    )
+  if (!isUnsettledSupplierInvoiceStatus(existing.status)) {
+    return errorResponseFromCode('SI_EDIT_INVALID_STATUS', log, {
+      requestId,
+      details: { currentStatus: existing.status },
+    })
   }
 
   const validation = await validateBody(request, UpdateSupplierInvoiceSchema)
   if (!validation.success) return validation.response
   const body = validation.data
 
-  const { data, error } = await supabase
+  // Keep the overdue label in step with the due date this update lands on
+  // instead of waiting for the next cron run: extending the due date should
+  // clear "Förfallen" immediately, and moving it into the past should set it.
+  const restingStatus = resolveUnsettledStatus(
+    {
+      due_date: body.due_date ?? existing.due_date,
+      remaining_amount: existing.remaining_amount,
+      is_credit_note: existing.is_credit_note,
+      approved_at: existing.approved_at,
+    },
+    getSwedishLocalDate(),
+  )
+
+  const rewritesStatus = restingStatus !== existing.status
+
+  let update = supabase
     .from('supplier_invoices')
-    .update(body)
+    .update(rewritesStatus ? { ...body, status: restingStatus } : body)
     .eq('id', id)
     .eq('company_id', companyId)
-    .select()
-    .single()
+
+  if (rewritesStatus) {
+    // Compare-and-swap, but only when this write derives a new status. The
+    // label is computed from facts read a moment ago, so writing it back
+    // unconditionally would let this request overwrite a concurrent cron flip
+    // or approval with a status derived from what those changed. Pinning the
+    // three inputs turns that into zero matched rows, i.e. a conflict the
+    // caller can retry, instead of a silently stale label. Metadata-only
+    // updates need no pin: they never touch status.
+    update = update
+      .eq('status', existing.status)
+      .eq('due_date', existing.due_date)
+    update = existing.approved_at
+      ? update.eq('approved_at', existing.approved_at)
+      : update.is('approved_at', null)
+  }
+
+  const { data, error } = await update.select().maybeSingle()
 
   if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 })
+    return NextResponse.json({ error: getUserErrorMessage(error) }, { status: 500 })
+  }
+
+  if (!data) {
+    return errorResponseFromCode('SI_EDIT_CONFLICT', log, {
+      requestId,
+      details: { expectedStatus: existing.status, expectedDueDate: existing.due_date },
+    })
   }
 
   return NextResponse.json({ data })
-}
+  },
+  { requireWrite: true },
+)
 
-export async function DELETE(
-  _request: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
-  const supabase = await createClient()
+export const DELETE = withRouteContext<{ params: Promise<{ id: string }> }>(
+  'supplier_invoice.delete',
+  async (_request, { supabase, companyId, log }, { params }) => {
   const { id } = await params
-
-  const { data: { user } } = await supabase.auth.getUser()
-
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const writeCheck = await requireWritePermission(supabase, user.id)
-  if (!writeCheck.ok) return writeCheck.response
-
-  const companyId = await requireCompanyId(supabase, user.id)
 
   // Only allow deleting registered invoices without journal entries
   const { data: existing } = await supabase
@@ -126,7 +137,7 @@ export async function DELETE(
     return NextResponse.json({ error: 'Not found' }, { status: 404 })
   }
 
-  // Block direct deletion of credit notes — deleting just the row would orphan the
+  // Block direct deletion of credit notes: deleting just the row would orphan the
   // posted reversal JE and silently break momsdeklaration. The user must instead
   // run "Ångra kreditering" on the original, which storno-reverses the JE and
   // restores the original's status atomically.
@@ -140,18 +151,27 @@ export async function DELETE(
     )
   }
 
-  if (existing.status !== 'registered') {
+  // 'overdue' and 'approved' are included: the daily cron flips unbooked
+  // invoices past due_date from registered/approved to 'overdue', and a
+  // registered-only gate made such an invoice permanently undeletable just by
+  // aging (support case 2026-07-26). What actually protects the books is the
+  // orphan-safety checks below (no registration verifikat, no payments, no
+  // accrual schedule), not the lifecycle label.
+  if (!['registered', 'approved', 'overdue'].includes(existing.status)) {
     return NextResponse.json(
-      { error: 'Kan bara ta bort registrerade fakturor' },
+      { error: 'Endast obetalda fakturor utan bokföring kan tas bort' },
       { status: 400 }
     )
   }
 
   // Booked invoices must go through the credit flow (mirrors the credit-note
-  // guard above). Two independent blockers:
-  //   (a) a posted registration verifikat — deleting the row would orphan it
+  // guard above). Three independent blockers:
+  //   (a) a posted registration verifikat: deleting the row would orphan it
   //       and silently understate 2440/2641 for the momsdeklaration;
-  //   (b) an accrual schedule — accrual_schedules.supplier_invoice_id is
+  //   (b) a payment row: deleting the invoice would orphan the payment's
+  //       journal-entry link (belt-and-braces: payments normally move the
+  //       status to partially_paid/paid, which the gate above already blocks);
+  //   (c) an accrual schedule: accrual_schedules.supplier_invoice_id is
   //       ON DELETE RESTRICT, so the invoice DELETE below would fail AFTER the
   //       items were already deleted, leaving a broken invoice with zero rows.
   if (existing.registration_journal_entry_id) {
@@ -160,13 +180,38 @@ export async function DELETE(
     })
   }
 
-  const { data: linkedSchedule } = await supabase
+  // Both orphan-safety lookups fail CLOSED: a lookup error must block the
+  // delete, otherwise a transient DB/RLS failure would read as "no payment /
+  // no schedule" and let the delete through unverified.
+  const { data: linkedPayment, error: paymentLookupError } = await supabase
+    .from('supplier_invoice_payments')
+    .select('id')
+    .eq('company_id', companyId)
+    .eq('supplier_invoice_id', id)
+    .limit(1)
+    .maybeSingle()
+
+  if (paymentLookupError) {
+    return NextResponse.json({ error: getUserErrorMessage(paymentLookupError) }, { status: 500 })
+  }
+
+  if (linkedPayment) {
+    return errorResponseFromCode('SI_DELETE_HAS_BOOKING', log, {
+      details: { reason: 'payments', paymentId: linkedPayment.id },
+    })
+  }
+
+  const { data: linkedSchedule, error: scheduleLookupError } = await supabase
     .from('accrual_schedules')
     .select('id')
     .eq('company_id', companyId)
     .eq('supplier_invoice_id', id)
     .limit(1)
     .maybeSingle()
+
+  if (scheduleLookupError) {
+    return NextResponse.json({ error: getUserErrorMessage(scheduleLookupError) }, { status: 500 })
+  }
 
   if (linkedSchedule) {
     return errorResponseFromCode('SI_DELETE_HAS_BOOKING', log, {
@@ -184,8 +229,10 @@ export async function DELETE(
     .eq('company_id', companyId)
 
   if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 })
+    return NextResponse.json({ error: getUserErrorMessage(error) }, { status: 500 })
   }
 
   return NextResponse.json({ success: true })
-}
+  },
+  { requireWrite: true },
+)

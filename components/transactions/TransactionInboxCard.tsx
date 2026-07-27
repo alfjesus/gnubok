@@ -4,26 +4,20 @@ import { useEffect, useState } from 'react'
 import { useTranslations } from 'next-intl'
 import { useDocumentExtraction } from '@/lib/hooks/use-document-extraction'
 import ExtractionStatus from '@/components/ui/extraction-status'
-import { motion } from 'framer-motion'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
-import {
-  DataListRow,
-  DataListPrimary,
-  DataListMeta,
-  DataListMetaSeparator,
-} from '@/components/ui/data-list'
+import { TD_CLASS, RowFoldout } from '@/components/ui/dry-table'
 import { cn, formatCurrency, formatDate } from '@/lib/utils'
 import { isImportedTransaction } from '@/lib/transactions/origin'
 import {
   AlertCircle,
-  ArrowUpRight,
-  ArrowDownRight,
+  ChevronRight,
+  EyeOff,
   FileSearch,
-  FileText,
   Link2,
   Loader2,
+  MessageCircle,
   MoreHorizontal,
   Paperclip,
   Pencil,
@@ -39,12 +33,13 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { ENABLED_EXTENSION_IDS } from '@/lib/extensions/_generated/enabled-extensions'
 
-// True when the AI tier is active — gates user-facing strings that promise
+// True when the AI tier is active: gates user-facing strings that promise
 // AI behavior. On the free build (document-extraction disabled) we keep the
 // upload functional but drop the "AI:n läser dokumentet" promise.
 const HAS_AI_EXTRACTION = ENABLED_EXTENSION_IDS.has('document-extraction')
 import { TransactionAttachmentIndicator } from './TransactionAttachmentIndicator'
 import { useCanWrite } from '@/lib/hooks/use-can-write'
+import { useAgentSheet } from '@/components/agent/AgentSheetProvider'
 import type { TransactionWithInvoice, CategorizeHandler } from './transaction-types'
 
 interface TransactionInboxCardProps {
@@ -53,38 +48,49 @@ interface TransactionInboxCardProps {
    *  transfer that the user will later see on /skattekonto. */
   skvCounterpartDate?: string
   processingId: string | null
-  isBatchMode: boolean
   isSelected: boolean
+  /** Row expansion (concept foldout): controlled by the page so only one
+   *  row is open at a time, mirroring the verifikat list. */
+  isExpanded: boolean
+  onToggleExpand: (id: string) => void
   entityType?: string
   onCategorize: CategorizeHandler
   /** Confirm an auto-detected invoice match (1-click shortcut). */
   onOpenMatchDialog: (transaction: TransactionWithInvoice) => void
-  /** Open the manual picker — routes to customer or supplier picker by amount sign. */
+  /** Open the manual picker: routes to customer or supplier picker by amount sign. */
   onOpenMatchInvoicePicker: (transaction: TransactionWithInvoice) => void
-  /** Open the split-payment allocator (1 tx → N invoices) — same direction
+  /** Open the split-payment allocator (1 tx → N invoices): same direction
    *  detection as the single-pick picker. Optional so legacy callers stay
    *  source-compatible. */
   onOpenSplitMatch?: (transaction: TransactionWithInvoice) => void
-  /** Open the existing-verifikat matcher — link the bank tx to an already-booked
+  /** Open the existing-verifikat matcher: link the bank tx to an already-booked
    *  voucher (salary, Fortnox import, manual entry) with no new bokföring. */
   onOpenMatchVoucher?: (transaction: TransactionWithInvoice) => void
-  /** Open the attach-underlag dialog — pin an inbox document or a fresh upload
+  /** Open the attach-underlag dialog: pin an inbox document or a fresh upload
    *  to the transaction (the tx→doc mirror of the Documents view's matcher). */
   onOpenAttachDocument?: (transaction: TransactionWithInvoice) => void
   onOpenCategoryDialog: (transaction: TransactionWithInvoice) => void
   onDelete?: (id: string) => void
+  /** Mark the transaction as ignored so it leaves the inbox without a journal entry. */
+  onIgnore?: (transaction: TransactionWithInvoice) => void
   /** Open the edit-title dialog. Only wired for editable (unbooked/unmatched) rows. */
   onEditTitle?: (transaction: TransactionWithInvoice) => void
   onToggleSelect: (id: string) => void
-  onAnimationComplete?: (id: string) => void
 }
 
+/**
+ * A bank transaction in the inbox, rendered as a dry-table row pair (concept
+ * scene 10): main row with hover checkbox/chevron and the primary action as a
+ * quiet pill, plus a foldout with the row's detail and full action set. The
+ * ⋯ overflow menu stays on the row for one-click access to the same actions.
+ */
 export default function TransactionInboxCard({
   transaction,
   skvCounterpartDate,
   processingId,
-  isBatchMode,
   isSelected,
+  isExpanded,
+  onToggleExpand,
   onOpenMatchDialog,
   onOpenMatchInvoicePicker,
   onOpenSplitMatch,
@@ -92,18 +98,23 @@ export default function TransactionInboxCard({
   onOpenAttachDocument,
   onOpenCategoryDialog,
   onDelete,
+  onIgnore,
   onEditTitle,
   onToggleSelect,
-  onAnimationComplete,
 }: TransactionInboxCardProps) {
   const t = useTranslations('tx_inbox_card')
-  // Attaching underlag is a write — hide the affordance from viewers so they
+  // Attaching underlag is a write: hide the affordance from viewers so they
   // don't dead-end on a 403 (mirrors the gate in TransactionHistoryList).
   const { canWrite } = useCanWrite()
+  // The transaction-side entry point to the assistant ("Lena"). openAgentSheet
+  // hands this specific bank line to the transaction.categorization intent:
+  // the mirror of "Fråga assistenten" in Dokumentinkorgen, so the user can
+  // start a booking with the agent from the inbox they actually live in.
+  const { openAgentSheet, identity } = useAgentSheet()
   const isProcessing = processingId === transaction.id
   const isDisabled = processingId !== null && processingId !== transaction.id
   const isIncome = transaction.amount > 0
-  // Optimistic override — flips the indicator to "attached" as soon as the
+  // Optimistic override: flips the indicator to "attached" as soon as the
   // upload POST succeeds, without waiting for the parent to refetch. The
   // next parent refresh will sync; in the meantime the user sees the
   // correct visual state immediately. Same hook handles agent-chat uploads
@@ -134,87 +145,45 @@ export default function TransactionInboxCard({
   const hasSupplierInvoiceMatch =
     !!transaction.potential_supplier_invoice && !transaction.supplier_invoice_id
   const isUncategorized = transaction.is_business === null && !transaction.journal_entry_id
-  const showCheckbox = isBatchMode && isUncategorized
-  // Unbooked rows are still actionable (match, split, edit, categorize) — that
+  const selectable = isUncategorized && canWrite
+  // Unbooked rows are still actionable (match, split, edit, categorize): that
   // includes imported bank rows, which are the whole point of the inbox.
   const isUnbooked = !transaction.journal_entry_id
+  // "Fråga [namn]" hands the row to the assistant for categorization/booking.
+  // Only on unbooked rows (nothing to categorize once it's a verifikat) and
+  // only after the user has built their agent in /onboarding/agent
+  // (identity.isVerified): same gate as the FAB / AgentSparkleButton.
+  const assistantName = identity.displayName?.trim() || 'min assistent'
+  const showAskAssistant = isUnbooked && identity.isVerified
   // ...but only rows the USER created in the app may be deleted. Imported rows
-  // (bank sync / CSV) are ignore-only — mirrors the server guard in
+  // (bank sync / CSV) are ignore-only: mirrors the server guard in
   // DELETE /api/transactions/[id]. See lib/transactions/origin.ts.
   const canDelete = isUnbooked && !isImportedTransaction(transaction)
-  // Title is editable only on a mutable staging row — not booked and not
+  // Title is editable only on a mutable staging row: not booked and not
   // confirmed-matched. Mirrors the server-side gate in PATCH /api/transactions/[id].
   const isTitleEditable =
     !transaction.journal_entry_id && !transaction.invoice_id && !transaction.supplier_invoice_id
   const originalName = transaction.original_description
 
-  // Primary action: invoice/supplier-invoice match keeps the 1-click shortcut;
-  // otherwise the user opens the template picker.
-  const primaryAction = (() => {
-    if (hasInvoiceMatch) {
-      return (
-        <Button
-          size="sm"
-          variant="default"
-          className="h-9 px-3 text-sm"
-          onClick={(e) => {
-            e.stopPropagation()
-            onOpenMatchDialog(transaction)
-          }}
-          disabled={isProcessing || isDisabled}
-        >
-          {isProcessing ? (
-            <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-          ) : (
-            <FileText className="mr-1.5 h-3.5 w-3.5" />
-          )}
-          {t('match_invoice_btn', {
-            number: transaction.potential_invoice!.invoice_number ?? '',
-          })}
-        </Button>
-      )
-    }
-    if (hasSupplierInvoiceMatch) {
-      return (
-        <Button
-          size="sm"
-          variant="default"
-          className="h-9 px-3 text-sm"
-          onClick={(e) => {
-            e.stopPropagation()
-            onOpenMatchDialog(transaction)
-          }}
-          disabled={isProcessing || isDisabled}
-        >
-          {isProcessing ? (
-            <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-          ) : (
-            <FileText className="mr-1.5 h-3.5 w-3.5" />
-          )}
-          {t('match_supplier_invoice_btn', {
-            number: transaction.potential_supplier_invoice!.supplier_invoice_number ?? '',
-          })}
-        </Button>
-      )
-    }
-    return (
-      <Button
-        size="sm"
-        variant="default"
-        className="h-9 px-3 text-sm"
-        onClick={(e) => {
-          e.stopPropagation()
-          onOpenCategoryDialog(transaction)
-        }}
-        disabled={isProcessing || isDisabled}
-      >
-        Bokför
-      </Button>
-    )
-  })()
+  const matchLabel = hasInvoiceMatch
+    ? t('match_invoice_btn', { number: transaction.potential_invoice!.invoice_number ?? '' })
+    : hasSupplierInvoiceMatch
+      ? t('match_supplier_invoice_btn', {
+          number: transaction.potential_supplier_invoice!.supplier_invoice_number ?? '',
+        })
+      : null
+
+  // Primary action: invoice/supplier-invoice match keeps the 1-click
+  // shortcut; otherwise the user opens the template picker. Rendered as the
+  // row-level quiet pill AND as the foldout's leading pill.
+  const runPrimary = () => {
+    if (matchLabel) onOpenMatchDialog(transaction)
+    else onOpenCategoryDialog(transaction)
+  }
+  const primaryLabel = matchLabel ?? 'Bokför'
 
   // Manual invoice-match affordance. Hidden once an auto-detected match is
-  // already shown as the primary button — having both makes the row noisy.
+  // already shown as the primary button: having both makes the row noisy.
   const showInvoiceMatchButton =
     isUnbooked && !hasInvoiceMatch && !hasSupplierInvoiceMatch
 
@@ -226,234 +195,308 @@ export default function TransactionInboxCard({
     ? 'Dela inbetalningen på flera fakturor'
     : 'Dela utbetalningen på flera leverantörsfakturor'
 
-  // Secondary row actions are collapsed into a single ⋯ overflow menu to keep
-  // the inbox row uncluttered. Bokför + the invoice-match button stay inline.
-  // "Matcha mot befintlig verifikation" — link to an already-booked voucher.
+  // Secondary row actions live twice, deliberately: as quiet links in the
+  // foldout (concept vact) and in the row's ⋯ overflow menu for one-click use.
+  // "Matcha mot befintlig verifikation": link to an already-booked voucher.
   // Available on any unbooked row (income or expense), independent of whether an
   // invoice match was auto-detected: the user may want to point the bank line at
   // an existing salary/Fortnox/manual voucher instead of confirming a payment.
   const showMatchVoucherItem = isUnbooked && !!onOpenMatchVoucher
-  // "Matcha mot underlag" — pin an inbox doc / fresh upload to the tx. The
+  // "Matcha mot underlag": pin an inbox doc / fresh upload to the tx. The
   // tx→doc mirror of the Documents view's "Matcha mot transaktion".
   const showAttachDocumentItem = isUnbooked && canWrite && !!onOpenAttachDocument
   const showSplitItem = showInvoiceMatchButton && !!onOpenSplitMatch
   const showEditItem = isTitleEditable && !!onEditTitle
+  const showIgnoreItem = isUnbooked && isImportedTransaction(transaction) && !!onIgnore
   const showDeleteItem = canDelete && !!onDelete
   const showOverflowMenu =
-    showMatchVoucherItem || showAttachDocumentItem || showSplitItem || showEditItem || showDeleteItem
+    showInvoiceMatchButton || showAskAssistant || showMatchVoucherItem || showAttachDocumentItem || showSplitItem || showEditItem || showIgnoreItem || showDeleteItem
+
+  const askAssistant = () =>
+    openAgentSheet({
+      intentId: 'transaction.categorization',
+      intentArgs: { transaction_id: transaction.id },
+      contextRef: `transaction:${transaction.id}`,
+    })
+
+  // The foldout carries row detail only (actions live on the row: pill + ⋯).
+  // Rows with nothing to show don't expand at all; once bank-tx metadata
+  // classification lands (see the transactions-metadata issue) every imported
+  // row will have foldout content again.
+  const hasFoldoutContent =
+    (transaction.currency !== 'SEK' && transaction.amount_sek != null) ||
+    Boolean(transaction.title_edited_at && originalName) ||
+    Boolean(skvCounterpartDate) ||
+    (HAS_AI_EXTRACTION && (extraction.status === 'running' || extraction.status === 'failed'))
+  const canExpand = hasFoldoutContent
+  const expanded = isExpanded && canExpand
 
   return (
-    <motion.div
-      layout
-      initial={{ opacity: 1, scale: 1 }}
-      exit={{ opacity: 0, scale: 0.97, x: -16 }}
-      transition={{ duration: 0.25, ease: [0.25, 0.46, 0.45, 0.94] }}
-      onAnimationComplete={(definition) => {
-        if (typeof definition === 'object' && 'opacity' in definition && definition.opacity === 0) {
-          onAnimationComplete?.(transaction.id)
-        }
-      }}
-    >
-      <DataListRow
+    <>
+      <tr
         data-tx-id={transaction.id}
-        selected={isSelected}
-        className={cn(isDisabled && 'opacity-50')}
-        rowClassName="py-4 gap-4"
-        onClick={showCheckbox ? () => onToggleSelect(transaction.id) : undefined}
-        leading={
-          showCheckbox ? (
+        className={cn(
+          'group transition-colors duration-150',
+          canExpand && 'cursor-pointer',
+          expanded ? 'bg-secondary/25' : 'hover:bg-secondary/35',
+          isSelected && 'bg-secondary/40',
+          isDisabled && 'opacity-50',
+        )}
+        role={canExpand ? 'button' : undefined}
+        tabIndex={canExpand ? 0 : undefined}
+        aria-expanded={canExpand ? expanded : undefined}
+        onClick={canExpand ? () => onToggleExpand(transaction.id) : undefined}
+        onKeyDown={
+          canExpand
+            ? (e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault()
+                  onToggleExpand(transaction.id)
+                }
+              }
+            : undefined
+        }
+      >
+        {/* Hover-revealed selection checkbox (concept .cb) */}
+        {/* Zero-width cell: the checkbox hangs in the left page margin so
+            the date column can sit flush with the page edge. */}
+        <td
+          className={cn(TD_CLASS, 'relative w-0 !p-0')}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {selectable && (
             <Checkbox
               checked={isSelected}
               onCheckedChange={() => onToggleSelect(transaction.id)}
-              onClick={(e) => e.stopPropagation()}
               aria-label="Välj transaktion"
-            />
-          ) : (
-            <span
               className={cn(
-                'inline-flex h-6 w-6 items-center justify-center',
-                isIncome ? 'text-success' : 'text-foreground/60'
+                'absolute -left-5 top-1/2 -translate-y-1/2 transition-opacity duration-150 md:-left-6',
+                isSelected
+                  ? 'opacity-100'
+                  : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100',
               )}
-              aria-hidden
-            >
-              {isIncome ? (
-                <ArrowUpRight className="h-5 w-5" />
-              ) : (
-                <ArrowDownRight className="h-5 w-5" />
-              )}
-            </span>
-          )
-        }
-        trailing={
-          <>
-            <div className="text-right">
-              <p
-                className={cn(
-                  'text-base font-medium tabular-nums leading-none',
-                  isIncome && 'text-success'
-                )}
-              >
-                {isIncome ? '+' : ''}
-                {formatCurrency(transaction.amount, transaction.currency)}
-              </p>
-              {transaction.currency !== 'SEK' && transaction.amount_sek != null && (
-                <p className="mt-1 text-xs text-muted-foreground tabular-nums">
-                  {formatCurrency(transaction.amount_sek)}
-                </p>
-              )}
-            </div>
-            {!isBatchMode && (
-              <>
-                {primaryAction}
-                {showInvoiceMatchButton && (
-                  <Button
-                    variant="outline"
-                    size="icon"
-                    className="h-9 w-9"
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      onOpenMatchInvoicePicker(transaction)
-                    }}
-                    aria-label={invoiceMatchLabel}
-                    title={invoiceMatchLabel}
-                    disabled={isProcessing || isDisabled}
-                  >
-                    <Link2 className="h-4 w-4" />
-                  </Button>
-                )}
-                {/* The Paperclip indicator next to the description
-                    (TransactionAttachmentIndicator) is the single click
-                    target for opening the underlag. We deliberately don't
-                    duplicate that with a second icon in the trailing slot.
-                    Per-transaction agent help has moved to Dokumentinkorgen:
-                    match the underlag to the transaction and ask from there,
-                    where the receipt/invoice is in view. */}
-                {/* Secondary actions (split, edit, delete) collapse into a ⋯
-                    overflow menu so the row stays uncluttered. */}
-                {showOverflowMenu && (
-                  <DropdownMenu>
-                    <DropdownMenuTrigger asChild>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="h-9 w-9 text-muted-foreground hover:text-foreground"
-                        onClick={(e) => e.stopPropagation()}
-                        aria-label={t('more_actions_aria')}
-                        title={t('more_actions_aria')}
-                        disabled={isProcessing || isDisabled}
-                      >
-                        <MoreHorizontal className="h-4 w-4" />
-                      </Button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="end" className="min-w-[14rem]">
-                      {showMatchVoucherItem && (
-                        <DropdownMenuItem
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            onOpenMatchVoucher!(transaction)
-                          }}
-                        >
-                          <FileSearch className="h-4 w-4" />
-                          {t('match_voucher_btn')}
-                        </DropdownMenuItem>
-                      )}
-                      {showAttachDocumentItem && (
-                        <DropdownMenuItem
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            onOpenAttachDocument!(transaction)
-                          }}
-                        >
-                          <Paperclip className="h-4 w-4" />
-                          {t('attach_document_btn')}
-                        </DropdownMenuItem>
-                      )}
-                      {showSplitItem && (
-                        <DropdownMenuItem
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            onOpenSplitMatch!(transaction)
-                          }}
-                        >
-                          <Split className="h-4 w-4" />
-                          {splitMatchLabel}
-                        </DropdownMenuItem>
-                      )}
-                      {showEditItem && (
-                        <DropdownMenuItem
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            onEditTitle!(transaction)
-                          }}
-                        >
-                          <Pencil className="h-4 w-4" />
-                          {t('edit_title_aria')}
-                        </DropdownMenuItem>
-                      )}
-                      {showDeleteItem && (
-                        <>
-                          {(showMatchVoucherItem || showAttachDocumentItem || showSplitItem || showEditItem) && <DropdownMenuSeparator />}
-                          <DropdownMenuItem
-                            className="text-destructive focus:text-destructive"
-                            onClick={(e) => {
-                              e.stopPropagation()
-                              onDelete!(transaction.id)
-                            }}
-                          >
-                            <Trash2 className="h-4 w-4" />
-                            {t('delete_aria')}
-                          </DropdownMenuItem>
-                        </>
-                      )}
-                    </DropdownMenuContent>
-                  </DropdownMenu>
-                )}
-              </>
-            )}
-          </>
-        }
-      >
-        <div className="flex items-center gap-1.5 min-w-0">
-          <DataListPrimary className="text-base">{transaction.description}</DataListPrimary>
-          <TransactionAttachmentIndicator documentId={attachedDocumentId} />
-        </div>
-        <DataListMeta className="mt-1">
-          <span className="tabular-nums">{formatDate(transaction.date)}</span>
-          {transaction.title_edited_at && (
-            <>
-              <DataListMetaSeparator />
-              <Badge
-                variant="secondary"
-                className="h-4 px-1.5 py-0 text-[10px]"
+            />
+          )}
+        </td>
+        <td className={cn(TD_CLASS, '!pl-0 whitespace-nowrap tabular-nums text-muted-foreground')}>
+          {formatDate(transaction.date)}
+        </td>
+        <td className={cn(TD_CLASS, 'max-w-0 w-full')}>
+          <span className="flex min-w-0 items-center gap-2">
+            <span className="truncate">{transaction.description}</span>
+            <TransactionAttachmentIndicator documentId={attachedDocumentId} />
+            {transaction.title_edited_at && (
+              <span
+                className="shrink-0 text-xs text-muted-foreground"
                 title={originalName ? t('original_name_tooltip', { name: originalName }) : undefined}
               >
                 {t('edited_badge')}
-              </Badge>
-            </>
-          )}
-          {skvCounterpartDate && (
-            <>
-              <DataListMetaSeparator />
-              <Badge variant="warning" className="h-4 gap-1 px-1.5 py-0 text-[10px]">
+              </span>
+            )}
+            {skvCounterpartDate && (
+              <Badge variant="warning" className="h-4 shrink-0 gap-1 px-1.5 py-0 text-[10px]">
                 <AlertCircle className="h-3 w-3" />
                 Möjlig 1930↔1630
               </Badge>
-            </>
+            )}
+          </span>
+        </td>
+        <td
+          className={cn(
+            TD_CLASS,
+            'whitespace-nowrap text-right tabular-nums rr-mask',
+            isIncome && 'text-success',
           )}
-        </DataListMeta>
-        {/* Extraction status — visible only while AI is reading a freshly
-            attached document, or briefly if reading failed. */}
-        {HAS_AI_EXTRACTION &&
-          !isBatchMode &&
-          (extraction.status === 'running' || extraction.status === 'failed') && (
-            <div className="mt-2 pt-2 border-t border-border/40">
-              <ExtractionStatus
-                status={extraction.status}
-                elapsedMs={extraction.elapsedMs}
+        >
+          {isIncome ? '+' : ''}
+          {formatCurrency(transaction.amount, transaction.currency)}
+        </td>
+        <td className={cn(TD_CLASS, 'relative whitespace-nowrap text-right !pr-0 py-[9px]')}>
+          <span className="inline-flex items-center justify-end gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 px-3.5 text-xs"
+              onClick={(e) => {
+                e.stopPropagation()
+                runPrimary()
+              }}
+              disabled={isProcessing || isDisabled}
+            >
+              {isProcessing && <Loader2 className="mr-1.5 h-3 w-3 animate-spin" />}
+              {primaryLabel}
+            </Button>
+            {showOverflowMenu && (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  {/* mr-2 tucks the button in so the dots glyph sits under
+                      the middle of the STATUS header, not at the page edge. */}
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="mr-2 h-7 w-7 text-muted-foreground hover:text-foreground"
+                    onClick={(e) => e.stopPropagation()}
+                    aria-label={t('more_actions_aria')}
+                    title={t('more_actions_aria')}
+                    disabled={isProcessing || isDisabled}
+                  >
+                    <MoreHorizontal className="h-4 w-4" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="min-w-[14rem]">
+                  {showInvoiceMatchButton && (
+                    <DropdownMenuItem
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        onOpenMatchInvoicePicker(transaction)
+                      }}
+                    >
+                      <Link2 className="h-4 w-4" />
+                      {invoiceMatchLabel}
+                    </DropdownMenuItem>
+                  )}
+                  {showAskAssistant && (
+                    <DropdownMenuItem
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        askAssistant()
+                      }}
+                    >
+                      <MessageCircle className="h-4 w-4" />
+                      {`Fråga ${assistantName}`}
+                    </DropdownMenuItem>
+                  )}
+                  {showMatchVoucherItem && (
+                    <DropdownMenuItem
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        onOpenMatchVoucher!(transaction)
+                      }}
+                    >
+                      <FileSearch className="h-4 w-4" />
+                      {t('match_voucher_btn')}
+                    </DropdownMenuItem>
+                  )}
+                  {showAttachDocumentItem && (
+                    <DropdownMenuItem
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        onOpenAttachDocument!(transaction)
+                      }}
+                    >
+                      <Paperclip className="h-4 w-4" />
+                      {t('attach_document_btn')}
+                    </DropdownMenuItem>
+                  )}
+                  {showSplitItem && (
+                    <DropdownMenuItem
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        onOpenSplitMatch!(transaction)
+                      }}
+                    >
+                      <Split className="h-4 w-4" />
+                      {splitMatchLabel}
+                    </DropdownMenuItem>
+                  )}
+                  {showEditItem && (
+                    <DropdownMenuItem
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        onEditTitle!(transaction)
+                      }}
+                    >
+                      <Pencil className="h-4 w-4" />
+                      {t('edit_title_aria')}
+                    </DropdownMenuItem>
+                  )}
+                  {(showIgnoreItem || showDeleteItem) && (showMatchVoucherItem || showAttachDocumentItem || showSplitItem || showEditItem) && (
+                    <DropdownMenuSeparator />
+                  )}
+                  {showIgnoreItem && (
+                    <DropdownMenuItem
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        onIgnore!(transaction)
+                      }}
+                    >
+                      <EyeOff className="h-4 w-4" />
+                      {t('ignore_btn')}
+                    </DropdownMenuItem>
+                  )}
+                  {showDeleteItem && (
+                    <DropdownMenuItem
+                      className="text-destructive focus:text-destructive"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        onDelete!(transaction.id)
+                      }}
+                    >
+                      <Trash2 className="h-4 w-4" />
+                      {t('delete_aria')}
+                    </DropdownMenuItem>
+                  )}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            )}
+            {/* Expand affordance hangs in the right page margin, mirroring
+                the selection checkbox on the left. */}
+            {canExpand && (
+              <ChevronRight
+                className={cn(
+                  'absolute -right-5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground transition-all duration-200 md:-right-6',
+                  expanded ? 'rotate-90 opacity-100' : 'opacity-0 group-hover:opacity-100',
+                )}
               />
-            </div>
-          )}
-      </DataListRow>
-    </motion.div>
+            )}
+          </span>
+        </td>
+      </tr>
+      {expanded && (
+        <tr>
+          <td colSpan={5} className="border-b border-border p-0">
+            <RowFoldout>
+              <div className="pb-6 pt-1">
+                {(transaction.currency !== 'SEK' && transaction.amount_sek != null) ||
+                transaction.title_edited_at ||
+                skvCounterpartDate ? (
+                  <div className="space-y-1 py-1 text-xs text-muted-foreground">
+                    {transaction.currency !== 'SEK' && transaction.amount_sek != null && (
+                      <p className="tabular-nums">
+                        {formatCurrency(transaction.amount, transaction.currency)}
+                        {' · '}
+                        {formatCurrency(transaction.amount_sek)}
+                      </p>
+                    )}
+                    {transaction.title_edited_at && originalName && (
+                      <p>{t('original_name_tooltip', { name: originalName })}</p>
+                    )}
+                    {skvCounterpartDate && (
+                      <p>
+                        {t('skv_counterpart_label')}{' '}
+                        {t('skv_counterpart_body', { date: skvCounterpartDate })}
+                      </p>
+                    )}
+                  </div>
+                ) : null}
+
+                {/* Extraction status: visible only while AI is reading a freshly
+                    attached document, or briefly if reading failed. */}
+                {HAS_AI_EXTRACTION &&
+                  (extraction.status === 'running' || extraction.status === 'failed') && (
+                    <div className="py-1">
+                      <ExtractionStatus
+                        status={extraction.status}
+                        elapsedMs={extraction.elapsedMs}
+                      />
+                    </div>
+                  )}
+
+              </div>
+            </RowFoldout>
+          </td>
+        </tr>
+      )}
+    </>
   )
 }

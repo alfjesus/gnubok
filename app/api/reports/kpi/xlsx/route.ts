@@ -1,4 +1,4 @@
-import { createClient } from '@/lib/supabase/server'
+import { withRouteContext } from '@/lib/api/with-route-context'
 import { NextResponse } from 'next/server'
 import { generateIncomeStatement } from '@/lib/reports/income-statement'
 import { generateTrialBalance } from '@/lib/reports/trial-balance'
@@ -9,8 +9,11 @@ import {
   calculateGrossMargin,
   calculateExpenseRatio,
   calculateAvgPaymentDays,
+  calculateVatLiability,
+  aggregateTopSuppliers,
+  fetchTopSupplierInvoices,
+  type KpiSupplierInvoiceRow,
 } from '@/lib/reports/kpi'
-import { requireCompanyId } from '@/lib/company/context'
 import {
   reportToWorkbook,
   textColumn,
@@ -19,6 +22,7 @@ import {
   integerColumn,
   xlsxFilename,
 } from '@/lib/reports/xlsx-export'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 interface KpiKv {
   label: string
@@ -42,13 +46,7 @@ interface SupplierRow {
   total: number
 }
 
-export async function GET(request: Request) {
-  const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
-  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-
-  const companyId = await requireCompanyId(supabase, user.id)
-
+export const GET = withRouteContext('report.kpi.xlsx', async (request, { supabase, companyId }) => {
   const { searchParams } = new URL(request.url)
   const periodId = searchParams.get('period_id')
   if (!periodId) {
@@ -92,25 +90,13 @@ export async function GET(request: Request) {
         .eq('company_id', companyId)
         .eq('status', 'paid')
         .not('paid_at', 'is', null),
-      supabase
-        .from('supplier_invoices')
-        .select('supplier_id, total_sek, total, supplier:suppliers(id, name)')
-        .eq('company_id', companyId)
-        .gte('invoice_date', period.period_start)
-        .lte('invoice_date', period.period_end)
-        .neq('status', 'credited'),
+      // Paginated past PostgREST's 1000-row cap so the export sums every
+      // supplier invoice in the period, same as the KPI JSON route.
+      fetchTopSupplierInvoices(supabase, companyId, period.period_start, period.period_end),
     ])
 
     const cashPosition = calculateCashPosition(trialBalanceResult.rows)
-    const vatOutputAccounts = ['2611', '2621', '2631']
-    const vatInputAccounts = ['2641', '2645']
-    const outputVat = trialBalanceResult.rows
-      .filter((r) => vatOutputAccounts.includes(r.account_number))
-      .reduce((sum, r) => sum + (r.closing_credit - r.closing_debit), 0)
-    const inputVat = trialBalanceResult.rows
-      .filter((r) => vatInputAccounts.includes(r.account_number))
-      .reduce((sum, r) => sum + (r.closing_debit - r.closing_credit), 0)
-    const vatLiability = Math.round((outputVat - inputVat) * 100) / 100
+    const vatLiability = calculateVatLiability(trialBalanceResult.rows)
 
     const paidInvoices = (paidInvoicesResult.data ?? []).map((inv) => ({
       invoice_date: inv.invoice_date as string,
@@ -132,30 +118,12 @@ export async function GET(request: Request) {
       { class4: 0, class5: 0, class6: 0, class7: 0 },
     )
 
-    type SupplierInvoiceRow = {
-      supplier_id: string | null
-      total_sek: number | null
-      total: number | null
-      supplier: { id: string; name: string } | { id: string; name: string }[] | null
-    }
-    const supplierTotals = new Map<string, { name: string; total: number }>()
-    for (const row of (topSuppliersResult.data ?? []) as SupplierInvoiceRow[]) {
-      if (!row.supplier_id) continue
-      const supplier = Array.isArray(row.supplier) ? row.supplier[0] : row.supplier
-      if (!supplier?.name) continue
-      const amount = row.total_sek ?? null
-      if (amount == null) continue
-      const existing = supplierTotals.get(row.supplier_id)
-      if (existing) existing.total += amount
-      else supplierTotals.set(row.supplier_id, { name: supplier.name, total: amount })
-    }
-    const topSuppliers = Array.from(supplierTotals.values())
-      .map((v) => ({
-        supplier_name: v.name,
-        total: Math.round(v.total * 100) / 100,
-      }))
-      .sort((a, b) => b.total - a.total)
-      .slice(0, 7)
+    // Same query, same aggregation as the KPI JSON route: both go through
+    // topSupplierInvoicesQuery + aggregateTopSuppliers, so the export and the
+    // in-app panel report identical supplier totals for a given period.
+    const { suppliers: topSuppliers, unconvertedFxCount } = aggregateTopSuppliers(
+      (topSuppliersResult.data ?? []) as KpiSupplierInvoiceRow[],
+    )
 
     // Sheet 1: scalar KPIs, label + value. Currency by default; percent rows
     // are split into a separate sheet so the formatting is unambiguous.
@@ -179,15 +147,18 @@ export async function GET(request: Request) {
 
     const integerKpis: KpiKv[] = [
       { label: 'Genomsnittliga betaldagar', value: calculateAvgPaymentDays(paidInvoices) },
+      // Antal valutafakturor som saknar både SEK-belopp och kurs och därför
+      // inte kan räknas in i "Topp leverantörer". 0 = inget är exkluderat.
+      { label: 'Ej omräknade valutafakturor (leverantörer)', value: unconvertedFxCount },
     ]
 
     const monthRows: MonthRow[] = monthlyBreakdown.months
 
     const compositionRows: CompositionRow[] = [
-      { klass: '4 — Material/varor', amount: Math.round(expenseComposition.class4 * 100) / 100 },
-      { klass: '5 — Externa kostnader', amount: Math.round(expenseComposition.class5 * 100) / 100 },
-      { klass: '6 — Externa kostnader', amount: Math.round(expenseComposition.class6 * 100) / 100 },
-      { klass: '7 — Personalkostnader', amount: Math.round(expenseComposition.class7 * 100) / 100 },
+      { klass: '4: Material/varor', amount: Math.round(expenseComposition.class4 * 100) / 100 },
+      { klass: '5: Externa kostnader', amount: Math.round(expenseComposition.class5 * 100) / 100 },
+      { klass: '6: Externa kostnader', amount: Math.round(expenseComposition.class6 * 100) / 100 },
+      { klass: '7: Personalkostnader', amount: Math.round(expenseComposition.class7 * 100) / 100 },
     ]
 
     const supplierRows: SupplierRow[] = topSuppliers
@@ -245,11 +216,11 @@ export async function GET(request: Request) {
     })
   } catch (err) {
     return NextResponse.json(
-      { error: err instanceof Error ? err.message : 'Kunde inte generera nyckeltalsrapport' },
+      { error: err instanceof Error ? getUserErrorMessage(err) : 'Kunde inte generera nyckeltalsrapport' },
       { status: 500 }
     )
   }
-}
+})
 
 function scaleToFraction(value: number | null): number | null {
   return value === null ? null : Math.round(value) / 100

@@ -24,6 +24,7 @@ vi.mock('@/lib/auth/api-keys', async (importOriginal) => {
     extractBearerToken: vi.fn().mockReturnValue('test-token'),
     validateApiKey: vi.fn().mockResolvedValue({
       userId: 'user-1',
+      companyId: '11111111-1111-4111-8111-111111111111',
       scopes: ['transactions:read', 'transactions:write', 'customers:read', 'customers:write', 'invoices:read', 'invoices:write', 'suppliers:read', 'reports:read'],
     }),
     createServiceClientNoCookies: vi.fn(),
@@ -40,6 +41,12 @@ vi.mock('@/lib/bookkeeping/category-mapping', () => ({
 
 vi.mock('@/lib/bookkeeping/transaction-entries', () => ({
   createTransactionJournalEntry: vi.fn().mockResolvedValue({ id: 'je-123' }),
+  // Coherent with the mocked mapping above: 373.75 gross = 299 net + 74.75 moms.
+  buildTransactionEntryLines: vi.fn().mockReturnValue([
+    { account_number: '2641', debit_amount: 74.75, credit_amount: 0, line_description: 'Ingående moms 25%' },
+    { account_number: '6110', debit_amount: 299, credit_amount: 0, line_description: 'Kostnad' },
+    { account_number: '1930', debit_amount: 0, credit_amount: 373.75, line_description: 'Bank' },
+  ]),
 }))
 
 vi.mock('@/lib/events/bus', () => ({
@@ -48,7 +55,7 @@ vi.mock('@/lib/events/bus', () => ({
 
 vi.mock('@/lib/invoices/vat-rules', () => ({
   getVatRules: vi.fn(),
-  getAvailableVatRates: vi.fn(),
+  getPermittedVatRates: vi.fn(),
 }))
 
 vi.mock('@/lib/currency/riksbanken', () => ({
@@ -109,6 +116,13 @@ vi.mock('@/lib/transactions/category-suggestions', () => ({
   getSuggestedCategories: vi.fn(),
 }))
 
+// The categorize tool runs the booking-time duplicate guard before staging.
+// These tests don't exercise that path, so stub it to "no duplicate": otherwise
+// its detection queries would consume the queued supabase mock results.
+vi.mock('@/lib/transactions/booking-duplicate-detection', () => ({
+  detectBookingDuplicate: vi.fn().mockResolvedValue(null),
+}))
+
 vi.mock('@/lib/bookkeeping/counterparty-templates', () => ({
   upsertCounterpartyTemplate: vi.fn(),
   findCounterpartyTemplatesBatch: vi.fn(),
@@ -128,7 +142,11 @@ vi.mock('@/lib/email/service', () => ({
   getEmailService: vi.fn().mockReturnValue({ sendInvoice: vi.fn() }),
 }))
 
-vi.mock('@/lib/email/invoice-templates', () => ({
+// Partial mock: server.ts also pulls INVOICE_EMAIL_PLACEHOLDER_KEYS through
+// the company-settings staging schema, so keep the real exports and stub only
+// the render functions.
+vi.mock('@/lib/email/invoice-templates', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/email/invoice-templates')>()),
   generateInvoiceEmailHtml: vi.fn(),
   generateInvoiceEmailText: vi.fn(),
   generateInvoiceEmailSubject: vi.fn(),
@@ -166,7 +184,30 @@ describe('MCP Receipt Matcher', () => {
     const mock = createQueuedMockSupabase()
     supabase = mock.supabase
     enqueueMany = mock.enqueueMany
-    vi.mocked(createServiceClientNoCookies).mockReturnValue(supabase as never)
+    const membershipChain: unknown = new Proxy(
+      {},
+      {
+        get(_t, prop) {
+          if (prop === 'then') {
+            return (resolve: (v: unknown) => void) =>
+              resolve({
+                data: {
+                  company_id: '11111111-1111-4111-8111-111111111111',
+                  role: 'owner',
+                },
+                error: null,
+              })
+          }
+          return () => membershipChain
+        },
+      }
+    )
+    vi.mocked(createServiceClientNoCookies).mockReturnValue({
+      ...supabase,
+      from: vi.fn((table: string) =>
+        table === 'company_members' ? membershipChain : supabase.from(table)
+      ),
+    } as never)
   })
 
   // ── Protocol: initialize includes resources capability ──
@@ -195,7 +236,18 @@ describe('MCP Receipt Matcher', () => {
       })
     })
 
-    it('does not include _meta for tools without it', async () => {
+    it('does not include _meta for read-only tools that neither stage nor render UI', async () => {
+      const res = await handleMcpRequest(mcpRequest('tools/list'))
+      const result = await parseResult(res)
+
+      const listTool = result.tools.find(
+        (t: { name: string }) => t.name === 'gnubok_list_customers'
+      )
+      expect(listTool).toBeDefined()
+      expect(listTool._meta).toBeUndefined()
+    })
+
+    it('includes the derived staging contract in _meta for staging writes', async () => {
       const res = await handleMcpRequest(mcpRequest('tools/list'))
       const result = await parseResult(res)
 
@@ -203,7 +255,10 @@ describe('MCP Receipt Matcher', () => {
         (t: { name: string }) => t.name === 'gnubok_categorize_transaction'
       )
       expect(categorizeTool).toBeDefined()
-      expect(categorizeTool._meta).toBeUndefined()
+      expect(categorizeTool._meta).toMatchObject({
+        requires_approval: true,
+        approve_tool: 'gnubok_approve_pending_operation',
+      })
     })
   })
 
@@ -307,8 +362,8 @@ describe('MCP Receipt Matcher', () => {
         { data: tx, error: null },           // fetch transaction (preview)
         { data: { entity_type: 'enskild_firma', fiscal_year_start_month: 1 }, error: null },
         { data: tx, error: null },            // fetch transaction for title
-        { data: null, error: null },          // resolvePeriodStatusForDate — company_settings
-        { data: null, error: null },          // resolvePeriodStatusForDate — fiscal_periods
+        { data: null, error: null },          // resolvePeriodStatusForDate: company_settings
+        { data: null, error: null },          // resolvePeriodStatusForDate: fiscal_periods
         { data: { id: 'op-1' }, error: null }, // insert into pending_operations
       ])
 
@@ -350,8 +405,8 @@ describe('MCP Receipt Matcher', () => {
         { data: tx, error: null },
         { data: { entity_type: 'enskild_firma', fiscal_year_start_month: 1 }, error: null },
         { data: tx, error: null },            // fetch transaction for title
-        { data: null, error: null },          // resolvePeriodStatusForDate — company_settings
-        { data: null, error: null },          // resolvePeriodStatusForDate — fiscal_periods
+        { data: null, error: null },          // resolvePeriodStatusForDate: company_settings
+        { data: null, error: null },          // resolvePeriodStatusForDate: fiscal_periods
         { data: { id: 'op-1' }, error: null }, // insert into pending_operations
       ])
 

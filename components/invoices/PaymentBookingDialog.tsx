@@ -27,6 +27,7 @@ import { useCompany } from '@/contexts/CompanyContext'
 import { Plus, Trash2, Loader2 } from 'lucide-react'
 import type { FormLine } from '@/components/bookkeeping/JournalEntryForm'
 import type { Invoice, InvoiceItem, Customer, BASAccount, EntityType } from '@/types'
+import { loadBasCatalog, type CatalogAccount } from '@/lib/bookkeeping/bas-catalog-client'
 
 type DuplicateMatchReason = 'ocr_exact' | 'name_amount_fuzzy' | 'amount_only'
 
@@ -77,7 +78,13 @@ export default function PaymentBookingDialog({
   }
 
   const [accounts, setAccounts] = useState<BASAccount[]>([])
+  const [catalog, setCatalog] = useState<CatalogAccount[]>([])
   const [lines, setLines] = useState<FormLine[]>([])
+  const accountNameByNumber = useMemo(() => {
+    const names = new Map(catalog.map((account) => [account.account_number, account.account_name]))
+    for (const account of accounts) names.set(account.account_number, account.account_name)
+    return names
+  }, [accounts, catalog])
   const [paymentDate, setPaymentDate] = useState(() => new Date().toISOString().split('T')[0])
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [isInitialized, setIsInitialized] = useState(false)
@@ -86,7 +93,7 @@ export default function PaymentBookingDialog({
   // Drives the "Befintlig verifikation" picker copy: cash links against a 19xx
   // debit, accrual against a 1510 credit.
   const [accountingMethod, setAccountingMethod] = useState<'accrual' | 'cash'>('accrual')
-  // source_type the booking will use — drives the voucher-series preview so the
+  // source_type the booking will use: drives the voucher-series preview so the
   // number shown matches what mark-paid will actually create.
   const [sourceType, setSourceType] =
     useState<'invoice_cash_payment' | 'invoice_paid' | null>(null)
@@ -108,7 +115,10 @@ export default function PaymentBookingDialog({
     async function init() {
       try {
         // Fetch accounts
-        const accountsRes = await fetch('/api/bookkeeping/accounts')
+        const [accountsRes, fetchedCatalog] = await Promise.all([
+          fetch('/api/bookkeeping/accounts'),
+          loadBasCatalog(),
+        ])
         if (!accountsRes.ok) throw new Error(t('load_chart_failed'))
         const accountsData = await accountsRes.json()
         const fetchedAccounts: BASAccount[] = accountsData.data || []
@@ -118,7 +128,7 @@ export default function PaymentBookingDialog({
         // Fetch company settings
         const { data: settings, error: settingsError } = await supabase
           .from('company_settings')
-          .select('accounting_method, entity_type')
+          .select('accounting_method, entity_type, ore_rounding')
           .eq('company_id', company.id)
           .maybeSingle()
 
@@ -126,6 +136,7 @@ export default function PaymentBookingDialog({
         if (cancelled) return
 
         setAccounts(fetchedAccounts)
+        setCatalog(fetchedCatalog)
 
         const accountingMethod = (settings?.accounting_method || 'accrual') as 'accrual' | 'cash'
         const entityType = (settings?.entity_type as EntityType) || 'enskild_firma'
@@ -152,9 +163,13 @@ export default function PaymentBookingDialog({
             exchange_rate: invoice.exchange_rate,
             vat_treatment: invoice.vat_treatment,
             items: invoice.items,
+            default_dimensions: invoice.default_dimensions,
+            ore_rounding: invoice.ore_rounding,
           },
           accountingMethod,
           entityType,
+          companyOreRounding:
+            typeof settings?.ore_rounding === 'boolean' ? settings.ore_rounding : undefined,
         })
 
         setLines(proposed)
@@ -164,7 +179,7 @@ export default function PaymentBookingDialog({
         if (cancelled) return
         toast({
           title: t('load_dialog_failed_title'),
-          description: err instanceof Error ? err.message : t('try_again'),
+          description: err instanceof Error ? getErrorMessage(err) : t('try_again'),
           variant: 'destructive',
         })
         onOpenChange(false)
@@ -245,6 +260,12 @@ export default function PaymentBookingDialog({
           debit_amount: parseFloat(l.debit_amount) || 0,
           credit_amount: parseFloat(l.credit_amount) || 0,
           line_description: l.line_description || undefined,
+          // Dimensions PR7: the proposal re-propagates the invoice default;
+          // whatever the grid holds is what gets booked.
+          dimensions:
+            l.dimensions && Object.keys(l.dimensions).length > 0
+              ? l.dimensions
+              : undefined,
         }))
 
       const response = await fetch(`/api/invoices/${invoice.id}/mark-paid`, {
@@ -349,7 +370,7 @@ export default function PaymentBookingDialog({
                         </span>
                       </div>
                       <p className="truncate text-xs text-muted-foreground">
-                        {c.merchant_name || c.description || '—'}
+                        {c.merchant_name || c.description || '-'}
                       </p>
                     </div>
                     <Button
@@ -414,6 +435,7 @@ export default function PaymentBookingDialog({
                         value={line.account_number}
                         accounts={accounts}
                         onChange={(val) => updateLine(index, 'account_number', val)}
+                        selectedName={accountNameByNumber.get(line.account_number)}
                       />
                     </div>
                     <Button
@@ -437,7 +459,7 @@ export default function PaymentBookingDialog({
                         placeholder="0,00"
                         value={line.debit_amount}
                         onChange={(e) => updateLine(index, 'debit_amount', e.target.value)}
-                        className="font-mono text-right"
+                        className="tabular-nums text-right"
                         inputMode="decimal"
                       />
                     </div>
@@ -450,7 +472,7 @@ export default function PaymentBookingDialog({
                         placeholder="0,00"
                         value={line.credit_amount}
                         onChange={(e) => updateLine(index, 'credit_amount', e.target.value)}
-                        className="font-mono text-right"
+                        className="tabular-nums text-right"
                         inputMode="decimal"
                       />
                     </div>
@@ -480,6 +502,7 @@ export default function PaymentBookingDialog({
                       value={line.account_number}
                       accounts={accounts}
                       onChange={(val) => updateLine(index, 'account_number', val)}
+                      selectedName={accountNameByNumber.get(line.account_number)}
                     />
                   </div>
                   <Input
@@ -489,7 +512,7 @@ export default function PaymentBookingDialog({
                     placeholder="0,00"
                     value={line.debit_amount}
                     onChange={(e) => updateLine(index, 'debit_amount', e.target.value)}
-                    className="font-mono text-right"
+                    className="tabular-nums text-right"
                   />
                   <Input
                     type="number"
@@ -498,7 +521,7 @@ export default function PaymentBookingDialog({
                     placeholder="0,00"
                     value={line.credit_amount}
                     onChange={(e) => updateLine(index, 'credit_amount', e.target.value)}
-                    className="font-mono text-right"
+                    className="tabular-nums text-right"
                   />
                   <Button
                     type="button"
@@ -530,7 +553,7 @@ export default function PaymentBookingDialog({
             <div className="flex items-center justify-between border-t pt-3">
               <div className="flex items-center gap-2">
                 {isBalanced ? (
-                  <Badge variant="secondary" className="bg-success/10 text-success">
+                  <Badge variant="success">
                     {t('balanced_badge')}
                   </Badge>
                 ) : (
@@ -539,7 +562,7 @@ export default function PaymentBookingDialog({
                   </Badge>
                 )}
               </div>
-              <div className="text-sm text-muted-foreground font-mono">
+              <div className="text-sm text-muted-foreground tabular-nums">
                 {formatCurrency(totalDebit)} / {formatCurrency(totalCredit)}
               </div>
             </div>

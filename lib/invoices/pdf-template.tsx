@@ -4,16 +4,25 @@ import {
   Text,
   View,
   Image,
+  Link,
   StyleSheet,
 } from '@react-pdf/renderer'
 import type { Invoice, InvoiceItem, Customer, CompanySettings, InvoiceDocumentType } from '@/types'
 import { generateOcrReference } from '@/lib/bankgiro/luhn'
-import { getDisplayTotal } from '@/lib/invoices/rounding'
+import {
+  BUNDLED_INVOICE_FONT_FAMILIES,
+  INVOICE_LOGO_MAX_HEIGHT_PT,
+  INVOICE_LOGO_MAX_WIDTH_PT,
+  STANDARD_PDF_FONT_FAMILIES,
+} from '@/lib/invoices/branding-constants'
+import { CUSTOM_INVOICE_FONT_RENDER_PREFIX } from '@/lib/invoices/pdf-fonts'
+import { getAmountToPay } from '@/lib/invoices/rounding'
+import { isTextLikeLine } from '@/lib/invoices/display'
 
 type PdfLang = 'sv' | 'en'
 
 // Customer-facing labels. Statutory chapter references (ML 17 kap 24§, ML 3 kap.)
-// stay intact in both locales — they identify the law, not the language.
+// stay intact in both locales: they identify the law, not the language.
 const LABELS = {
   sv: {
     // Document titles
@@ -23,10 +32,10 @@ const LABELS = {
     titleDeliveryNote: 'FÖLJESEDEL',
     titlePreview: 'FÖRHANDSGRANSKNING',
     // Status banners
-    cancelledTitle: 'MAKULERAD – inte en giltig faktura',
+    cancelledTitle: 'MAKULERAD: inte en giltig faktura',
     cancelledWithNumber: (n: string) => `Faktura ${n} har makulerats. Numret behålls i serien för att hålla nummerföljden obruten enligt ML 17 kap 24§, men dokumentet är inte ett giltigt fakturaunderlag.`,
     cancelledNoNumber: 'Detta utkast har makulerats och är inte ett giltigt fakturaunderlag.',
-    draftTitle: 'UTKAST – inte en giltig faktura',
+    draftTitle: 'UTKAST: inte en giltig faktura',
     draftWithNumber: 'Detta är ett utkast. Markera fakturan som skickad eller skicka via systemet för att göra den giltig som fakturaunderlag.',
     draftNoNumber: 'Denna faktura saknar löpnummer och kan inte användas som fakturaunderlag enligt ML 17 kap 24§. Skicka fakturan via systemet för att tilldela ett nummer.',
     // Credit note reference
@@ -42,6 +51,7 @@ const LABELS = {
     yourReference: 'Er referens:',
     ourReference: 'Vår referens:',
     // Customer box
+    custNo: 'Kundnr:',
     orgNo: 'Org.nr:',
     vat: 'VAT:',
     // Table columns
@@ -83,6 +93,10 @@ const LABELS = {
     bic: 'BIC/SWIFT:',
     ocr: 'OCR/Referens:',
     paymentReference: 'Betalningsreferens:',
+    invoiceNumber: 'Fakturanummer:',
+    swishQrCaption: 'Skanna för att betala med Swish',
+    payOnline: 'Betala online:',
+    paymentLinkQrCaption: 'Skanna för att betala online',
     // Footer
     orgNoLong: 'Org.nr:',
     vatRegNo: 'Momsreg.nr:',
@@ -94,10 +108,10 @@ const LABELS = {
     titleProforma: 'PROFORMA INVOICE',
     titleDeliveryNote: 'DELIVERY NOTE',
     titlePreview: 'PREVIEW',
-    cancelledTitle: 'VOID — not a valid invoice',
-    cancelledWithNumber: (n: string) => `Invoice ${n} has been voided. The number is retained in the sequence to keep the numbering unbroken (ML 17 kap 24§ — Swedish VAT Act), but this document is not a valid invoice.`,
+    cancelledTitle: 'VOID: not a valid invoice',
+    cancelledWithNumber: (n: string) => `Invoice ${n} has been voided. The number is retained in the sequence to keep the numbering unbroken (ML 17 kap 24§, Swedish VAT Act), but this document is not a valid invoice.`,
     cancelledNoNumber: 'This draft has been voided and is not a valid invoice.',
-    draftTitle: 'DRAFT — not a valid invoice',
+    draftTitle: 'DRAFT: not a valid invoice',
     draftWithNumber: 'This is a draft. Mark the invoice as sent, or send it via the system, to make it a valid invoice.',
     draftNoNumber: 'This invoice has no serial number and cannot be used as a valid invoice under ML 17 kap 24§ (Swedish VAT Act). Send the invoice via the system to assign a number.',
     creditNoteRef: (n: string) => `This credit note credits invoice no. ${n}`,
@@ -109,6 +123,7 @@ const LABELS = {
     deliveryDate: 'Delivery date:',
     yourReference: 'Your reference:',
     ourReference: 'Our reference:',
+    custNo: 'Customer no.:',
     orgNo: 'Reg. no.:',
     vat: 'VAT:',
     colDescription: 'Description',
@@ -134,7 +149,7 @@ const LABELS = {
     vatInSek: (rate: number | string) => `VAT in SEK (rate ${rate}):`,
     totalInSek: 'Total in SEK:',
     proformaNotice: 'This is a proforma invoice and is not a request for payment.',
-    exemptNotice: 'Exempt from VAT (ML 3 kap. — Swedish VAT Act).',
+    exemptNotice: 'Exempt from VAT (ML 3 kap., Swedish VAT Act).',
     notVatRegisteredNotice: 'The seller is not VAT-registered. No VAT is charged on this invoice.',
     paymentHeading: 'Payment information',
     bank: 'Bank:',
@@ -146,17 +161,25 @@ const LABELS = {
     bic: 'BIC/SWIFT:',
     ocr: 'Reference:',
     paymentReference: 'Payment reference:',
+    invoiceNumber: 'Invoice number:',
+    swishQrCaption: 'Scan to pay with Swish',
+    payOnline: 'Pay online:',
+    paymentLinkQrCaption: 'Scan to pay online',
     orgNoLong: 'Reg. no.:',
     vatRegNo: 'VAT reg. no.:',
-    // Statutory Swedish phrase — kept verbatim in both locales. Peppol SE-R-005
+    // Statutory Swedish phrase: kept verbatim in both locales. Peppol SE-R-005
     // and Skatteverket's F-skatt notation expect "Godkänd för F-skatt"; an
     // English translation has no legal standing.
     fSkatt: 'Godkänd för F-skatt',
   },
 } as const
 
+// Swish on invoices (the number row + the payment QR). When true, the Swish row
+// and QR render on the invoice PDF and the settings "Visa Swish" toggle is live.
+export const SHOW_SWISH_ON_INVOICE = true
+
 // Labor-only disclaimer for the ROT/RUT block. Kept Swedish-only in both
-// locales — references Skatteverket's fakturamodell directly, which is a
+// locales: references Skatteverket's fakturamodell directly, which is a
 // statutory Swedish concept and has no formal English equivalent.
 const DEDUCTION_LABOR_ONLY_NOTICE =
   'Endast arbetskostnad har inkluderats i underlaget för ROT/RUT-avdrag enligt Skatteverkets fakturamodell.'
@@ -166,14 +189,13 @@ const DEDUCTION_LABOR_ONLY_NOTICE =
 // place (createStyles below) and gives the rest of the component a fully
 // non-null object to work with.
 export interface InvoiceBranding {
-  /** Primary color — used for the document title and other strong text.
+  /** Primary color: used for the document title and other strong text.
    *  Default '#1a1a1a' (the existing hardcoded value). */
   primaryColor?: string
-  /** Accent color — used for muted labels and section headings.
+  /** Accent color: used for muted labels and section headings.
    *  Default '#666666' (the existing hardcoded value). */
   accentColor?: string
-  /** Font family — must be one of react-pdf's built-in PostScript fonts.
-   *  Default 'Helvetica'. */
+  /** Registered react-pdf font family. Default 'Helvetica'. */
   fontFamily?: string
   /** Optional banner text rendered above the document title. */
   headerText?: string | null
@@ -187,18 +209,18 @@ interface ResolvedBranding {
   fontFamily: string
 }
 
-// react-pdf only ships these three PostScript fonts. Anything else would
-// require registerFont() with a binary file — out of scope for AGPL-clean
-// branding and a fingerprinting risk besides.
-const ALLOWED_FONTS = new Set(['Helvetica', 'Times-Roman', 'Courier'])
+const ALLOWED_FONTS = new Set<string>([
+  ...STANDARD_PDF_FONT_FAMILIES,
+  ...BUNDLED_INVOICE_FONT_FAMILIES,
+])
 
 /**
  * Extract the InvoicePDF branding shape from a CompanySettings row. Tolerates
- * legacy rows where the branding columns are still null/undefined — returns
+ * legacy rows where the branding columns are still null/undefined: returns
  * undefined fields that resolveBranding() then maps to the legacy defaults.
  *
- * Use this at every InvoicePDF call site that has access to a CompanySettings
- * — keeping the extraction logic in one place means a future schema rename or
+ * Use this at every InvoicePDF call site that has access to a CompanySettings:
+ * keeping the extraction logic in one place means a future schema rename or
  * new branding field only needs to land here.
  */
 export function brandingFromCompanySettings(
@@ -222,7 +244,9 @@ const DEFAULT_BRANDING: ResolvedBranding = {
 function resolveBranding(branding: InvoiceBranding | undefined): ResolvedBranding {
   if (!branding) return DEFAULT_BRANDING
   const fontFamily =
-    branding.fontFamily && ALLOWED_FONTS.has(branding.fontFamily)
+    branding.fontFamily &&
+    (ALLOWED_FONTS.has(branding.fontFamily) ||
+      branding.fontFamily.startsWith(CUSTOM_INVOICE_FONT_RENDER_PREFIX))
       ? branding.fontFamily
       : DEFAULT_BRANDING.fontFamily
   return {
@@ -233,7 +257,7 @@ function resolveBranding(branding: InvoiceBranding | undefined): ResolvedBrandin
 }
 
 // Create styles. Calling without args yields the original (pre-branding)
-// stylesheet — required so the default code path is byte-equivalent to the
+// stylesheet: required so the default code path is byte-equivalent to the
 // previous hardcoded version.
 function createStyles(branding?: InvoiceBranding) {
   const b = resolveBranding(branding)
@@ -386,6 +410,7 @@ function createStyles(branding?: InvoiceBranding) {
       padding: 15,
       backgroundColor: '#f8f9fa',
       borderRadius: 4,
+      position: 'relative',
     },
     paymentTitle: {
       fontSize: 11,
@@ -572,16 +597,31 @@ function createStyles(branding?: InvoiceBranding) {
 // Format currency with explicit ISO code so non-Swedish recipients see "1 234,56 SEK"
 // instead of the Swedish symbol "kr". Decimal style + appended code works for any
 // currency (SEK/EUR/USD) and avoids Intl's locale-specific symbol quirks.
-function formatCurrency(amount: number, currency: string = 'SEK', language: PdfLang = 'sv'): string {
+export function formatPdfCurrency(amount: number, currency: string = 'SEK', language: PdfLang = 'sv'): string {
   const formatted = new Intl.NumberFormat(language === 'en' ? 'en-US' : 'sv-SE', {
     style: 'decimal',
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
-  }).format(amount)
+    // sv-SE emits U+2212, which standard PDF fonts can silently drop. The
+    // ASCII minus is supported by every allowed invoice font.
+  }).format(amount).replaceAll('\u2212', '-')
   return `${formatted} ${currency}`
 }
 
-// Format date as ISO yyyy-MM-dd in both locales — universally unambiguous and
+export function buildPdfVatBreakdown(items: InvoiceItem[]): Map<number, { base: number; vat: number }> {
+  const vatByRate = new Map<number, { base: number; vat: number }>()
+  for (const item of items) {
+    if (isTextLikeLine(item)) continue
+    const rate = item.vat_rate ?? 0
+    const group = vatByRate.get(rate) || { base: 0, vat: 0 }
+    group.base += item.line_total
+    group.vat += item.vat_amount || 0
+    vatByRate.set(rate, group)
+  }
+  return vatByRate
+}
+
+// Format date as ISO yyyy-MM-dd in both locales: universally unambiguous and
 // matches the project's formatDate() convention (lib/utils.ts).
 // Input is already a YYYY-MM-DD string from the DB, so slice avoids the
 // new Date() + local-getter timezone hazard.
@@ -617,25 +657,33 @@ interface InvoicePDFProps {
   language?: PdfLang
   /**
    * Per-company branding overrides. Omit to render with the original default
-   * stylesheet — the rendered output is byte-equivalent to the pre-branding
+   * stylesheet: the rendered output is byte-equivalent to the pre-branding
    * version of this template, which makes the rollout safe for the snapshot
    * suite and for callers that haven't yet been migrated to forward branding.
    */
   branding?: InvoiceBranding
+  /** Pre-rendered Swish payment QR (PNG data URL). Built offline in
+   *  pdf-render-helpers; null/omitted renders no QR. */
+  swishQrDataUrl?: string | null
+  /** Pre-rendered payment-link QR (PNG data URL) for invoice.payment_link_url.
+   *  Built offline in pdf-render-helpers; null/omitted renders no QR. */
+  paymentLinkQrDataUrl?: string | null
 }
 
-export function InvoicePDF({ invoice, customer, items, company, originalInvoiceNumber, isPreview, language, branding }: InvoicePDFProps) {
+export function InvoicePDF({ invoice, customer, items, company, originalInvoiceNumber, isPreview, language, branding, swishQrDataUrl, paymentLinkQrDataUrl }: InvoicePDFProps) {
   const lang: PdfLang = language ?? customer.language ?? 'sv'
   const L = LABELS[lang]
   // Build the stylesheet per-render so each invoice picks up its company's
   // current branding. createStyles() with no argument returns the original
-  // hardcoded stylesheet — the default code path is unchanged.
+  // hardcoded stylesheet: the default code path is unchanged.
   const styles = createStyles(branding)
   const isCreditNote = !!invoice.credited_invoice_id
 
-  // Free-text / blank rows carry no amounts — exclude them from every VAT
+  // Free-text / blank rows carry no amounts: exclude them from every VAT
   // calculation. They still render as their own row in the line-items table.
-  const billableItems = items.filter((item) => item.line_type !== 'text')
+  // Amount-less product rows count as text too (isTextLikeLine), so they
+  // neither print zeros nor seed an empty per-rate VAT group.
+  const billableItems = items.filter((item) => !isTextLikeLine(item))
 
   // Check if items have mixed VAT rates
   const hasPerLineVat = billableItems.some((item) => item.vat_rate !== undefined && item.vat_rate !== null)
@@ -645,22 +693,15 @@ export function InvoicePDF({ invoice, customer, items, company, originalInvoiceN
   const showVatColumn = hasPerLineVat && uniqueRates.size > 1
 
   // Calculate per-rate VAT breakdown for totals
-  const vatByRate = new Map<number, { base: number; vat: number }>()
-  if (hasPerLineVat) {
-    for (const item of billableItems) {
-      const rate = item.vat_rate ?? 0
-      const group = vatByRate.get(rate) || { base: 0, vat: 0 }
-      group.base += Math.abs(item.line_total)
-      group.vat += Math.abs(item.vat_amount || 0)
-      vatByRate.set(rate, group)
-    }
-  }
+  const vatByRate = hasPerLineVat
+    ? buildPdfVatBreakdown(billableItems)
+    : new Map<number, { base: number; vat: number }>()
   const docType = (invoice as Invoice & { document_type?: InvoiceDocumentType }).document_type || 'invoice'
   const isDeliveryNote = docType === 'delivery_note'
   const isProforma = docType === 'proforma'
 
   // Optional branding banner text. Rendered only when the company has set
-  // invoice_header_text — invisible chrome by default, so the byte-equivalence
+  // invoice_header_text: invisible chrome by default, so the byte-equivalence
   // promise for un-branded callers holds.
   const headerText = branding?.headerText ?? null
   const footerText = branding?.footerText ?? null
@@ -668,7 +709,7 @@ export function InvoicePDF({ invoice, customer, items, company, originalInvoiceN
   return (
     <Document>
       <Page size="A4" style={styles.page}>
-        {/* Optional branded header — rendered above the status banners so it
+        {/* Optional branded header: rendered above the status banners so it
             sits at the very top of the page. Non-statutory free-form text. */}
         {headerText && (
           <View style={styles.brandingHeader}>
@@ -676,7 +717,7 @@ export function InvoicePDF({ invoice, customer, items, company, originalInvoiceN
           </View>
         )}
 
-        {/* Status banner — cancelled takes precedence over draft so a cancelled
+        {/* Status banner: cancelled takes precedence over draft so a cancelled
             row that lacks a number (legacy un-numbered draft that was later
             cancelled) still surfaces as MAKULERAD rather than UTKAST. The draft
             banner only shows for genuine drafts and for the corrupt-state case
@@ -705,7 +746,26 @@ export function InvoicePDF({ invoice, customer, items, company, originalInvoiceN
         <View style={styles.header}>
           <View style={styles.companyInfo}>
             {company.logo_url && (company.invoice_show_logo ?? true) && (
-              <Image src={company.logo_url} style={{ maxHeight: 40, maxWidth: 150, marginBottom: 6, alignSelf: 'flex-start' }} />
+              <Image
+                src={company.logo_url}
+                style={{
+                  maxHeight: INVOICE_LOGO_MAX_HEIGHT_PT,
+                  maxWidth: INVOICE_LOGO_MAX_WIDTH_PT,
+                  marginBottom: 6,
+                  alignSelf: 'flex-start',
+                  objectFit: 'contain',
+                  // Any logo bigger than the reserved area is clamped to the
+                  // full 240x80pt box, so the box never hugs the image and the
+                  // image is placed *inside* it. Anchor it top-left: with the
+                  // default centering, a near-square logo scaled down to the
+                  // 80pt height cap is only ~117pt wide and gets pushed ~60pt
+                  // in from the left margin, while a wide banner logo fills the
+                  // width and looks correctly aligned. Left-anchoring makes
+                  // every aspect ratio start at the margin instead, so a
+                  // company doesn't have to reshape its logo to fit the layout.
+                  objectPosition: 'left top',
+                }}
+              />
             )}
             {(company.invoice_show_company_name ?? true) &&
               (company.invoice_company_name_position ?? 'header') === 'header' && (
@@ -787,7 +847,13 @@ export function InvoicePDF({ invoice, customer, items, company, originalInvoiceN
               {customer.country && customer.country !== 'SE' && (
                 <Text>{customer.country}</Text>
               )}
-              {/* Suppress the identifier row for private customers — their
+              {/* Seller-assigned kundnummer: no per-customer-type guard needed,
+                  it identifies the customer in the seller's own register and
+                  carries no personal data of its own. */}
+              {customer.customer_number && (
+                <Text style={{ marginTop: 6 }}>{L.custNo} {customer.customer_number}</Text>
+              )}
+              {/* Suppress the identifier row for private customers: their
                   personnummer is not required on a B2C invoice (ML 17 kap 24§
                   asks for name + address only) and printing it is a GDPR
                   data-minimization regression. ROT/RUT-avdrag invoices surface
@@ -796,7 +862,7 @@ export function InvoicePDF({ invoice, customer, items, company, originalInvoiceN
               {customer.customer_type !== 'individual' && customer.org_number && (
                 <Text style={{ marginTop: 6 }}>{L.orgNo} {customer.org_number}</Text>
               )}
-              {/* Same data-minimisation guard as org_number above — for a
+              {/* Same data-minimisation guard as org_number above: for a
                   private customer a VAT number functions as a personal tax
                   identifier in some EU jurisdictions and is not required by
                   ML 17 kap 24§ on a B2C invoice. */}
@@ -829,7 +895,7 @@ export function InvoicePDF({ invoice, customer, items, company, originalInvoiceN
 
             {/* Table rows */}
             {items.map((item, index) =>
-              item.line_type === 'text' ? (
+              isTextLikeLine(item) ? (
                 // Free-text / blank row: description spans the full width, no
                 // numeric columns. An empty description renders as a spacer.
                 <View key={index} style={styles.tableRow}>
@@ -843,13 +909,13 @@ export function InvoicePDF({ invoice, customer, items, company, originalInvoiceN
                   <Text style={styles.colQty}>{item.quantity}</Text>
                   <Text style={styles.colUnit}>{item.unit}</Text>
                   {!isDeliveryNote && (
-                    <Text style={styles.colPrice}>{formatCurrency(item.unit_price, invoice.currency, lang)}</Text>
+                    <Text style={styles.colPrice}>{formatPdfCurrency(item.unit_price, invoice.currency, lang)}</Text>
                   )}
                   {!isDeliveryNote && showVatColumn && (
                     <Text style={styles.colVat}>{item.vat_rate ?? 0}%</Text>
                   )}
                   {!isDeliveryNote && (
-                    <Text style={styles.colTotal}>{formatCurrency(item.line_total, invoice.currency, lang)}</Text>
+                    <Text style={styles.colTotal}>{formatPdfCurrency(item.line_total, invoice.currency, lang)}</Text>
                   )}
                 </View>
               )
@@ -862,7 +928,7 @@ export function InvoicePDF({ invoice, customer, items, company, originalInvoiceN
           <View style={styles.totalsSection}>
             <View style={styles.totalRow}>
               <Text style={styles.totalLabel}>{L.subtotal}</Text>
-              <Text style={styles.totalValue}>{formatCurrency(invoice.subtotal, invoice.currency, lang)}</Text>
+              <Text style={styles.totalValue}>{formatPdfCurrency(invoice.subtotal, invoice.currency, lang)}</Text>
             </View>
             {vatByRate.size > 1 ? (
               Array.from(vatByRate.entries())
@@ -871,12 +937,12 @@ export function InvoicePDF({ invoice, customer, items, company, originalInvoiceN
                   <View key={rate}>
                     <View style={styles.totalRow}>
                       <Text style={styles.totalLabel}>{L.net(rate)}</Text>
-                      <Text style={styles.totalValue}>{formatCurrency(group.base, invoice.currency, lang)}</Text>
+                      <Text style={styles.totalValue}>{formatPdfCurrency(group.base, invoice.currency, lang)}</Text>
                     </View>
-                    {group.vat > 0 && (
+                    {group.vat !== 0 && (
                       <View style={styles.totalRow}>
                         <Text style={styles.totalLabel}>{L.vatRow(rate)}</Text>
-                        <Text style={styles.totalValue}>{formatCurrency(group.vat, invoice.currency, lang)}</Text>
+                        <Text style={styles.totalValue}>{formatPdfCurrency(group.vat, invoice.currency, lang)}</Text>
                       </View>
                     )}
                   </View>
@@ -890,38 +956,37 @@ export function InvoicePDF({ invoice, customer, items, company, originalInvoiceN
               !(company.vat_registered === false && invoice.vat_amount === 0) && (
                 <View style={styles.totalRow}>
                   <Text style={styles.totalLabel}>{L.vatRow(invoice.vat_rate ?? (vatByRate.size === 1 ? (vatByRate.keys().next().value ?? 0) : 0))}</Text>
-                  <Text style={styles.totalValue}>{formatCurrency(invoice.vat_amount, invoice.currency, lang)}</Text>
+                  <Text style={styles.totalValue}>{formatPdfCurrency(invoice.vat_amount, invoice.currency, lang)}</Text>
                 </View>
               )
             )}
             {(() => {
-              const rounding = getDisplayTotal(invoice, company)
-              // ROT/RUT-avdrag reduces "Att betala" — the customer only owes
-              // (total - deduction); the rest is reclaimed from Skatteverket
-              // via fakturamodellen. The rule does not apply to credit notes.
-              const showDeduction = !isCreditNote && (invoice.deduction_total ?? 0) > 0
-              const grandTotal = showDeduction
-                ? Math.round((rounding.displayed - (invoice.deduction_total ?? 0)) * 100) / 100
-                : rounding.displayed
+              // Shared with the invoice email (lib/email/invoice-templates.ts)
+              // so the mail and the PDF always state the same "Att betala".
+              const { rounding, deductionApplies: showDeduction, toPay: grandTotal } =
+                getAmountToPay(invoice, company)
               return (
                 <>
                   {rounding.applies && (
                     <View style={styles.totalRow}>
                       <Text style={[styles.totalLabel, { fontSize: 8 }]}>{L.rounding}</Text>
-                      <Text style={[styles.totalValue, { fontSize: 8 }]}>{formatCurrency(rounding.roundingDelta, 'SEK', lang)}</Text>
+                      <Text style={[styles.totalValue, { fontSize: 8 }]}>{formatPdfCurrency(rounding.roundingDelta, 'SEK', lang)}</Text>
                     </View>
                   )}
                   {showDeduction && (
                     <View style={styles.totalRow}>
                       <Text style={styles.totalLabel}>{L.deductionRow}</Text>
                       <Text style={styles.totalValue}>
-                        −{formatCurrency(invoice.deduction_total ?? 0, invoice.currency, lang)}
+                        {/* deduction_total is stored as a positive magnitude;
+                            -Math.abs() keeps the row a reduction even if the
+                            stored sign convention ever changes. */}
+                        {formatPdfCurrency(-Math.abs(invoice.deduction_total ?? 0), invoice.currency, lang)}
                       </Text>
                     </View>
                   )}
                   <View style={styles.grandTotal}>
                     <Text style={styles.grandTotalLabel}>{isCreditNote ? L.toCredit : L.toPay}</Text>
-                    <Text style={styles.grandTotalValue}>{formatCurrency(grandTotal, invoice.currency, lang)}</Text>
+                    <Text style={styles.grandTotalValue}>{formatPdfCurrency(grandTotal, invoice.currency, lang)}</Text>
                   </View>
                 </>
               )
@@ -931,12 +996,12 @@ export function InvoicePDF({ invoice, customer, items, company, originalInvoiceN
                 {invoice.vat_amount_sek != null && invoice.vat_amount_sek !== 0 && (
                   <View style={styles.totalRow}>
                     <Text style={[styles.totalLabel, { fontSize: 9 }]}>{L.vatInSek(invoice.exchange_rate ?? '')}</Text>
-                    <Text style={[styles.totalValue, { fontSize: 9 }]}>{formatCurrency(invoice.vat_amount_sek, 'SEK', lang)}</Text>
+                    <Text style={[styles.totalValue, { fontSize: 9 }]}>{formatPdfCurrency(invoice.vat_amount_sek, 'SEK', lang)}</Text>
                   </View>
                 )}
                 <View style={styles.totalRow}>
                   <Text style={[styles.totalLabel, { fontSize: 9 }]}>{L.totalInSek}</Text>
-                  <Text style={[styles.totalValue, { fontSize: 9 }]}>{formatCurrency(invoice.total_sek, 'SEK', lang)}</Text>
+                  <Text style={[styles.totalValue, { fontSize: 9 }]}>{formatPdfCurrency(invoice.total_sek, 'SEK', lang)}</Text>
                 </View>
               </View>
             )}
@@ -980,19 +1045,19 @@ export function InvoicePDF({ invoice, customer, items, company, originalInvoiceN
               )
             })()}
             {/* Labor-only disclaimer (Skatteverket fakturamodellen). Per ML
-                17 kap, only the labor portion qualifies — material must be
+                17 kap, only the labor portion qualifies; material must be
                 invoiced separately. */}
             <Text style={styles.deductionNotice}>{DEDUCTION_LABOR_ONLY_NOTICE}</Text>
-            {/* Per-line breakdown — one row per eligible item with kind,
+            {/* Per-line breakdown: one row per eligible item with kind,
                 work type if present and the deducted amount. */}
             {items
               .filter((i) => i.deduction_type)
               .map((i, idx) => {
                 const kind = i.deduction_type === 'rot' ? 'ROT' : 'RUT'
-                const work = i.work_type ? ` — ${i.work_type}` : ''
+                const work = i.work_type ? `, ${i.work_type}` : ''
                 return (
                   <Text key={idx} style={styles.deductionLineItem}>
-                    {`${kind}${work}: ${i.description} — ${formatCurrency(i.deduction_amount ?? 0, invoice.currency, lang)}`}
+                    {`${kind}${work}: ${i.description}, ${formatPdfCurrency(i.deduction_amount ?? 0, invoice.currency, lang)}`}
                   </Text>
                 )
               })}
@@ -1013,6 +1078,16 @@ export function InvoicePDF({ invoice, customer, items, company, originalInvoiceN
         {!isCreditNote && !isProforma && !isDeliveryNote && (
           <View style={styles.paymentSection}>
             <Text style={styles.paymentTitle}>{L.paymentHeading}</Text>
+            {invoice.payment_link_url && (
+              <View style={styles.paymentRow}>
+                <Text style={styles.paymentLabel}>{L.payOnline}</Text>
+                <Link src={invoice.payment_link_url} style={styles.paymentValue}>
+                  {invoice.payment_link_url.length > 60
+                    ? `${invoice.payment_link_url.slice(0, 57)}...`
+                    : invoice.payment_link_url}
+                </Link>
+              </View>
+            )}
             {company.bank_name && (
               <View style={styles.paymentRow}>
                 <Text style={styles.paymentLabel}>{L.bank}</Text>
@@ -1039,7 +1114,7 @@ export function InvoicePDF({ invoice, customer, items, company, originalInvoiceN
                 <Text style={styles.paymentValue}>{company.plusgiro}</Text>
               </View>
             )}
-            {company.swish && (company.invoice_show_swish ?? false) && (
+            {SHOW_SWISH_ON_INVOICE && company.swish && (company.invoice_show_swish ?? false) && (
               <View style={styles.paymentRow}>
                 <Text style={styles.paymentLabel}>{L.swish}</Text>
                 <Text style={styles.paymentValue}>{company.swish}</Text>
@@ -1061,16 +1136,29 @@ export function InvoicePDF({ invoice, customer, items, company, originalInvoiceN
               <Text style={styles.paymentLabel}>{L.dueDate}</Text>
               <Text style={[styles.paymentValue, { fontWeight: 'bold' }]}>{formatDate(invoice.due_date)}</Text>
             </View>
+            {invoice.invoice_number && (
+              <View style={styles.paymentRow}>
+                <Text style={styles.paymentLabel}>{L.invoiceNumber}</Text>
+                <Text style={[styles.paymentValue, { fontWeight: 'bold' }]}>{invoice.invoice_number}</Text>
+              </View>
+            )}
             {(company.invoice_show_ocr ?? true) && (company.bankgiro || company.plusgiro) && lang === 'sv' && (
               <View style={styles.paymentRow}>
                 <Text style={styles.paymentLabel}>{L.ocr}</Text>
-                <Text style={[styles.paymentValue, { fontWeight: 'bold' }]}>{invoice.invoice_number ? generateOcrReference(invoice.invoice_number) : '—'}</Text>
+                <Text style={[styles.paymentValue, { fontWeight: 'bold' }]}>{invoice.invoice_number ? generateOcrReference(invoice.invoice_number) : '-'}</Text>
               </View>
             )}
-            {lang !== 'sv' && invoice.invoice_number && (
-              <View style={styles.paymentRow}>
-                <Text style={styles.paymentLabel}>{L.paymentReference}</Text>
-                <Text style={[styles.paymentValue, { fontWeight: 'bold' }]}>{invoice.invoice_number}</Text>
+            {swishQrDataUrl && (
+              <View style={{ position: 'absolute', top: 15, right: 15, width: 96, alignItems: 'center' }}>
+                <Image src={swishQrDataUrl} style={{ width: 96, height: 96 }} />
+                <Text style={[styles.paymentLabel, { width: 'auto', marginTop: 2, textAlign: 'center' }]}>{L.swishQrCaption}</Text>
+              </View>
+            )}
+            {/* Payment-link QR: shifts left when the Swish QR occupies the corner. */}
+            {paymentLinkQrDataUrl && (
+              <View style={{ position: 'absolute', top: 15, right: swishQrDataUrl ? 125 : 15, width: 96, alignItems: 'center' }}>
+                <Image src={paymentLinkQrDataUrl} style={{ width: 96, height: 96 }} />
+                <Text style={[styles.paymentLabel, { width: 'auto', marginTop: 2, textAlign: 'center' }]}>{L.paymentLinkQrCaption}</Text>
               </View>
             )}
           </View>
@@ -1078,7 +1166,7 @@ export function InvoicePDF({ invoice, customer, items, company, originalInvoiceN
 
         {/* Reverse charge / export / exempt / not-registered notice.
             "Not VAT-registered" trumps the others ONLY when the invoice
-            actually carries no VAT — a non-registered seller who chose to
+            actually carries no VAT: a non-registered seller who chose to
             state VAT on the invoice (warned at create time per ML 16 kap.
             23 §) gets the normal reverse-charge / exempt notices instead,
             since the "ej momsregistrerad" line would contradict the VAT
@@ -1121,7 +1209,7 @@ export function InvoicePDF({ invoice, customer, items, company, originalInvoiceN
           </View>
         )}
 
-        {/* Footer — collected legal info per ML 17 kap 24§. Optional branded
+        {/* Footer: collected legal info per ML 17 kap 24§. Optional branded
             footnote sits above the statutory line so it can never crowd out
             the compliance text (which is why the user-supplied string lives
             in its own Text node, not inside the join). */}

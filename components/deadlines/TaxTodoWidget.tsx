@@ -9,6 +9,7 @@ import { Button } from '@/components/ui/button'
 import { useToast } from '@/components/ui/use-toast'
 import { Deadline, DeadlineStatus, TAX_DEADLINE_TYPE_LABELS, DEADLINE_STATUS_LABELS } from '@/types'
 import { getReportUrl } from '@/lib/tax/deadline-config'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 // Use the labels from types
 const STATUS_LABELS = DEADLINE_STATUS_LABELS
@@ -83,8 +84,17 @@ export function TaxTodoWidget({ deadlines, onStatusChange }: TaxTodoWidgetProps)
       })
 
       if (!response.ok) {
-        const data = await response.json()
-        throw new Error(data.error || 'Failed to update status')
+        // Map the parsed body plus the status, never `new Error(data.error)`:
+        // the route answers thrown errors with the canonical envelope
+        // `{ error: { code, message } }`, and the Error constructor would
+        // stringify that object to "[object Object]", discarding the route's
+        // own Swedish reason.
+        const body = await response.json().catch(() => null)
+        toast({
+          title: getUserErrorMessage(body, { statusCode: response.status }),
+          variant: 'destructive',
+        })
+        return
       }
 
       toast({
@@ -95,7 +105,7 @@ export function TaxTodoWidget({ deadlines, onStatusChange }: TaxTodoWidgetProps)
       onStatusChange?.(deadlineId, newStatus)
     } catch (error) {
       toast({
-        title: error instanceof Error ? error.message : t('toast_status_update_failed'),
+        title: error instanceof Error ? getUserErrorMessage(error) : t('toast_status_update_failed'),
         variant: 'destructive',
       })
     } finally {
@@ -112,7 +122,7 @@ export function TaxTodoWidget({ deadlines, onStatusChange }: TaxTodoWidgetProps)
   }
 
   return (
-    <Card className="border-warning/30 bg-warning/5">
+    <Card>
       <CardHeader className="pb-2">
         <div className="flex items-center justify-between">
           <CardTitle className="text-lg flex items-center gap-2">
@@ -134,18 +144,11 @@ export function TaxTodoWidget({ deadlines, onStatusChange }: TaxTodoWidgetProps)
           const isUpdating = updatingId === deadline.id
           const reportLink = getReportLink(deadline)
           const isOverdue = deadline.status === 'overdue'
-          const isActionNeeded = deadline.status === 'action_needed'
 
           return (
             <div
               key={deadline.id}
-              className={`p-3 rounded-lg ${
-                isOverdue
-                  ? 'bg-destructive/5 border border-destructive/30'
-                  : isActionNeeded
-                  ? 'bg-warning/5 border border-warning/20'
-                  : ''
-              }`}
+              className={`p-3 rounded-lg ${isOverdue ? 'bg-destructive/5' : ''}`}
             >
               <div className="flex items-start justify-between gap-2">
                 <div className="flex items-start gap-2 min-w-0 flex-1">
@@ -165,9 +168,9 @@ export function TaxTodoWidget({ deadlines, onStatusChange }: TaxTodoWidgetProps)
                         {formatDate(deadline.due_date)}
                       </span>
                       {deadline.tax_deadline_type && (
-                        <Badge variant="outline" className="text-xs px-1.5 py-0 h-5">
-                          {TAX_DEADLINE_TYPE_LABELS[deadline.tax_deadline_type]}
-                        </Badge>
+                        <span className="text-xs text-muted-foreground">
+                          · {TAX_DEADLINE_TYPE_LABELS[deadline.tax_deadline_type]}
+                        </span>
                       )}
                     </div>
                   </div>

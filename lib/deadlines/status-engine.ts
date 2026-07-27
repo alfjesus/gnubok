@@ -57,37 +57,6 @@ export function daysUntilDeadline(dueDate: string): number {
 }
 
 /**
- * Determine the automatic status based on deadline date
- */
-export function getAutomaticStatus(
-  dueDate: string,
-  currentStatus: DeadlineStatus
-): DeadlineStatus | null {
-  const daysUntil = daysUntilDeadline(dueDate)
-
-  // Already in terminal or user-controlled state
-  if (['submitted', 'confirmed', 'in_progress'].includes(currentStatus)) {
-    // Check for overdue on submitted (shouldn't happen often)
-    if (currentStatus === 'submitted' && daysUntil < 0) {
-      return null // Keep as submitted, don't change to overdue
-    }
-    return null
-  }
-
-  // Past deadline without submission
-  if (daysUntil < 0 && currentStatus !== 'overdue') {
-    return 'overdue'
-  }
-
-  // Within action needed threshold
-  if (daysUntil <= ACTION_NEEDED_THRESHOLD_DAYS && currentStatus === 'upcoming') {
-    return 'action_needed'
-  }
-
-  return null
-}
-
-/**
  * Update deadline statuses automatically (called by daily cron)
  */
 export async function updateDeadlineStatuses(
@@ -115,6 +84,7 @@ export async function updateDeadlineStatuses(
     })
     .lt('due_date', todayStr)
     .eq('is_completed', false)
+    .is('dismissed_at', null)
     .in('status', ['upcoming', 'action_needed'])
     .select('id')
 
@@ -136,6 +106,7 @@ export async function updateDeadlineStatuses(
     .lte('due_date', thresholdStr)
     .eq('status', 'upcoming')
     .eq('is_completed', false)
+    .is('dismissed_at', null)
     .select('id')
 
   if (actionNeededError) {
@@ -217,6 +188,7 @@ export async function getDeadlinesNeedingAttention(
     .select('id, title, due_date, tax_deadline_type, status')
     .eq('company_id', companyId)
     .eq('is_completed', false)
+    .is('dismissed_at', null)
     .in('status', ['action_needed', 'overdue'])
     .order('due_date', { ascending: true })
 

@@ -5,7 +5,8 @@ import {
 } from '@/lib/reports/vat-declaration'
 import { withRouteContext } from '@/lib/api/with-route-context'
 import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
-import type { VatPeriodType, AccountingMethod } from '@/types'
+import type { VatPeriodType } from '@/types'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 /**
  * GET /api/reports/vat-declaration
@@ -76,17 +77,12 @@ export const GET = withRouteContext(
       })
     }
 
-    const { data: settings } = await supabase
-      .from('company_settings')
-      .select('accounting_method')
-      .eq('company_id', companyId)
-      .single()
-
-    const accountingMethod = (settings?.accounting_method as AccountingMethod) || 'accrual'
-
     try {
+      // No accounting-method argument: the method is baked into journal entry
+      // timing (see the invariant note on calculateVatDeclaration), so no
+      // company_settings round trip is needed here.
       const declaration = await calculateVatDeclaration(
-        supabase, companyId!, periodType, year, period, accountingMethod,
+        supabase, companyId!, periodType, year, period,
         { fiscalPeriodId },
       )
 
@@ -106,7 +102,7 @@ export const GET = withRouteContext(
       })
       return errorResponseFromCode('VAT_REPORT_GENERATION_FAILED', log, {
         requestId,
-        details: { reason: err instanceof Error ? err.message : 'unknown' },
+        details: { reason: err instanceof Error ? getUserErrorMessage(err) : 'unknown' },
       })
     }
   },

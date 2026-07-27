@@ -1,12 +1,15 @@
 'use client'
 
 import { useState, useEffect, useCallback } from 'react'
+import { useRouter } from 'next/navigation'
 import { useTranslations } from 'next-intl'
-import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog'
 import { useToast } from '@/components/ui/use-toast'
+import { ToastAction } from '@/components/ui/toast'
 import { formatCurrency, formatDate } from '@/lib/utils'
+import { linkDocuments, formatFailedDocumentNames } from '@/lib/documents/link-documents'
 import { ArrowUpRight, ArrowDownRight, Check, Paperclip, ChevronDown, ChevronUp, AlertTriangle } from 'lucide-react'
 import { getDefaultAccountForCategory } from '@/lib/bookkeeping/category-mapping'
 import type { BookingTemplate } from '@/lib/bookkeeping/booking-templates'
@@ -15,11 +18,13 @@ import { formatAccountWithName } from '@/lib/bookkeeping/client-account-names'
 import JournalEntryPreview from './JournalEntryPreview'
 import AccountCombobox from '@/components/bookkeeping/AccountCombobox'
 import DocumentUploadZone from '@/components/bookkeeping/DocumentUploadZone'
+import DocumentViewerPane from '@/components/bookkeeping/DocumentViewerPane'
 import type { UploadedFile } from '@/components/bookkeeping/DocumentUploadZone'
 import VatTreatmentSelect from './VatTreatmentSelect'
 import { VAT_TREATMENT_OPTIONS } from './transaction-types'
 import type { TransactionWithInvoice } from './transaction-types'
 import type { TransactionCategory, VatTreatment, BASAccount, EntityType, LinePatternEntry } from '@/types'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 interface QuickReviewDialogProps {
   open: boolean
@@ -61,6 +66,7 @@ export default function QuickReviewDialog({
   const t = useTranslations('tx_quick_review')
   const tCat = useTranslations('tx_categories')
   const { toast } = useToast()
+  const router = useRouter()
   const [accountOverride, setAccountOverride] = useState(defaultAccount)
   const [vatTreatment, setVatTreatment] = useState<VatTreatment | 'none'>(defaultVat)
   const [accounts, setAccounts] = useState<BASAccount[]>([])
@@ -69,9 +75,8 @@ export default function QuickReviewDialog({
   const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([])
   const [showUploadZone, setShowUploadZone] = useState(false)
   const [showVatDropdown, setShowVatDropdown] = useState(false)
-  const [isOpeningDoc, setIsOpeningDoc] = useState(false)
   // Mirror of `transaction` so we can patch in a freshly-fetched SEK conversion
-  // before the user confirms — the verifikation must always be in SEK and the
+  // before the user confirms: the verifikation must always be in SEK and the
   // engine reads these fields straight off the transaction row.
   const [enrichedTx, setEnrichedTx] = useState<TransactionWithInvoice | null>(transaction)
   const [rateLoading, setRateLoading] = useState(false)
@@ -79,25 +84,7 @@ export default function QuickReviewDialog({
 
   const preAttachedDocumentId = transaction?.document_id ?? null
 
-  const handleOpenAttachedDoc = useCallback(async () => {
-    if (!preAttachedDocumentId || isOpeningDoc) return
-    setIsOpeningDoc(true)
-    try {
-      const res = await fetch(`/api/documents/${preAttachedDocumentId}`)
-      if (!res.ok) {
-        toast({ title: t('open_attached_failed'), variant: 'destructive' })
-        return
-      }
-      const { data } = await res.json()
-      if (data?.download_url) {
-        window.open(data.download_url, '_blank', 'noopener,noreferrer')
-      }
-    } finally {
-      setIsOpeningDoc(false)
-    }
-  }, [preAttachedDocumentId, isOpeningDoc, toast, t])
-
-  // Handle account changes — clear VAT for liability/equity accounts (class 2)
+  // Handle account changes: clear VAT for liability/equity accounts (class 2)
   const handleAccountChange = useCallback((account: string) => {
     setAccountOverride(account)
     if (account.startsWith('2')) {
@@ -151,7 +138,7 @@ export default function QuickReviewDialog({
         const json = await res.json()
         if (cancelled) return
         if (!res.ok) {
-          setRateError(json?.error?.message || t('exchange_rate_fetch_failed'))
+          setRateError(getUserErrorMessage(json?.error) || t('exchange_rate_fetch_failed'))
           return
         }
         if (json?.data) {
@@ -180,7 +167,7 @@ export default function QuickReviewDialog({
   const isTemplateBooking = !!templateId || isCounterpartyTemplate
   const isLiabilityAccount = accountOverride.startsWith('2')
   // For non-SEK transactions, the verifikation and the headline must show
-  // the SEK-converted total — the mall/category booking always posts in SEK.
+  // the SEK-converted total: the mall/category booking always posts in SEK.
   const sekAmount = resolveSekAmount(
     tx.amount,
     tx.amount_sek,
@@ -189,6 +176,20 @@ export default function QuickReviewDialog({
   )
   const isForeign = !!(tx.currency && tx.currency !== 'SEK')
   const sekConversionMissing = isForeign && (tx.amount_sek == null || tx.exchange_rate == null)
+
+  // Dimensions carried by the counterparty template's line pattern (dimensions
+  // PR7). Business lines may each carry a {sie_dim_no: code} bag: merge them
+  // into one compact display label ("KS01 · P001", dim-number order). This is
+  // display-only: booking applies the pattern's bags server-side.
+  const patternDims: Record<string, string> = {}
+  for (const line of counterpartyLinePattern ?? []) {
+    if (line.dimensions) Object.assign(patternDims, line.dimensions)
+  }
+  const patternDimsLabel = Object.entries(patternDims)
+    .filter(([, code]) => code)
+    .sort(([a], [b]) => Number(a) - Number(b))
+    .map(([, code]) => code)
+    .join(' · ')
 
   async function handleConfirm() {
     if (!category || !transaction) return
@@ -204,27 +205,40 @@ export default function QuickReviewDialog({
 
       const journalEntryId = await onConfirm(transaction.id, category, resolvedVat, override, templateId)
 
-      // Link uploaded documents to the journal entry
+      // Attach the uploaded underlag to the verifikat the booking just created.
+      // BFL 5 kap 7 § requires the verifikation to reference its underlag and
+      // BFL 7 kap requires that underlag to be archived with it; the verifikat
+      // is already committed here, so a failed link can only be reported, not
+      // undone. The parent's "Bokförd" toast must not be the last word when a
+      // receipt never made it onto the books.
       if (journalEntryId && uploadedFiles.length > 0) {
-        const filesToLink = uploadedFiles.filter((f) => f.status === 'uploaded' && f.id)
-        let linkFailCount = 0
-        for (const file of filesToLink) {
-          try {
-            await fetch(`/api/documents/${file.id}/link`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ journal_entry_id: journalEntryId }),
-            })
-          } catch {
-            linkFailCount++
-          }
-        }
-        if (linkFailCount > 0) {
+        const targets = uploadedFiles
+          .filter((f) => f.status === 'uploaded' && f.id)
+          .map((f) => ({ documentId: f.id as string, fileName: f.fileName }))
+        const { failed } = await linkDocuments(targets, journalEntryId)
+        if (failed.length > 0) {
           toast({
-            title: t('doc_link_failed_title'),
-            description: t('doc_link_failed_description', { count: linkFailCount }),
+            title: t('doc_link_failed_booked_title'),
+            description: t('doc_link_failed_booked_description', {
+              count: failed.length,
+              files: formatFailedDocumentNames(failed),
+            }),
             variant: 'destructive',
+            action: (
+              <ToastAction
+                altText={t('doc_link_open_entry')}
+                onClick={() => router.push(`/bookkeeping/${journalEntryId}`)}
+              >
+                {t('doc_link_open_entry')}
+              </ToastAction>
+            ),
           })
+          // By this point the parent has already closed the dialog (onConfirm
+          // resolved before linkDocuments did), so this component's file state
+          // is invisible either way: the toast above, with its open-entry
+          // action, is the user's actual pointer to the underlag that did not
+          // attach. The early return just skips the redundant cleanup below.
+          return
         }
       }
 
@@ -233,7 +247,7 @@ export default function QuickReviewDialog({
     } catch {
       setError(t('generic_error'))
     } finally {
-      // Always reset isProcessing — without this, an onConfirm that resolves
+      // Always reset isProcessing: without this, an onConfirm that resolves
       // with null (e.g. server returned a structured 4xx error like
       // ACCOUNTS_NOT_IN_CHART) leaves the dialog frozen because the
       // <Dialog onOpenChange> below disables backdrop/ESC while processing.
@@ -249,7 +263,7 @@ export default function QuickReviewDialog({
       }
       onOpenChange(o)
     }}>
-      <DialogContent className="max-w-md sm:max-w-lg max-h-[85vh] overflow-y-auto">
+      <DialogContent className={preAttachedDocumentId ? 'max-w-6xl max-h-[90vh] overflow-y-auto' : 'max-w-md sm:max-w-lg max-h-[85vh] overflow-y-auto'}>
         <DialogHeader>
           <DialogTitle>{t('title')}</DialogTitle>
           <DialogDescription>
@@ -257,10 +271,21 @@ export default function QuickReviewDialog({
           </DialogDescription>
         </DialogHeader>
 
+        {/* When a document is pre-attached, show it side-by-side (receipt left,
+            review right). With no document the wrappers use display:contents so
+            the dialog collapses to the original single-column layout. */}
+        <div className={preAttachedDocumentId ? 'grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,520px)]' : 'contents'}>
+          {preAttachedDocumentId && (
+            <div className="h-[45vh] lg:sticky lg:top-0 lg:h-[72vh] lg:self-start">
+              <DocumentViewerPane documentId={preAttachedDocumentId} className="h-full" />
+            </div>
+          )}
+          <div className={preAttachedDocumentId ? 'space-y-4' : 'contents'}>
+
         {/* Transaction summary */}
         <div className="flex items-center gap-3 rounded-lg border p-3">
           <div
-            className={`h-9 w-9 rounded-full flex items-center justify-center flex-shrink-0 ${isIncome ? 'bg-success/10 text-success' : 'bg-destructive/10 text-destructive'}`}
+            className={`h-9 w-9 rounded-full flex items-center justify-center flex-shrink-0 ${isIncome ? 'text-success' : 'text-destructive'}`}
           >
             {isIncome ? (
               <ArrowUpRight className="h-4 w-4" />
@@ -316,9 +341,14 @@ export default function QuickReviewDialog({
             {isCounterpartyTemplate ? t('label_counterparty_template') : template ? t('label_template') : t('label_category')}
           </label>
           <div className="mt-1 flex items-center gap-2">
-            <Badge variant="outline" className="text-sm py-1 px-3">
+            <span className="text-sm font-medium text-foreground">
               {template ? template.name_sv : categoryLabel}
-            </Badge>
+            </span>
+            {patternDimsLabel && (
+              <Badge variant="secondary" className="font-mono tabular-nums">
+                {patternDimsLabel}
+              </Badge>
+            )}
             {onChangeTemplate && !isCounterpartyTemplate && (
               <button
                 type="button"
@@ -366,7 +396,7 @@ export default function QuickReviewDialog({
           </div>
         )}
 
-        {/* Journal entry preview — hidden until we have a SEK conversion;
+        {/* Journal entry preview: hidden until we have a SEK conversion;
             otherwise we'd render a verifikation in the wrong currency. */}
         {!sekConversionMissing && !rateLoading && (
           <JournalEntryPreview
@@ -387,7 +417,7 @@ export default function QuickReviewDialog({
           />
         )}
 
-        {/* Account & VAT — hidden for template bookings (accounts defined by the template) */}
+        {/* Account & VAT: hidden for template bookings (accounts defined by the template) */}
         {!isTemplateBooking && (
           <>
             <div>
@@ -434,27 +464,9 @@ export default function QuickReviewDialog({
           </>
         )}
 
-        {/* Document — either show the doc the inbox attached pre-categorize,
-            or let the user upload one if none is attached yet. */}
-        {preAttachedDocumentId ? (
-          <div className="rounded-lg border flex items-center justify-between px-3 py-2.5 text-sm">
-            <div className="flex items-center gap-2 min-w-0">
-              <Paperclip className="h-4 w-4 text-muted-foreground shrink-0" />
-              <span className="font-medium">{t('attached_doc_label')}</span>
-              <span className="text-xs text-muted-foreground truncate">
-                {t('attached_doc_source')}
-              </span>
-            </div>
-            <button
-              type="button"
-              onClick={handleOpenAttachedDoc}
-              disabled={isOpeningDoc}
-              className="text-xs text-primary hover:underline shrink-0"
-            >
-              {isOpeningDoc ? t('opening') : t('view')}
-            </button>
-          </div>
-        ) : (
+        {/* No pre-attached document: let the user upload one. (When a document
+            IS pre-attached it's shown in the left preview column instead.) */}
+        {!preAttachedDocumentId && (
           <div className="rounded-lg border">
             <button
               type="button"
@@ -517,6 +529,8 @@ export default function QuickReviewDialog({
             <Check className="mr-2 h-4 w-4" />
             {isProcessing ? t('booking') : rateLoading ? t('fetching_rate') : t('book')}
           </Button>
+        </div>
+          </div>
         </div>
       </DialogContent>
     </Dialog>

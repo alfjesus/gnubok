@@ -16,8 +16,8 @@
  * its own (still-active) accrual JE.
  *
  * Remediation per affected payment:
- *   1. reverseEntry(payment_je)  — storno cancels Dr 1930 / Cr 30xx / Cr 26xx
- *   2. createInvoicePaymentJournalEntry — posts the correct Dr 1930 / Cr 1510
+ *   1. reverseEntry(payment_je): storno cancels Dr 1930 / Cr 30xx / Cr 26xx
+ *   2. createInvoicePaymentJournalEntry: posts the correct Dr 1930 / Cr 1510
  *   3. Re-link invoice_payments + transactions to the new JE
  *
  * Net effect on the books: 30xx and 26xx are restored to their correct
@@ -32,6 +32,7 @@ import { reverseEntry } from '@/lib/bookkeeping/engine'
 import { createInvoicePaymentJournalEntry } from '@/lib/bookkeeping/invoice-entries'
 import { ensureInitialized } from '@/lib/init'
 import type { Invoice } from '@/types'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 ensureInitialized()
 
@@ -237,7 +238,7 @@ export const POST = withRouteContext(
           payment_id: t.payment_id,
           ok: false,
           old_journal_entry_id: t.payment_journal_entry_id,
-          error: err instanceof Error ? err.message : 'Unknown error',
+          error: err instanceof Error ? getUserErrorMessage(err) : 'Unknown error',
         })
       }
     }

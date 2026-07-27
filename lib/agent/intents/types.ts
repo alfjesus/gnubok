@@ -15,9 +15,9 @@ export interface AgentIntent<Args = Record<string, unknown>, Captured = unknown>
   sheetTitle: string
 
   // Atom-loading mode.
-  //   declarative — load the listed horizontal atoms + the company's
+  //   declarative: load the listed horizontal atoms + the company's
   //                 vertical + modifier atoms upfront.
-  //   progressive — load metadata only; the agent calls gnubok_load_skill
+  //   progressive: load metadata only; the agent calls gnubok_load_skill
   //                 to pull a full body on demand.
   // See plan §10 (caching) and §16 ("Atom routing").
   atoms: {
@@ -36,18 +36,19 @@ export interface AgentIntent<Args = Record<string, unknown>, Captured = unknown>
   // override to Opus.
   model: string
 
-  // Extended-thinking budget. When set, run-turn enables a reasoning channel
-  // (thinking: { type: 'enabled', budget_tokens }) on every model call in the
-  // loop, so the agent reasons before it answers instead of narrating its
-  // steps in the visible reply. Omit to disable. budget_tokens must be ≥ 1024.
-  thinking?: { budgetTokens: number }
+  // Reasoning depth. When set, run-turn enables adaptive thinking on every
+  // model call in the loop, so the agent reasons before it answers instead of
+  // narrating its steps in the visible reply. Omit to disable.
+  //
+  // Sonnet 5 rejects the old fixed budget outright, so this is an effort level
+  // (EFFORT_STANDARD / EFFORT_DEEP), not a token count.
+  thinking?: { effort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' }
 
   // Captures the page-context object the prompt template needs. Runs server-
   // side after the user clicks the button. Failures bubble up to the route.
   capture: (args: Args, ctx: CaptureContext) => Promise<Captured>
 
-  // Builds the first-turn user message. The user does NOT see the prompt —
-  // only the agent's response to it.
+  // Builds the first-turn user message. The user does NOT see the prompt:   // only the agent's response to it.
   promptTemplate: (input: PromptTemplateInput<Captured>) => string
 }
 

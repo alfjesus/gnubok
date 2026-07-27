@@ -3,12 +3,13 @@
  *
  * Core defines the contract. The email extension registers a real
  * implementation (Resend). Without the extension, a no-op service
- * is used — email-dependent features degrade gracefully.
+ * is used: email-dependent features degrade gracefully.
  */
 
 export interface SendEmailOptions {
   to: string | string[]
   cc?: string | string[]
+  bcc?: string | string[]
   subject: string
   html: string
   text?: string
@@ -23,6 +24,7 @@ export interface SendEmailOptions {
 
 export interface SendEmailResult {
   success: boolean
+  provider?: string
   messageId?: string
   error?: string
 }

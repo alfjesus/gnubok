@@ -1,5 +1,5 @@
 /**
- * Shared test helpers — mock factories and fixture builders
+ * Shared test helpers: mock factories and fixture builders
  */
 import { vi } from 'vitest'
 import type {
@@ -60,7 +60,7 @@ export function createMockSupabase() {
     const handler: ProxyHandler<object> = {
       get(_target, prop) {
         if (prop === 'then') {
-          // Make the chain thenable — resolves to pendingResult
+          // Make the chain thenable: resolves to pendingResult
           return (resolve: (v: unknown) => void) => resolve(pendingResult)
         }
         // Return a function that returns a new chain
@@ -79,6 +79,10 @@ export function createMockSupabase() {
         error: null,
       }),
       remove: vi.fn().mockResolvedValue({ data: [], error: null }),
+      createSignedUrl: vi.fn().mockResolvedValue({
+        data: { signedUrl: 'https://example.com/signed' },
+        error: null,
+      }),
       getPublicUrl: vi.fn().mockReturnValue({
         data: { publicUrl: 'https://example.com/file.jpg' },
       }),
@@ -352,6 +356,7 @@ export function makeInvoice(overrides: Partial<Invoice> = {}): Invoice {
     vat_amount_sek: null,
     total: 12500,
     total_sek: null,
+    ore_rounding: null,
     vat_treatment: 'standard_25',
     vat_rate: 25,
     moms_ruta: '10',
@@ -399,6 +404,7 @@ export function makeCustomer(overrides: Partial<Customer> = {}): Customer {
     company_id: 'company-1',
     name: 'Test AB',
     customer_type: 'swedish_business',
+    customer_number: null,
     email: 'kontakt@test.se',
     phone: null,
     address_line1: 'Storgatan 1',
@@ -466,6 +472,7 @@ export function makeSupplierInvoice(
     received_date: '2024-06-02',
     delivery_date: null,
     status: 'registered',
+    approved_at: null,
     currency: 'SEK',
     exchange_rate: null,
     exchange_rate_date: null,
@@ -475,6 +482,7 @@ export function makeSupplierInvoice(
     vat_amount_sek: null,
     total: 10000,
     total_sek: null,
+    ore_rounding: null,
     vat_treatment: 'standard_25',
     reverse_charge: false,
     payment_reference: null,
@@ -504,6 +512,7 @@ export function makeCompanySettings(
     company_id: 'company-1',
     entity_type: 'enskild_firma',
     company_name: 'Test Firma',
+    default_our_reference: null,
     org_number: '199001011234',
     address_line1: 'Testgatan 1',
     address_line2: null,
@@ -519,6 +528,18 @@ export function makeCompanySettings(
     vat_number: null,
     moms_period: 'quarterly',
     periodisk_sammanstallning_period: 'quarterly',
+    vat_taxable_base_over_40m: false,
+    vat_has_eu_trade: false,
+    vat_filing_method: 'electronic',
+    periodisk_sammanstallning_enabled: false,
+    periodisk_sammanstallning_filing_method: 'electronic',
+    kontrolluppgifter_enabled: false,
+    rot_rut_enabled: false,
+    oss_enabled: false,
+    ioss_enabled: false,
+    intrastat_enabled: false,
+    punktskatt_enabled: false,
+    fyllnadsinbetalning_enabled: false,
     tax_contact_name: null,
     tax_contact_phone: null,
     tax_contact_email: null,
@@ -535,6 +556,7 @@ export function makeCompanySettings(
     accounting_method: 'accrual',
     invoice_prefix: 'F',
     next_invoice_number: 1,
+    next_arrival_number: 1,
     next_delivery_note_number: 1,
     invoice_default_days: 30,
     invoice_default_notes: null,
@@ -578,12 +600,23 @@ export function makeCompanySettings(
     invoice_primary_color: '#1a1a1a',
     invoice_accent_color: '#666666',
     invoice_font_family: 'Helvetica',
+    invoice_custom_font_path: null,
+    invoice_custom_font_name: null,
     invoice_header_text: null,
     invoice_footer_text: null,
+    invoice_email_texts: null,
+    invoice_payment_links_enabled: false,
     send_invoice_reminders: true,
+    reminder_days_level_1: 15,
+    reminder_days_level_2: 30,
+    reminder_days_level_3: 45,
     reminder_fee_enabled: true,
     reminder_fee_amount: 60,
     reminder_interest_rate_override: null,
+    dimensions_enabled: false,
+    preferred_payment_format: 'pain001',
+    salary_pay_day: 25,
+    salary_default_bank: null,
     logo_url: null,
     onboarding_step: 6,
     onboarding_complete: true,
@@ -744,6 +777,10 @@ export function createQueuedMockSupabase() {
         error: null,
       }),
       remove: vi.fn().mockResolvedValue({ data: [], error: null }),
+      createSignedUrl: vi.fn().mockResolvedValue({
+        data: { signedUrl: 'https://example.com/signed' },
+        error: null,
+      }),
       getPublicUrl: vi.fn().mockReturnValue({
         data: { publicUrl: 'https://example.com/file.jpg' },
       }),

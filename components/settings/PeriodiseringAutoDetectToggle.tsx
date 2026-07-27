@@ -4,7 +4,10 @@ import { useCallback, useSyncExternalStore } from 'react'
 import Link from 'next/link'
 import { ExternalLink } from 'lucide-react'
 import { Switch } from '@/components/ui/switch'
-import { Label } from '@/components/ui/label'
+import {
+  SettingsRow,
+  SettingsRowEnd,
+} from '@/components/settings/SettingsRows'
 
 /**
  * Per-user toggle for the periodisering wizard's auto-detection step.
@@ -16,7 +19,7 @@ import { Label } from '@/components/ui/label'
  * `company_settings.periodisering_autodetect_enabled boolean` column and
  * the wizard's auto-detect step will read either source.
  *
- * Default: enabled. The wizard's auto-detect step renders regardless — the
+ * Default: enabled. The wizard's auto-detect step renders regardless: the
  * toggle merely controls whether the GET response includes `autoDetected`
  * on subsequent fetches. (Today the API always returns it; the wizard step
  * can early-out based on this setting locally.)
@@ -34,7 +37,7 @@ function readStored(): boolean {
 }
 
 /** Subscribe to localStorage changes from OTHER tabs. Same-tab updates are
- *  picked up via the explicit re-render after `setItem` — see
+ *  picked up via the explicit re-render after `setItem`: see
  *  `notifyChange` below. */
 function subscribe(callback: () => void): () => void {
   if (typeof window === 'undefined') return () => {}
@@ -76,33 +79,27 @@ export function PeriodiseringAutoDetectToggle() {
   }, [])
 
   return (
-    <section className="space-y-4">
-      <h2 className="text-sm font-medium uppercase tracking-wider text-muted-foreground">
-        Periodisering
-      </h2>
-      <div className="flex items-start justify-between gap-4">
-        <div className="space-y-1">
-          <Label htmlFor="periodisering-autodetect" className="text-sm">
-            Aktivera automatisk periodiseringsdetektering
-          </Label>
-          <p className="text-xs text-muted-foreground max-w-md">
-            Skannar fakturor i bokslutet efter datumintervall som sträcker sig
-            in i nästa räkenskapsår och föreslår periodiseringar i bokslut-wizarden.
-          </p>
-        </div>
-        <Switch
-          id="periodisering-autodetect"
-          checked={enabled}
-          onCheckedChange={handleChange}
-        />
-      </div>
-      <Link
-        href="/bookkeeping/year-end/periodisering"
-        className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors"
-      >
-        <ExternalLink className="h-3.5 w-3.5" />
-        Öppna periodiserings-wizarden
-      </Link>
-    </section>
+    <SettingsRow
+      label="Periodisering"
+      help="Skannar fakturor i bokslutet efter datumintervall som sträcker sig in i nästa räkenskapsår och föreslår periodiseringar i bokslut-wizarden."
+    >
+      <Switch
+        id="periodisering-autodetect"
+        checked={enabled}
+        onCheckedChange={handleChange}
+      />
+      <label htmlFor="periodisering-autodetect" className="cursor-pointer text-sm">
+        Aktivera automatisk periodiseringsdetektering
+      </label>
+      <SettingsRowEnd>
+        <Link
+          href="/bookkeeping/year-end/periodisering"
+          className="inline-flex items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
+        >
+          <ExternalLink className="h-3.5 w-3.5" />
+          Öppna periodiserings-wizarden
+        </Link>
+      </SettingsRowEnd>
+    </SettingsRow>
   )
 }

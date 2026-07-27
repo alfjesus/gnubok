@@ -9,8 +9,16 @@ import { withRouteContext } from '@/lib/api/with-route-context'
 import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
 import type { ParsedBankTransaction, BankFileFormatId } from '@/lib/import/bank-file/types'
 import type { Transaction } from '@/types'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 ensureInitialized()
+
+// Bank-file imports run a sequential, per-row ingest (insert + invoice/supplier
+// matching + FX lookup). A full-year file (300+ rows) takes ~85s of server time,
+// which sits right on the platform's default function limit and gets killed
+// mid-run: the import "spins then aborts" for the user. Give it the same 5-minute
+// budget the SIE import route uses (app/api/import/sie/execute/route.ts).
+export const maxDuration = 300
 
 interface ExecuteRequest {
   transactions: ParsedBankTransaction[]
@@ -34,7 +42,7 @@ export const POST = withRouteContext(
     const { user, supabase, log, requestId } = ctx
 
     // We still call getCompanyRole because viewers are allowed through with
-    // rawInsertOnly behavior — `requireWrite: true` would block them.
+    // rawInsertOnly behavior: `requireWrite: true` would block them.
     const roleCheck = await getCompanyRole(supabase, user.id)
     if (!roleCheck.ok) {
       // Inject the request id for traceability and pass through.
@@ -72,7 +80,7 @@ export const POST = withRouteContext(
           status: 'processing',
           date_from: transactions.map((t) => t.date).sort()[0] || null,
           date_to: transactions.map((t) => t.date).sort().reverse()[0] || null,
-        }, { onConflict: 'user_id,file_hash' })
+        }, { onConflict: 'company_id,file_hash' })
         .select()
         .single()
 
@@ -80,7 +88,7 @@ export const POST = withRouteContext(
         opLog.error('failed to create bank_file_imports record', importError)
         return errorResponseFromCode('BANK_FILE_IMPORT_RECORD_FAILED', opLog, {
           requestId,
-          details: { reason: importError.message },
+          details: { reason: getUserErrorMessage(importError) },
         })
       }
 
@@ -157,7 +165,7 @@ export const POST = withRouteContext(
       opLog.error('bank file execute failed', err as Error)
       return errorResponseFromCode('BANK_FILE_EXECUTE_FAILED', opLog, {
         requestId,
-        details: { reason: err instanceof Error ? err.message : 'unknown' },
+        details: { reason: err instanceof Error ? getUserErrorMessage(err) : 'unknown' },
       })
     }
   },

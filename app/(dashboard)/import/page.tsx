@@ -2,44 +2,37 @@
 
 import { useState, useCallback, useEffect } from 'react'
 import { useSearchParams, useRouter } from 'next/navigation'
-import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
 import { useTranslations } from 'next-intl'
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
+import { Card, CardContent } from '@/components/ui/card'
 import { Progress } from '@/components/ui/progress'
 import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
+import { PageHeader } from '@/components/ui/page-header'
+import { HelpPopover } from '@/components/ui/help-popover'
+import { AttnLine } from '@/components/ui/attn-line'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { useToast } from '@/components/ui/use-toast'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
-import { ArrowLeftRight, ArrowRightLeft, FileText, ArrowLeft, Landmark, Loader2, Info, ChevronRight, FileSpreadsheet, Download, AlertTriangle } from 'lucide-react'
-import { motion } from 'framer-motion'
+import { ArrowLeft, CreditCard, Landmark, Loader2, ChevronRight, Download, AlertTriangle } from 'lucide-react'
 import { cn, formatDate } from '@/lib/utils'
 import { createClient } from '@/lib/supabase/client'
-import { useCompany } from '@/contexts/CompanyContext'
-import { BankSelector, type Bank } from '@/extensions/general/enable-banking/components/BankSelector'
-import { BankConnectionStatus } from '@/extensions/general/enable-banking/components/BankConnectionStatus'
+import { useCompany, useCapability } from '@/contexts/CompanyContext'
+import { CAPABILITY } from '@/lib/entitlements/keys'
 import { DestructiveConfirmDialog, useDestructiveConfirm } from '@/components/ui/destructive-confirm-dialog'
-import type { BankConnection } from '@/types'
+import { getSettingsPanel } from '@/lib/extensions/settings-panel-registry'
 
-// Bank file import components
-import BankFileUploadStep from '@/components/import/BankFileUploadStep'
-import BankFilePreviewStep from '@/components/import/BankFilePreviewStep'
-import BankFileColumnMappingStep from '@/components/import/BankFileColumnMappingStep'
-import BankFileConfirmStep from '@/components/import/BankFileConfirmStep'
-import BankFileResultStep from '@/components/import/BankFileResultStep'
-
-// Opening balance import components
-import OpeningBalanceUploadStep from '@/components/import/OpeningBalanceUploadStep'
-import OpeningBalanceColumnMappingStep from '@/components/import/OpeningBalanceColumnMappingStep'
-import OpeningBalanceEditStep from '@/components/import/OpeningBalanceEditStep'
-import OpeningBalancePeriodStep from '@/components/import/OpeningBalancePeriodStep'
-import OpeningBalanceResultStep from '@/components/import/OpeningBalanceResultStep'
 import type { OpeningBalanceParseResult, OpeningBalanceExecuteResult, DetectedColumns } from '@/lib/import/opening-balance/types'
 
 // Register import (customers/suppliers) components
-import RegisterUploadStep from '@/components/import/RegisterUploadStep'
 import RegisterColumnMappingStep, { type RegisterColumnSpec } from '@/components/import/RegisterColumnMappingStep'
-import CustomersEditStep from '@/components/import/CustomersEditStep'
-import SuppliersEditStep from '@/components/import/SuppliersEditStep'
-import RegisterResultStep, { type RegisterResult } from '@/components/import/RegisterResultStep'
+import type { RegisterResult } from '@/components/import/RegisterResultStep'
 import type {
   CustomerImportParseResult,
   AnnotatedCustomerRow,
@@ -50,13 +43,13 @@ import type {
   AnnotatedSupplierRow,
   DetectedSupplierColumns,
 } from '@/lib/import/suppliers/types'
+import type {
+  ArticleImportParseResult,
+  AnnotatedArticleRow,
+  DetectedArticleColumns,
+} from '@/lib/import/articles/types'
 
-// SIE import components
-import SIEUploadStep from '@/components/import/SIEUploadStep'
-import SIEPreviewStep from '@/components/import/SIEPreviewStep'
-import AccountMappingStep from '@/components/import/AccountMappingStep'
-import ImportReviewStep, { type ImportExecuteOptions } from '@/components/import/ImportReviewStep'
-import ImportResultStep from '@/components/import/ImportResultStep'
+import type { ImportExecuteOptions } from '@/components/import/ImportReviewStep'
 import { applyMappingOverride } from '@/lib/import/account-mapper'
 import type { BankFileParseResult, BankFileFormatId, GenericCSVColumnMapping } from '@/lib/import/bank-file/types'
 import type { IngestResult } from '@/lib/transactions/ingest'
@@ -79,6 +72,35 @@ const MigrationWizard = dynamic(
   () => import('@/components/extensions/general/ArcimMigrationWorkspace'),
   { ssr: false, loading: () => <div className="flex items-center gap-3 text-muted-foreground p-6"><Loader2 className="h-5 w-5 animate-spin" />Laddar migreringsverktyg...</div> }
 )
+
+function ImportStepLoading() {
+  return (
+    <div className="flex min-h-48 items-center justify-center" role="status">
+      <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+    </div>
+  )
+}
+
+const BankFileUploadStep = dynamic(() => import('@/components/import/BankFileUploadStep'), { loading: ImportStepLoading })
+const BankFilePreviewStep = dynamic(() => import('@/components/import/BankFilePreviewStep'), { loading: ImportStepLoading })
+const BankFileColumnMappingStep = dynamic(() => import('@/components/import/BankFileColumnMappingStep'), { loading: ImportStepLoading })
+const BankFileConfirmStep = dynamic(() => import('@/components/import/BankFileConfirmStep'), { loading: ImportStepLoading })
+const BankFileResultStep = dynamic(() => import('@/components/import/BankFileResultStep'), { loading: ImportStepLoading })
+const OpeningBalanceUploadStep = dynamic(() => import('@/components/import/OpeningBalanceUploadStep'), { loading: ImportStepLoading })
+const OpeningBalanceColumnMappingStep = dynamic(() => import('@/components/import/OpeningBalanceColumnMappingStep'), { loading: ImportStepLoading })
+const OpeningBalanceEditStep = dynamic(() => import('@/components/import/OpeningBalanceEditStep'), { loading: ImportStepLoading })
+const OpeningBalancePeriodStep = dynamic(() => import('@/components/import/OpeningBalancePeriodStep'), { loading: ImportStepLoading })
+const OpeningBalanceResultStep = dynamic(() => import('@/components/import/OpeningBalanceResultStep'), { loading: ImportStepLoading })
+const RegisterUploadStep = dynamic(() => import('@/components/import/RegisterUploadStep'), { loading: ImportStepLoading })
+const CustomersEditStep = dynamic(() => import('@/components/import/CustomersEditStep'), { loading: ImportStepLoading })
+const SuppliersEditStep = dynamic(() => import('@/components/import/SuppliersEditStep'), { loading: ImportStepLoading })
+const ArticlesEditStep = dynamic(() => import('@/components/import/ArticlesEditStep'), { loading: ImportStepLoading })
+const RegisterResultStep = dynamic(() => import('@/components/import/RegisterResultStep'), { loading: ImportStepLoading })
+const SIEUploadStep = dynamic(() => import('@/components/import/SIEUploadStep'), { loading: ImportStepLoading })
+const SIEPreviewStep = dynamic(() => import('@/components/import/SIEPreviewStep'), { loading: ImportStepLoading })
+const AccountMappingStep = dynamic(() => import('@/components/import/AccountMappingStep'), { loading: ImportStepLoading })
+const ImportReviewStep = dynamic(() => import('@/components/import/ImportReviewStep'), { loading: ImportStepLoading })
+const ImportResultStep = dynamic(() => import('@/components/import/ImportResultStep'), { loading: ImportStepLoading })
 
 // ============================================================
 // Bank File Import Wizard Steps
@@ -118,7 +140,7 @@ function BankFileImportWizard() {
   // Import result
   const [ingestResult, setIngestResult] = useState<IngestResult | null>(null)
 
-  // Active PSD2 connections — drives an overlap warning so users don't
+  // Active PSD2 connections: drives an overlap warning so users don't
   // accidentally upload a CSV covering periods we already sync nightly.
   const [activePsd2Banks, setActivePsd2Banks] = useState<string[]>([])
   useEffect(() => {
@@ -179,7 +201,7 @@ function BankFileImportWizard() {
                 'Exportera en ny fil från banken om du vill lägga till fler transaktioner.'
             )
           } else {
-            setBankError(err.message || 'Kunde inte läsa filen')
+            setBankError(getErrorMessage(err) || 'Kunde inte läsa filen')
           }
         } else {
           setBankError(typeof err === 'string' ? err : 'Kunde inte läsa filen')
@@ -199,7 +221,7 @@ function BankFileImportWizard() {
 
       const txCount = data.data.parse_result.transactions.length
       if (data.data.parse_result.format === 'generic_csv') {
-        // Auto-detect failed or user picked "Annan CSV" — always route to manual column mapping.
+        // Auto-detect failed or user picked "Annan CSV": always route to manual column mapping.
         // Default mapping rarely matches, so advance regardless of tx count.
         setBankStep('column_mapping')
       } else if (txCount > 0) {
@@ -209,11 +231,11 @@ function BankFileImportWizard() {
           description: `${txCount} transaktioner hittades`,
         })
       } else {
-        // Format detected but no transactions parsed — parser couldn't extract rows
+        // Format detected but no transactions parsed: parser couldn't extract rows
         setBankError('Filen kunde läsas men inga transaktioner hittades. Kontrollera att filen innehåller transaktionsdata och inte bara rubriker.')
       }
     } catch (err) {
-      setBankError(err instanceof Error ? err.message : 'Kunde inte läsa filen')
+      setBankError(err instanceof Error ? getErrorMessage(err) : 'Kunde inte läsa filen')
     } finally {
       setBankIsLoading(false)
     }
@@ -249,7 +271,10 @@ function BankFileImportWizard() {
       const data = await res.json()
 
       if (!res.ok) {
-        setBankError(data.error || 'Importen misslyckades')
+        // Map the parsed body plus the status: on the thrown-error path
+        // `data.error` is the canonical envelope OBJECT (withRouteContext),
+        // which must never be stored into a rendered string state.
+        setBankError(getErrorMessage(data, { statusCode: res.status }))
         return
       }
 
@@ -261,7 +286,7 @@ function BankFileImportWizard() {
         description: `${data.data.imported} transaktioner importerades`,
       })
     } catch (err) {
-      setBankError(err instanceof Error ? err.message : 'Importen misslyckades')
+      setBankError(err instanceof Error ? getErrorMessage(err) : 'Importen misslyckades')
     } finally {
       setBankIsLoading(false)
     }
@@ -285,10 +310,10 @@ function BankFileImportWizard() {
       {/* Status chip for at-a-glance "auto-sync is healthy / stale / needs attention" */}
       <BankSyncStatusChip />
 
-      {/* Overlap warning — active PSD2 means file import will likely create
+      {/* Overlap warning: active PSD2 means file import will likely create
           duplicates of transactions the nightly sync already covers. */}
       {activePsd2Banks.length > 0 && (
-        <div className="flex items-start gap-3 rounded-lg border border-warning/30 bg-warning/5 p-4">
+        <div className="flex items-start gap-3 rounded-lg border border-border bg-muted/30 p-4">
           <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-warning" />
           <div className="flex-1 text-sm">
             <p className="font-medium">
@@ -492,6 +517,8 @@ function SIEImportWizard() {
         closingBalances: [],
         resultBalances: [],
         vouchers: [],
+        dimensions: [],
+        dimensionValues: [],
         issues: data.parsed.issues,
         stats: data.parsed.stats,
       })
@@ -516,7 +543,7 @@ function SIEImportWizard() {
       const isNetworkError = err instanceof TypeError && (err.message === 'Failed to fetch' || err.message.includes('NetworkError'))
       const message = isNetworkError
         ? 'Kunde inte nå servern. Kontrollera din internetanslutning och försök igen.'
-        : err instanceof Error ? err.message : 'Ett oväntat fel uppstod.'
+        : getErrorMessage(err)
       setErrorType(isNetworkError ? 'network' : 'parse')
       setError(message)
       toast({ title: isNetworkError ? 'Anslutningsfel' : 'Ett fel uppstod', description: message, variant: 'destructive' })
@@ -669,7 +696,7 @@ function SIEImportWizard() {
         setBasAccounts(accountsData.data || [])
       }
     } catch (err) {
-      toast({ title: 'Kunde inte skapa konton', description: err instanceof Error ? err.message : 'Försök igen.', variant: 'destructive' })
+      toast({ title: 'Kunde inte skapa konton', description: err instanceof Error ? getErrorMessage(err) : 'Försök igen.', variant: 'destructive' })
     } finally {
       setIsCreatingAccounts(false)
     }
@@ -731,7 +758,7 @@ function SIEImportWizard() {
       const isNetworkError = err instanceof TypeError && (err.message === 'Failed to fetch' || err.message.includes('NetworkError'))
       const msg = isNetworkError
         ? 'Tappade anslutningen till servern under importen. Kontrollera din internetanslutning och se om importen genomfördes under Bokföring.'
-        : err instanceof Error ? err.message : 'Ett oväntat fel uppstod.'
+        : getErrorMessage(err)
       setError(msg)
       toast({ title: 'Import avbröts', description: msg, variant: 'destructive' })
     } finally {
@@ -807,10 +834,13 @@ const OB_STEP_LABELS: Record<OpeningBalanceStep, string> = {
 
 function OpeningBalanceFlow() {
   const { toast } = useToast()
+  const { dialogProps, confirm } = useDestructiveConfirm()
+  const router = useRouter()
 
   const [obStep, setObStep] = useState<OpeningBalanceStep>('upload')
   const [obIsLoading, setObIsLoading] = useState(false)
   const [obError, setObError] = useState<string | null>(null)
+  const [obBankFormatHint, setObBankFormatHint] = useState<string | null>(null)
   const [obFile, setObFile] = useState<File | null>(null)
   const [parseResult, setParseResult] = useState<OpeningBalanceParseResult | null>(null)
   const [editedRows, setEditedRows] = useState<{
@@ -819,7 +849,7 @@ function OpeningBalanceFlow() {
   }[]>([])
   const [executeResult, setExecuteResult] = useState<OpeningBalanceExecuteResult | null>(null)
 
-  // Determine steps — skip column mapping if confidence >= 0.8
+  // Determine steps: skip column mapping if confidence >= 0.8
   const needsMapping = parseResult && parseResult.detected_columns.confidence < 0.8
   const steps: OpeningBalanceStep[] = needsMapping
     ? ['upload', 'column_mapping', 'edit', 'period', 'result']
@@ -829,6 +859,7 @@ function OpeningBalanceFlow() {
 
   const handleFileSelect = useCallback(async (file: File) => {
     setObError(null)
+    setObBankFormatHint(null)
     setObIsLoading(true)
     setObFile(file)
 
@@ -844,7 +875,9 @@ function OpeningBalanceFlow() {
       const data = await res.json()
 
       if (!res.ok) {
-        setObError(data.error || 'Kunde inte läsa filen')
+        // Map the parsed body plus the status, never render `data.error` raw:
+        // the thrown-error path answers with the canonical envelope OBJECT.
+        setObError(getErrorMessage(data, { statusCode: res.status }))
         return
       }
 
@@ -852,7 +885,13 @@ function OpeningBalanceFlow() {
       setParseResult(result)
 
       if (result.rows.length === 0) {
-        setObError('Inga konton med belopp hittades i filen. Kontrollera att filen innehåller kontonummer och belopp.')
+        if (result.detected_bank_format) {
+          // The file is a bank statement uploaded to the wrong importer (#918)
+          setObBankFormatHint(result.detected_bank_format)
+          setObError(`Filen ser ut som ett kontoutdrag från ${result.detected_bank_format}, inte ingående balanser. Kontoutdrag importeras under "Banktransaktioner".`)
+        } else {
+          setObError('Inga konton med belopp hittades i filen. Kontrollera att filen innehåller kontonummer och belopp.')
+        }
         return
       }
 
@@ -868,7 +907,7 @@ function OpeningBalanceFlow() {
         setObStep('edit')
       }
     } catch (err) {
-      setObError(err instanceof Error ? err.message : 'Kunde inte läsa filen')
+      setObError(err instanceof Error ? getErrorMessage(err) : 'Kunde inte läsa filen')
     } finally {
       setObIsLoading(false)
     }
@@ -893,14 +932,14 @@ function OpeningBalanceFlow() {
       const data = await res.json()
 
       if (!res.ok) {
-        setObError(data.error || 'Kunde inte läsa filen med de valda kolumnerna')
+        setObError(getErrorMessage(data, { statusCode: res.status }))
         return
       }
 
       setParseResult(data.data)
       setObStep('edit')
     } catch (err) {
-      setObError(err instanceof Error ? err.message : 'Kunde inte läsa filen')
+      setObError(err instanceof Error ? getErrorMessage(err) : 'Kunde inte läsa filen')
     } finally {
       setObIsLoading(false)
     }
@@ -911,12 +950,27 @@ function OpeningBalanceFlow() {
     setObStep('period')
   }, [])
 
-  const handleExecute = useCallback(async (fiscalPeriodId: string) => {
+  const handleExecute = useCallback(async (fiscalPeriodId: string, replace: boolean) => {
+    if (replace) {
+      const ok = await confirm({
+        title: 'Ersätt ingående balanser?',
+        description:
+          'Den befintliga IB-verifikationen makuleras (stornas) och en ny bokförs med beloppen du angett. Detta går inte att ångra automatiskt.',
+        confirmLabel: 'Ersätt',
+        variant: 'warning',
+      })
+      if (!ok) return
+    }
+
     setObIsLoading(true)
     setObError(null)
 
+    const endpoint = replace
+      ? '/api/import/opening-balance/correct'
+      : '/api/import/opening-balance/execute'
+
     try {
-      const res = await fetch('/api/import/opening-balance/execute', {
+      const res = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -932,11 +986,7 @@ function OpeningBalanceFlow() {
       const data = await res.json()
 
       if (!res.ok) {
-        if (res.status === 409) {
-          setObError(data.error || 'Perioden har redan ingående balanser')
-        } else {
-          setObError(data.error || 'Importen misslyckades')
-        }
+        setObError(getErrorMessage(data))
         return
       }
 
@@ -945,16 +995,16 @@ function OpeningBalanceFlow() {
 
       if (data.data.success) {
         toast({
-          title: 'Ingående balanser bokförda',
+          title: replace ? 'Ingående balanser korrigerade' : 'Ingående balanser bokförda',
           description: `${data.data.lines_created} kontorader skapades`,
         })
       }
     } catch (err) {
-      setObError(err instanceof Error ? err.message : 'Importen misslyckades')
+      setObError(err instanceof Error ? getErrorMessage(err) : 'Importen misslyckades')
     } finally {
       setObIsLoading(false)
     }
-  }, [editedRows, toast])
+  }, [editedRows, toast, confirm])
 
   const handleNewImport = () => {
     setObStep('upload')
@@ -963,6 +1013,7 @@ function OpeningBalanceFlow() {
     setEditedRows([])
     setExecuteResult(null)
     setObError(null)
+    setObBankFormatHint(null)
   }
 
   return (
@@ -998,6 +1049,11 @@ function OpeningBalanceFlow() {
           onFileSelect={handleFileSelect}
           isLoading={obIsLoading}
           error={obError}
+          errorAction={
+            obBankFormatHint
+              ? { label: 'Importera banktransaktioner', onClick: () => router.push('/import?mode=bank') }
+              : undefined
+          }
         />
       )}
 
@@ -1041,6 +1097,8 @@ function OpeningBalanceFlow() {
           onNewImport={handleNewImport}
         />
       )}
+
+      <DestructiveConfirmDialog {...dialogProps} />
     </div>
   )
 }
@@ -1119,7 +1177,7 @@ function CustomersFlow() {
       const data = await res.json()
 
       if (!res.ok) {
-        setError(data.error?.message_sv || data.error?.message || data.error || 'Kunde inte läsa filen')
+        setError(data.error?.message_sv || getErrorMessage(data.error) || data.error || 'Kunde inte läsa filen')
         return
       }
 
@@ -1138,7 +1196,7 @@ function CustomersFlow() {
 
       setStep(result.detected_columns.confidence < 0.8 ? 'column_mapping' : 'edit')
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Kunde inte läsa filen')
+      setError(err instanceof Error ? getErrorMessage(err) : 'Kunde inte läsa filen')
     } finally {
       setIsLoading(false)
     }
@@ -1180,14 +1238,14 @@ function CustomersFlow() {
       const data = await res.json()
 
       if (!res.ok) {
-        setError(data.error?.message_sv || data.error?.message || 'Kunde inte tolka filen med de valda kolumnerna')
+        setError(data.error?.message_sv || getErrorMessage(data.error) || 'Kunde inte tolka filen med de valda kolumnerna')
         return
       }
 
       setParseResult(data.data)
       setStep('edit')
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Kunde inte läsa filen')
+      setError(err instanceof Error ? getErrorMessage(err) : 'Kunde inte läsa filen')
     } finally {
       setIsLoading(false)
     }
@@ -1212,7 +1270,7 @@ function CustomersFlow() {
       const data = await res.json()
 
       if (!res.ok) {
-        setError(data.error?.message_sv || data.error?.message || 'Importen misslyckades')
+        setError(data.error?.message_sv || getErrorMessage(data.error) || 'Importen misslyckades')
         return
       }
 
@@ -1226,7 +1284,7 @@ function CustomersFlow() {
         variant: r.success ? 'default' : 'destructive',
       })
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Importen misslyckades')
+      setError(err instanceof Error ? getErrorMessage(err) : 'Importen misslyckades')
     } finally {
       setIsLoading(false)
     }
@@ -1370,7 +1428,7 @@ function SuppliersFlow() {
       const data = await res.json()
 
       if (!res.ok) {
-        setError(data.error?.message_sv || data.error?.message || data.error || 'Kunde inte läsa filen')
+        setError(data.error?.message_sv || getErrorMessage(data.error) || data.error || 'Kunde inte läsa filen')
         return
       }
 
@@ -1389,7 +1447,7 @@ function SuppliersFlow() {
 
       setStep(result.detected_columns.confidence < 0.8 ? 'column_mapping' : 'edit')
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Kunde inte läsa filen')
+      setError(err instanceof Error ? getErrorMessage(err) : 'Kunde inte läsa filen')
     } finally {
       setIsLoading(false)
     }
@@ -1437,14 +1495,14 @@ function SuppliersFlow() {
       const data = await res.json()
 
       if (!res.ok) {
-        setError(data.error?.message_sv || data.error?.message || 'Kunde inte tolka filen')
+        setError(data.error?.message_sv || getErrorMessage(data.error) || 'Kunde inte tolka filen')
         return
       }
 
       setParseResult(data.data)
       setStep('edit')
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Kunde inte läsa filen')
+      setError(err instanceof Error ? getErrorMessage(err) : 'Kunde inte läsa filen')
     } finally {
       setIsLoading(false)
     }
@@ -1469,7 +1527,7 @@ function SuppliersFlow() {
       const data = await res.json()
 
       if (!res.ok) {
-        setError(data.error?.message_sv || data.error?.message || 'Importen misslyckades')
+        setError(data.error?.message_sv || getErrorMessage(data.error) || 'Importen misslyckades')
         return
       }
 
@@ -1483,7 +1541,7 @@ function SuppliersFlow() {
         variant: r.success ? 'default' : 'destructive',
       })
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Importen misslyckades')
+      setError(err instanceof Error ? getErrorMessage(err) : 'Importen misslyckades')
     } finally {
       setIsLoading(false)
     }
@@ -1569,15 +1627,261 @@ function SuppliersFlow() {
 }
 
 // ============================================================
-// CSV/Excel Data Import Wizard — entity selector + sub-flow
+// Articles Flow (entity = "articles" inside CSVDataImportWizard)
 // ============================================================
 
-type CSVDataEntity = 'opening_balance' | 'customers' | 'suppliers'
+const ARTICLE_COLUMN_SPECS: RegisterColumnSpec<keyof DetectedArticleColumns>[] = [
+  { key: 'name_col', label: 'Benämning', required: true },
+  { key: 'article_number_col', label: 'Artikelnummer', required: false },
+  { key: 'type_col', label: 'Typ (vara/tjänst)', required: false },
+  { key: 'unit_col', label: 'Enhet', required: false },
+  { key: 'price_col', label: 'Pris exkl moms', required: false },
+  { key: 'currency_col', label: 'Valuta', required: false },
+  { key: 'vat_rate_col', label: 'Moms (%)', required: false },
+  { key: 'revenue_account_col', label: 'Försäljningskonto', required: false },
+  { key: 'cost_price_col', label: 'Inköpspris', required: false },
+  { key: 'ean_col', label: 'EAN', required: false },
+  { key: 'housework_type_col', label: 'ROT/RUT-arbetstyp', required: false },
+  { key: 'name_en_col', label: 'Benämning (engelska)', required: false },
+  { key: 'notes_col', label: 'Anteckning', required: false },
+]
+
+function ArticlesFlow() {
+  const { toast } = useToast()
+
+  const [step, setStep] = useState<RegisterStep>('upload')
+  const [isLoading, setIsLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [file, setFile] = useState<File | null>(null)
+  const [parseResult, setParseResult] = useState<ArticleImportParseResult | null>(null)
+  const [executeResult, setExecuteResult] = useState<RegisterResult | null>(null)
+
+  const needsMapping = parseResult && parseResult.detected_columns.confidence < 0.8
+  const steps: RegisterStep[] = needsMapping
+    ? ['upload', 'column_mapping', 'edit', 'result']
+    : ['upload', 'edit', 'result']
+  const currentStepIndex = steps.indexOf(step)
+  const progress = ((currentStepIndex + 1) / steps.length) * 100
+
+  const handleFileSelect = useCallback(async (selectedFile: File) => {
+    setError(null)
+    setIsLoading(true)
+    setFile(selectedFile)
+
+    try {
+      const formData = new FormData()
+      formData.append('file', selectedFile)
+
+      const res = await fetch('/api/import/articles/parse', {
+        method: 'POST',
+        body: formData,
+      })
+      const data = await res.json()
+
+      if (!res.ok) {
+        setError(data.error?.message_sv || getErrorMessage(data.error) || data.error || 'Kunde inte läsa filen')
+        return
+      }
+
+      const result = data.data as ArticleImportParseResult
+      setParseResult(result)
+
+      if (result.rows.length === 0) {
+        setError('Inga giltiga artiklar hittades. Kontrollera att filen innehåller en benämningskolumn.')
+        return
+      }
+
+      toast({
+        title: 'Fil analyserad',
+        description: `${result.rows.length} artiklar hittades${result.duplicate_count > 0 ? ` (${result.duplicate_count} matchar befintliga)` : ''}`,
+      })
+
+      setStep(result.detected_columns.confidence < 0.8 ? 'column_mapping' : 'edit')
+    } catch (err) {
+      setError(err instanceof Error ? getErrorMessage(err) : 'Kunde inte läsa filen')
+    } finally {
+      setIsLoading(false)
+    }
+  }, [toast])
+
+  const handleColumnMappingConfirm = useCallback(async (
+    mapping: Record<keyof DetectedArticleColumns, number | null>,
+  ) => {
+    if (!file) return
+    setIsLoading(true)
+    setError(null)
+
+    try {
+      const overrides: DetectedArticleColumns = {
+        name_col: mapping.name_col ?? 0,
+        article_number_col: mapping.article_number_col,
+        name_en_col: mapping.name_en_col,
+        type_col: mapping.type_col,
+        unit_col: mapping.unit_col,
+        price_col: mapping.price_col,
+        currency_col: mapping.currency_col,
+        vat_rate_col: mapping.vat_rate_col,
+        revenue_account_col: mapping.revenue_account_col,
+        cost_price_col: mapping.cost_price_col,
+        ean_col: mapping.ean_col,
+        housework_type_col: mapping.housework_type_col,
+        notes_col: mapping.notes_col,
+        confidence: 1,
+      }
+
+      const formData = new FormData()
+      formData.append('file', file)
+      formData.append('column_overrides', JSON.stringify(overrides))
+
+      const res = await fetch('/api/import/articles/parse', {
+        method: 'POST',
+        body: formData,
+      })
+      const data = await res.json()
+
+      if (!res.ok) {
+        setError(data.error?.message_sv || getErrorMessage(data.error) || 'Kunde inte tolka filen med de valda kolumnerna')
+        return
+      }
+
+      setParseResult(data.data)
+      setStep('edit')
+    } catch (err) {
+      setError(err instanceof Error ? getErrorMessage(err) : 'Kunde inte läsa filen')
+    } finally {
+      setIsLoading(false)
+    }
+  }, [file])
+
+  const handleExecute = useCallback(async (
+    rows: AnnotatedArticleRow[],
+    updateDuplicates: boolean,
+  ) => {
+    setIsLoading(true)
+    setError(null)
+
+    try {
+      const res = await fetch('/api/import/articles/execute', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          rows: rows.map(({ duplicate_match: _dup, is_valid: _v, validation_errors: _ve, vat_rate_adjusted: _vra, ...rest }) => rest),
+          update_duplicates: updateDuplicates,
+        }),
+      })
+      const data = await res.json()
+
+      if (!res.ok) {
+        setError(data.error?.message_sv || getErrorMessage(data.error) || 'Importen misslyckades')
+        return
+      }
+
+      setExecuteResult(data.data as RegisterResult)
+      setStep('result')
+
+      const r = data.data as RegisterResult
+      toast({
+        title: r.success ? 'Artiklar importerade' : 'Importen slutfördes med fel',
+        description: `${r.created} skapade, ${r.updated} uppdaterade, ${r.skipped} hoppade över${r.failed > 0 ? `, ${r.failed} misslyckades` : ''}`,
+        variant: r.success ? 'default' : 'destructive',
+      })
+    } catch (err) {
+      setError(err instanceof Error ? getErrorMessage(err) : 'Importen misslyckades')
+    } finally {
+      setIsLoading(false)
+    }
+  }, [toast])
+
+  const handleNewImport = () => {
+    setStep('upload')
+    setFile(null)
+    setParseResult(null)
+    setExecuteResult(null)
+    setError(null)
+  }
+
+  const initialMapping = parseResult
+    ? columnsToMapping<keyof DetectedArticleColumns>(parseResult.detected_columns as unknown as { [key: string]: unknown }, ARTICLE_COLUMN_SPECS)
+    : null
+
+  return (
+    <div className="space-y-6">
+      <Card>
+        <CardContent className="pt-6">
+          <div className="space-y-2">
+            <div className="flex justify-between text-sm">
+              <span className="sm:hidden text-primary font-medium">
+                Steg {currentStepIndex + 1}/{steps.length}: {REGISTER_STEP_LABELS[step]}
+              </span>
+              {steps.map((s, i) => (
+                <span
+                  key={s}
+                  className={cn(
+                    'hidden sm:inline',
+                    i <= currentStepIndex ? 'text-primary font-medium' : 'text-muted-foreground',
+                  )}
+                >
+                  {REGISTER_STEP_LABELS[s]}
+                </span>
+              ))}
+            </div>
+            <Progress value={progress} className="h-2" />
+          </div>
+        </CardContent>
+      </Card>
+
+      {step === 'upload' && (
+        <RegisterUploadStep
+          entity="articles"
+          onFileSelect={handleFileSelect}
+          isLoading={isLoading}
+          error={error}
+        />
+      )}
+
+      {step === 'column_mapping' && parseResult && initialMapping && (
+        <RegisterColumnMappingStep<keyof DetectedArticleColumns>
+          headers={parseResult.headers}
+          previewRows={parseResult.preview_rows}
+          specs={ARTICLE_COLUMN_SPECS}
+          initial={initialMapping}
+          onConfirm={handleColumnMappingConfirm}
+          onBack={() => setStep('upload')}
+        />
+      )}
+
+      {step === 'edit' && parseResult && (
+        <ArticlesEditStep
+          rows={parseResult.rows}
+          onExecute={handleExecute}
+          onBack={() => setStep(needsMapping ? 'column_mapping' : 'upload')}
+          isLoading={isLoading}
+          error={error}
+        />
+      )}
+
+      {step === 'result' && executeResult && (
+        <RegisterResultStep
+          entity="articles"
+          result={executeResult}
+          onNewImport={handleNewImport}
+        />
+      )}
+    </div>
+  )
+}
+
+// ============================================================
+// CSV/Excel Data Import Wizard, entity selector + sub-flow
+// ============================================================
+
+type CSVDataEntity = 'opening_balance' | 'customers' | 'suppliers' | 'articles'
 
 const ENTITY_OPTIONS: { value: CSVDataEntity; label: string }[] = [
   { value: 'opening_balance', label: 'Ingående balanser' },
   { value: 'customers', label: 'Kunder' },
   { value: 'suppliers', label: 'Leverantörer' },
+  { value: 'articles', label: 'Artiklar' },
 ]
 
 function CSVDataImportWizard() {
@@ -1595,7 +1899,7 @@ function CSVDataImportWizard() {
                   aria-hidden
                   className="pointer-events-none absolute -inset-[3px] h-[calc(100%+6px)] w-[calc(100%+6px)] overflow-visible"
                 >
-                  <motion.rect
+                  <rect
                     x="1"
                     y="1"
                     width="calc(100% - 2px)"
@@ -1606,9 +1910,7 @@ function CSVDataImportWizard() {
                     stroke="currentColor"
                     strokeWidth="1.25"
                     strokeDasharray="3 4"
-                    className="text-foreground/45"
-                    animate={{ strokeDashoffset: [0, -14] }}
-                    transition={{ duration: 1.2, repeat: Infinity, ease: 'linear' }}
+                    className="animate-marching-ants text-foreground/45"
                   />
                 </svg>
               )}
@@ -1633,243 +1935,68 @@ function CSVDataImportWizard() {
       {entity === 'opening_balance' && <OpeningBalanceFlow key="ob-flow" />}
       {entity === 'customers' && <CustomersFlow key="cust-flow" />}
       {entity === 'suppliers' && <SuppliersFlow key="supp-flow" />}
+      {entity === 'articles' && <ArticlesFlow key="art-flow" />}
     </div>
   )
 }
 
 // ============================================================
-// PSD2 Bank Connection (inline, from Enable Banking extension)
+// Banking (PSD2) connect UI
 // ============================================================
+// Provided by the enable-banking extension and loaded through the settings
+// panel registry (dynamic import), so this core page never imports from
+// @/extensions directly. The shared panel renders every connection state
+// (pending account selection, active, expiring, and expired/error with the
+// reconnect entry point), which the old inline wizard here did not.
+const BankingPanel = getSettingsPanel('enable-banking')
 
-function PSD2ConnectWizard() {
-  const { toast } = useToast()
-  const supabase = createClient()
-  const { dialogProps, confirm } = useDestructiveConfirm()
-  const { company } = useCompany()
-
-  const [bankConnections, setBankConnections] = useState<BankConnection[]>([])
-  const [syncingConnectionId, setSyncingConnectionId] = useState<string | null>(null)
-  const [isConnecting, setIsConnecting] = useState(false)
-  const [connectingBankName, setConnectingBankName] = useState<string | null>(null)
-  const [isLoading, setIsLoading] = useState(true)
-
-  useEffect(() => {
-    fetchConnections()
-  }, [])
-
-  async function fetchConnections() {
-    setIsLoading(true)
-    const { data: { user } } = await supabase.auth.getUser()
-    if (!user) return
-
-    if (!company) return
-
-    const { data: connections } = await supabase
-      .from('bank_connections')
-      .select('*')
-      .eq('company_id', company.id)
-      .order('created_at', { ascending: false })
-
-    setBankConnections(connections || [])
-    setIsLoading(false)
-  }
-
-  async function handleConnectBank(bank: Bank) {
-    setIsConnecting(true)
-    setConnectingBankName(bank.name)
-
-    try {
-      const response = await fetch('/api/extensions/ext/enable-banking/connect', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ aspsp_name: bank.name, aspsp_country: bank.country }),
-      })
-
-      const data = await response.json()
-
-      if (!response.ok) {
-        throw new Error(data.error)
-      }
-
-      window.location.href = data.authorization_url
-    } catch (error) {
-      toast({
-        title: 'Kunde inte ansluta bank',
-        description: error instanceof Error ? error.message : 'Försök igen.',
-        variant: 'destructive',
-      })
-      setIsConnecting(false)
-      setConnectingBankName(null)
-    }
-  }
-
-  async function handleSyncTransactions(connectionId: string) {
-    setSyncingConnectionId(connectionId)
-
-    try {
-      const response = await fetch('/api/extensions/ext/enable-banking/sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ connection_id: connectionId }),
-      })
-
-      const data = await response.json()
-
-      if (!response.ok) {
-        throw new Error(data.error)
-      }
-
-      toast({
-        title: 'Synkronisering klar',
-        description: `${data.imported} nya transaktioner importerade`,
-      })
-
-      fetchConnections()
-    } catch (error) {
-      toast({
-        title: 'Synkronisering misslyckades',
-        description: error instanceof Error ? error.message : 'Försök igen.',
-        variant: 'destructive',
-      })
-    }
-
-    setSyncingConnectionId(null)
-  }
-
-  async function handleDisconnectBank(connectionId: string) {
-    const ok = await confirm({
-      title: 'Koppla bort bank?',
-      description: 'PSD2-samtycket kommer återkallas. Befintliga transaktioner påverkas inte.',
-      confirmLabel: 'Koppla bort',
-      variant: 'warning',
-    })
-    if (!ok) return
-
-    try {
-      const response = await fetch('/api/extensions/ext/enable-banking/disconnect', {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ connection_id: connectionId }),
-      })
-
-      if (!response.ok) {
-        const data = await response.json()
-        throw new Error(data.error || 'Disconnect failed')
-      }
-
-      toast({
-        title: 'Bank bortkopplad',
-        description: 'Bankanslutningen och PSD2-samtycket har återkallats',
-      })
-      fetchConnections()
-    } catch (error) {
-      toast({
-        title: 'Kunde inte koppla bort bank',
-        description: error instanceof Error ? error.message : 'Försök igen.',
-        variant: 'destructive',
-      })
-    }
-  }
-
-  if (isLoading) {
-    return (
-      <div className="flex items-center justify-center h-32">
-        <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
-      </div>
-    )
-  }
-
-  const activeConnections = bankConnections.filter((c) => c.status === 'active')
-
-  return (
-    <div className="space-y-6">
-      <DestructiveConfirmDialog {...dialogProps} />
-
-      {/* Connected banks */}
-      {activeConnections.length > 0 && (
-        <Card>
-          <CardHeader>
-            <CardTitle>Anslutna banker</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            {activeConnections.map((connection) => (
-              <BankConnectionStatus
-                key={connection.id}
-                connection={connection}
-                onSync={handleSyncTransactions}
-                onDisconnect={handleDisconnectBank}
-                isSyncing={syncingConnectionId === connection.id}
-              />
-            ))}
-          </CardContent>
-        </Card>
-      )}
-
-      {/* Connect new bank */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Anslut din bank</CardTitle>
-          <CardDescription>
-            Välj din bank nedan för att koppla ditt konto via PSD2. Transaktioner synkas automatiskt varje dag.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <BankSelector
-            onConnect={handleConnectBank}
-            isConnecting={isConnecting}
-            connectingBankName={connectingBankName}
-          />
-        </CardContent>
-      </Card>
-    </div>
-  )
-}
+// Same registry mechanism for the Stripe connect/sync surface: the feed of
+// payments, fees and payouts is an import source in the same category as the
+// PSD2 bank connection above.
+const StripePanel = getSettingsPanel('stripe')
 
 // ============================================================
 // Import Page with Selection Cards
 // ============================================================
 
-type ImportMode = null | 'psd2' | 'bank' | 'sie' | 'csv_data' | 'migration'
+type ImportMode = null | 'psd2' | 'stripe' | 'bank' | 'sie' | 'csv_data' | 'migration'
 
 export default function ImportPage() {
-  const { company } = useCompany()
+  const { isSandbox } = useCompany()
   const [mode, setMode] = useState<ImportMode>(null)
   const [view, setView] = useState<'import' | 'export'>('import')
+  const [sieDialogOpen, setSieDialogOpen] = useState(false)
+  const [cloudOpen, setCloudOpen] = useState(false)
   const [userId, setUserId] = useState('')
-  const [isSandbox, setIsSandbox] = useState(false)
   const [exportPeriodId, setExportPeriodId] = useState<string | null>(null)
   const [exportExcludeClosing, setExportExcludeClosing] = useState(true)
   const t = useTranslations('import')
   const router = useRouter()
   const hasCloudBackup = ENABLED_EXTENSION_IDS.has('cloud-backup')
+  const hasBankSync = useCapability(CAPABILITY.bank_sync)
 
-  // Fetch authenticated user ID and sandbox status
+  // Fetch authenticated user ID (used by the migration wizard)
   useEffect(() => {
     const supabase = createClient()
     supabase.auth.getUser().then(({ data: { user } }) => {
-      if (!user) return
-      setUserId(user.id)
-      if (!company) return
-      supabase
-        .from('company_settings')
-        .select('is_sandbox')
-        .eq('company_id', company.id)
-        .single()
-        .then(({ data }) => {
-          if (data?.is_sandbox) setIsSandbox(true)
-        })
+      if (user) setUserId(user.id)
     })
   }, [])
 
   // Sync mode + view from URL search params (reacts to client-side navigation changes)
   const searchParams = useSearchParams()
   useEffect(() => {
-    if (isSandbox) return
-    if (searchParams.get('migration')) {
+    // External imports (provider migration, PSD2 bank connection) need live
+    // third-party credentials, so their deep links are ignored in the sandbox.
+    // Manual file-import modes (bank file, CSV/Excel, SIE) stay reachable.
+    const allowedModes = isSandbox
+      ? ['bank', 'sie', 'csv_data']
+      : ['psd2', 'stripe', 'bank', 'sie', 'csv_data', 'migration']
+    if (!isSandbox && searchParams.get('migration')) {
       setMode('migration')
     } else {
       const modeParam = searchParams.get('mode')
-      if (modeParam && ['psd2', 'bank', 'sie', 'csv_data', 'migration'].includes(modeParam)) {
+      if (modeParam && allowedModes.includes(modeParam)) {
         setMode(modeParam as ImportMode)
       }
     }
@@ -1879,20 +2006,24 @@ export default function ImportPage() {
     }
   }, [isSandbox, searchParams])
 
-  // Hash-based deep links (#cloud-backup, #sie-export) → switch to export tab and scroll
+  // Hash-based deep links: both live on the export tab; #sie-export opens
+  // the SIE dialog, #cloud-backup expands the cloud panel and scrolls to it.
   useEffect(() => {
     if (typeof window === 'undefined') return
     const hash = window.location.hash
-    if (hash === '#cloud-backup' || hash === '#sie-export') {
+    if (hash === '#sie-export') {
       setView('export')
+      setSieDialogOpen(true)
+    } else if (hash === '#cloud-backup') {
+      setView('export')
+      setCloudOpen(true)
       setTimeout(() => {
         document.querySelector(hash)?.scrollIntoView({ block: 'start', behavior: 'smooth' })
-      }, 50)
+      }, 80)
     }
   }, [])
 
-  const handleViewChange = (next: string) => {
-    if (next !== 'import' && next !== 'export') return
+  const handleViewChange = (next: 'import' | 'export') => {
     setView(next)
     const params = new URLSearchParams(searchParams.toString())
     if (next === 'export') params.set('view', 'export')
@@ -1900,288 +2031,190 @@ export default function ImportPage() {
     const qs = params.toString()
     router.replace(qs ? `/import?${qs}` : '/import', { scroll: false })
   }
-  // Extensions are active if compiled in — no runtime toggle check needed
+  // Extensions are active if compiled in: no runtime toggle check needed
   const hasBankingExtension = ENABLED_EXTENSION_IDS.has('enable-banking')
   const hasMigrationExtension = ENABLED_EXTENSION_IDS.has('arcim-migration')
+  const hasStripeExtension = ENABLED_EXTENSION_IDS.has('stripe')
+  // Stripe is enabled everywhere (hosted + self-hosted); only the sandbox blocks it.
+  const stripeDisabled = isSandbox
 
   return (
-    <div className="space-y-6">
-      {/* Header */}
-      <div>
-        <h1 className="font-display text-2xl md:text-3xl font-medium tracking-tight">
-          {view === 'export' ? t('export_title') : t('title')}
-        </h1>
-        <p className="text-muted-foreground">
-          {view === 'export' ? t('export_subtitle') : t('subtitle')}
-        </p>
-      </div>
+    <div className="space-y-8">
+      <PageHeader
+        title={t('title')}
+        help={
+          <HelpPopover>
+            <p>{t('help_text')}</p>
+          </HelpPopover>
+        }
+      />
 
       {mode === null && (
         <>
-          {isSandbox && (
-            <div className="flex items-start gap-3 rounded-lg border border-border bg-muted/50 px-4 py-3">
-              <Info className="h-4 w-4 text-muted-foreground mt-0.5 shrink-0" />
-              <p className="text-sm text-muted-foreground">
-                {t('sandbox_disabled')}
-              </p>
+          {isSandbox && <AttnLine>{t('sandbox_disabled')}</AttnLine>}
+
+          {/* Importera / Exportera as separate tabs (house seg), like before */}
+          <div className="inline-flex shrink-0 gap-0.5 rounded-lg bg-muted/70 p-[3px]" role="tablist">
+            {(
+              [
+                { key: 'import', label: t('tab_import') },
+                { key: 'export', label: t('tab_export') },
+              ] as const
+            ).map(({ key, label }) => (
+              <button
+                key={key}
+                type="button"
+                role="tab"
+                aria-selected={view === key}
+                onClick={() => handleViewChange(key)}
+                className={`rounded-md px-3.5 py-[5px] text-[12.5px] transition-colors duration-150 ${
+                  view === key
+                    ? 'border border-border bg-card font-medium text-foreground'
+                    : 'text-muted-foreground hover:text-foreground'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {view === 'import' ? (
+            <div>
+              <div className="stagger-enter">
+                {hasBankingExtension && (
+                  <ImportRow
+                    title={t('psd2_title')}
+                    sub={t('psd2_description')}
+                    chip={
+                      hasBankSync ? (
+                        <Badge variant="success" className="font-normal">{t('psd2_recommended')}</Badge>
+                      ) : (
+                        <span className="rounded-full bg-secondary px-2 py-0.5 text-[11px] font-medium leading-none text-muted-foreground">
+                          {t('psd2_requires_subscription')}
+                        </span>
+                      )
+                    }
+                    chips={<LogoChip src="/logos/enable-banking-icon.png" name="Enable Banking" mono />}
+                    disabled={isSandbox}
+                    onClick={() => setMode('psd2')}
+                  />
+                )}
+                {hasStripeExtension && (
+                  <ImportRow
+                    title={t('stripe_title')}
+                    sub={t('stripe_description')}
+                    chips={<LogoChip src="/logos/stripeicon.jpeg" name="Stripe" />}
+                    disabled={stripeDisabled}
+                    onClick={() => setMode('stripe')}
+                  />
+                )}
+                {hasMigrationExtension && (
+                  <ImportRow
+                    title={t('migration_title')}
+                    sub={t('migration_description')}
+                    chips={
+                      <>
+                        <LogoChip src="/logos/fortnox.svg" name="Fortnox" />
+                        <LogoChip src="/logos/visma.jpeg" name="Visma" />
+                        <LogoChip src="/logos/bokio.png" name="Bokio" />
+                        <LogoChip src="/logos/bjornlunden.png" name="Björn Lundén" />
+                        <LogoChip src="/logos/Briox_logo.png" name="Briox" />
+                      </>
+                    }
+                    disabled={isSandbox}
+                    onClick={() => setMode('migration')}
+                  />
+                )}
+                <ImportRow
+                  title={t('bankfile_title')}
+                  sub={t('bankfile_description')}
+                  onClick={() => setMode('bank')}
+                />
+                <ImportRow
+                  title={t('csv_data_title')}
+                  sub={t('csv_data_description')}
+                  onClick={() => setMode('csv_data')}
+                />
+                <ImportRow
+                  title={t('sie_title')}
+                  sub={t('sie_description')}
+                  onClick={() => setMode('sie')}
+                />
+              </div>
+              <p className="mt-4 px-1 text-xs leading-5 text-muted-foreground">{t('pgnote')}</p>
+            </div>
+          ) : (
+            <div>
+              <div className="stagger-enter">
+                <ImportRow
+                  id="sie-export"
+                  title={t('export_sie_title')}
+                  sub={t('export_sie_description')}
+                  onClick={() => setSieDialogOpen(true)}
+                />
+                {hasCloudBackup && (
+                  <ImportRow
+                    title={t('cloud_row_title')}
+                    sub={t('cloud_row_description')}
+                    expanded={cloudOpen}
+                    onClick={() => setCloudOpen((v) => !v)}
+                  />
+                )}
+              </div>
+              {hasCloudBackup && cloudOpen && (
+                <div id="cloud-backup" className="mt-6 scroll-mt-24">
+                  <CloudBackupCard />
+                </div>
+              )}
             </div>
           )}
 
-          <Tabs value={view} onValueChange={handleViewChange}>
-            <TabsList className="grid w-full max-w-xs grid-cols-2">
-              <TabsTrigger value="import">{t('tab_import')}</TabsTrigger>
-              <TabsTrigger value="export">{t('tab_export')}</TabsTrigger>
-            </TabsList>
-
-            <TabsContent value="import" className="mt-6">
-              <div className="space-y-2">
-            {/* 1. Koppla bank */}
-            {hasBankingExtension && (
-              <div
-                role="button"
-                tabIndex={isSandbox ? -1 : 0}
-                aria-disabled={isSandbox}
-                className={cn(
-                  'group flex items-start gap-4 rounded-lg border bg-card p-5 transition-all',
-                  isSandbox
-                    ? 'opacity-50 cursor-not-allowed'
-                    : 'cursor-pointer hover:border-foreground/15 hover:shadow-[var(--shadow-sm)] active:scale-[0.998]'
-                )}
-                onClick={() => { if (!isSandbox) setMode('psd2') }}
-                onKeyDown={(e) => { if (!isSandbox && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); setMode('psd2') } }}
-              >
-                <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-foreground/[0.06]">
-                  <Landmark className="h-[18px] w-[18px] text-foreground/60" />
-                </div>
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2.5">
-                    <h3 className="text-[15px] font-semibold leading-tight">{t('psd2_title')}</h3>
-                    <span className="text-[11px] font-medium text-success bg-success/10 px-2 py-0.5 rounded-full leading-none">
-                      {t('psd2_recommended')}
-                    </span>
-                  </div>
-                  <p className="text-sm text-muted-foreground mt-1.5 leading-relaxed max-w-lg">
-                    {t('psd2_description')}
-                  </p>
-                </div>
-                <ChevronRight className="h-4 w-4 text-muted-foreground/40 shrink-0 mt-2.5 transition-transform duration-150 group-hover:translate-x-0.5 group-hover:text-muted-foreground" />
-              </div>
-            )}
-
-            {/* 2. Hämta från annat system */}
-            {hasMigrationExtension === true && (
-              <div
-                role="button"
-                tabIndex={isSandbox ? -1 : 0}
-                aria-disabled={isSandbox}
-                className={cn(
-                  'group rounded-lg border bg-card p-5 transition-all',
-                  isSandbox
-                    ? 'opacity-50 cursor-not-allowed'
-                    : 'cursor-pointer hover:border-foreground/15 hover:shadow-[var(--shadow-sm)] active:scale-[0.998]'
-                )}
-                onClick={() => { if (!isSandbox) setMode('migration') }}
-                onKeyDown={(e) => { if (!isSandbox && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); setMode('migration') } }}
-              >
-                <div className="flex items-start gap-4">
-                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-foreground/[0.06]">
-                    <ArrowRightLeft className="h-[18px] w-[18px] text-foreground/60" />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <h3 className="text-[15px] font-semibold leading-tight">{t('migration_title')}</h3>
-                    <p className="text-sm mt-1.5 leading-relaxed max-w-lg underline decoration-foreground/20 underline-offset-2 text-muted-foreground">
-                      {t('migration_description')}
-                    </p>
-                  </div>
-                  <ChevronRight className="h-4 w-4 text-muted-foreground/40 shrink-0 mt-2.5 transition-transform duration-150 group-hover:translate-x-0.5 group-hover:text-muted-foreground" />
-                </div>
-                <div className="flex flex-wrap gap-2 mt-3.5 ml-[52px]">
-                  {([
-                    { name: 'Fortnox', logo: '/logos/fortnox.svg' },
-                    { name: 'Visma', logo: '/logos/visma.jpeg' },
-                    { name: 'Bokio', logo: '/logos/bokio.png' },
-                    { name: 'Björn Lundén', logo: '/logos/bjornlunden.png' },
-                    { name: 'Briox', logo: '/logos/Briox_logo.png' },
-                  ] as const).map(provider => (
-                    <div key={provider.name} className="flex items-center gap-1.5 rounded border border-border/60 bg-muted/30 px-2 py-1">
-                      <img src={provider.logo} alt={provider.name} className="h-4 w-4 shrink-0 rounded-sm object-contain" />
-                      <span className="text-[11px] font-medium text-muted-foreground">{provider.name}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* 3. Banktransaktioner */}
-            <div
-              role="button"
-              tabIndex={isSandbox ? -1 : 0}
-              aria-disabled={isSandbox}
-              className={cn(
-                'group flex items-start gap-4 rounded-lg border bg-card p-5 transition-all',
-                isSandbox
-                  ? 'opacity-50 cursor-not-allowed'
-                  : 'cursor-pointer hover:border-foreground/15 hover:shadow-[var(--shadow-sm)] active:scale-[0.998]'
-              )}
-              onClick={() => { if (!isSandbox) setMode('bank') }}
-              onKeyDown={(e) => { if (!isSandbox && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); setMode('bank') } }}
-            >
-              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-foreground/[0.06]">
-                <ArrowLeftRight className="h-[18px] w-[18px] text-foreground/60" />
-              </div>
-              <div className="flex-1 min-w-0">
-                <h3 className="text-[15px] font-semibold leading-tight">{t('bankfile_title')}</h3>
-                <p className="text-sm text-muted-foreground mt-1.5 leading-relaxed max-w-lg">
-                  {t('bankfile_description')}
-                </p>
-                <div className="flex flex-wrap gap-1.5 mt-2.5">
-                  {['CSV', 'OFX', 'SEB', 'Swedbank', 'Nordea'].map(fmt => (
-                    <span key={fmt} className="text-[11px] text-muted-foreground/80 bg-muted/80 px-1.5 py-0.5 rounded leading-none">
-                      {fmt}
-                    </span>
-                  ))}
-                </div>
-              </div>
-              <ChevronRight className="h-4 w-4 text-muted-foreground/40 shrink-0 mt-2.5 transition-transform duration-150 group-hover:translate-x-0.5 group-hover:text-muted-foreground" />
-            </div>
-
-            {/* 4. CSV/Excel-data (ingående balanser, kunder, leverantörer) */}
-            <div
-              role="button"
-              tabIndex={isSandbox ? -1 : 0}
-              aria-disabled={isSandbox}
-              className={cn(
-                'group flex items-start gap-4 rounded-lg border bg-card p-5 transition-all',
-                isSandbox
-                  ? 'opacity-50 cursor-not-allowed'
-                  : 'cursor-pointer hover:border-foreground/15 hover:shadow-[var(--shadow-sm)] active:scale-[0.998]'
-              )}
-              onClick={() => { if (!isSandbox) setMode('csv_data') }}
-              onKeyDown={(e) => { if (!isSandbox && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); setMode('csv_data') } }}
-            >
-              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-foreground/[0.06]">
-                <FileSpreadsheet className="h-[18px] w-[18px] text-foreground/60" />
-              </div>
-              <div className="flex-1 min-w-0">
-                <h3 className="text-[15px] font-semibold leading-tight">{t('csv_data_title')}</h3>
-                <p className="text-sm text-muted-foreground mt-1.5 leading-relaxed max-w-lg">
-                  {t('csv_data_description')}
-                </p>
-                <div className="flex flex-wrap gap-1.5 mt-2.5">
-                  {[
-                    { key: 'XLSX', label: 'XLSX' },
-                    { key: 'CSV', label: 'CSV' },
-                    { key: 'opening_balances', label: t('csv_chip_opening_balances') },
-                    { key: 'customers', label: t('csv_chip_customers') },
-                    { key: 'suppliers', label: t('csv_chip_suppliers') },
-                  ].map(chip => (
-                    <span key={chip.key} className="text-[11px] text-muted-foreground/80 bg-muted/80 px-1.5 py-0.5 rounded leading-none">
-                      {chip.label}
-                    </span>
-                  ))}
-                </div>
-              </div>
-              <ChevronRight className="h-4 w-4 text-muted-foreground/40 shrink-0 mt-2.5 transition-transform duration-150 group-hover:translate-x-0.5 group-hover:text-muted-foreground" />
-            </div>
-
-            {/* 5. Bokföringsdata (SIE) */}
-            <div
-              role="button"
-              tabIndex={isSandbox ? -1 : 0}
-              aria-disabled={isSandbox}
-              className={cn(
-                'group flex items-start gap-4 rounded-lg border bg-card p-5 transition-all',
-                isSandbox
-                  ? 'opacity-50 cursor-not-allowed'
-                  : 'cursor-pointer hover:border-foreground/15 hover:shadow-[var(--shadow-sm)] active:scale-[0.998]'
-              )}
-              onClick={() => { if (!isSandbox) setMode('sie') }}
-              onKeyDown={(e) => { if (!isSandbox && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); setMode('sie') } }}
-            >
-              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-foreground/[0.06]">
-                <FileText className="h-[18px] w-[18px] text-foreground/60" />
-              </div>
-              <div className="flex-1 min-w-0">
-                <h3 className="text-[15px] font-semibold leading-tight">{t('sie_title')}</h3>
-                <p className="text-sm text-muted-foreground mt-1.5 leading-relaxed max-w-lg">
-                  {t('sie_description')}
-                </p>
-                <div className="flex flex-wrap gap-1.5 mt-2.5">
-                  {['SIE4', '.se'].map(fmt => (
-                    <span key={fmt} className="text-[11px] text-muted-foreground/80 bg-muted/80 px-1.5 py-0.5 rounded leading-none">
-                      {fmt}
-                    </span>
-                  ))}
-                </div>
-              </div>
-              <ChevronRight className="h-4 w-4 text-muted-foreground/40 shrink-0 mt-2.5 transition-transform duration-150 group-hover:translate-x-0.5 group-hover:text-muted-foreground" />
-            </div>
-              </div>
-            </TabsContent>
-
-            <TabsContent value="export" className="mt-6">
+          {/* SIE export as a small centered dialog (concept overlay convention) */}
+          <Dialog open={sieDialogOpen} onOpenChange={setSieDialogOpen}>
+            <DialogContent className="sm:max-w-md">
+              <DialogHeader>
+                <DialogTitle className="font-display text-lg tracking-tight">
+                  {t('export_sie_title')}
+                </DialogTitle>
+                <DialogDescription className="text-[13px] leading-relaxed">
+                  {t('export_sie_dialog_description')}
+                </DialogDescription>
+              </DialogHeader>
               <div className="space-y-4">
-                {/* SIE-export */}
-                <div id="sie-export" className="scroll-mt-24 rounded-lg border border-border bg-card p-6">
-                  <div className="grid gap-6 md:grid-cols-[minmax(0,1fr)_minmax(0,1.5fr)]">
-                    {/* Identity */}
-                    <div className="flex items-start gap-3">
-                      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-foreground/[0.06]">
-                        <FileSpreadsheet className="h-[18px] w-[18px] text-foreground/60" />
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <h3 className="text-[15px] font-semibold leading-tight">{t('export_sie_title')}</h3>
-                        <p className="text-sm text-muted-foreground mt-1 leading-relaxed">
-                          {t('export_sie_description')}
-                        </p>
-                      </div>
-                    </div>
-
-                    {/* Controls */}
-                    <div className="space-y-4">
-                      <FiscalYearSelector
-                        value={exportPeriodId}
-                        onChange={setExportPeriodId}
-                        includeAllOption={false}
-                        hideFuturePeriods
-                        label={t('export_sie_period_label')}
-                      />
-                      <label className="flex items-start gap-2 text-sm text-muted-foreground cursor-pointer">
-                        <input
-                          type="checkbox"
-                          className="mt-0.5 h-4 w-4 rounded border-border"
-                          checked={exportExcludeClosing}
-                          onChange={(e) => setExportExcludeClosing(e.target.checked)}
-                        />
-                        <span>{t('export_sie_exclude_closing_label')}</span>
-                      </label>
-                      <Button
-                        onClick={() => {
-                          if (exportPeriodId) {
-                            const params = new URLSearchParams({ period_id: exportPeriodId })
-                            if (exportExcludeClosing) params.set('exclude_closing', 'true')
-                            window.open(`/api/reports/sie-export?${params.toString()}`, '_blank')
-                          }
-                        }}
-                        disabled={!exportPeriodId || isSandbox}
-                        className="w-full sm:w-auto"
-                      >
-                        <Download className="mr-2 h-4 w-4" />
-                        {t('export_sie_button')}
-                      </Button>
-                    </div>
-                  </div>
-                </div>
-
-                {/* Molnsynkronisering (Google Drive) */}
-                {hasCloudBackup && (
-                  <div id="cloud-backup" className="scroll-mt-24">
-                    <CloudBackupCard />
-                  </div>
-                )}
+                <FiscalYearSelector
+                  value={exportPeriodId}
+                  onChange={setExportPeriodId}
+                  includeAllOption={false}
+                  hideFuturePeriods
+                  label={t('export_sie_period_label')}
+                />
+                <label className="flex cursor-pointer items-start gap-2 text-sm text-muted-foreground">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5 h-4 w-4 rounded border-border"
+                    checked={exportExcludeClosing}
+                    onChange={(e) => setExportExcludeClosing(e.target.checked)}
+                  />
+                  <span>{t('export_sie_exclude_closing_label')}</span>
+                </label>
               </div>
-            </TabsContent>
-          </Tabs>
+              <DialogFooter>
+                <Button
+                  onClick={() => {
+                    if (exportPeriodId) {
+                      const params = new URLSearchParams({ period_id: exportPeriodId })
+                      if (exportExcludeClosing) params.set('exclude_closing', 'true')
+                      window.open(`/api/reports/sie-export?${params.toString()}`, '_blank')
+                    }
+                  }}
+                  disabled={!exportPeriodId}
+                >
+                  <Download className="mr-2 h-4 w-4" />
+                  {t('export_sie_button')}
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
         </>
       )}
 
@@ -2192,11 +2225,122 @@ export default function ImportPage() {
         </Button>
       )}
 
-      {mode === 'psd2' && <PSD2ConnectWizard />}
+      {mode === 'psd2' && (
+        hasBankingExtension && BankingPanel ? (
+          <BankingPanel />
+        ) : (
+          <Card>
+            <CardContent className="flex flex-col items-center justify-center py-12 text-center">
+              <Landmark className="mb-4 h-10 w-10 text-muted-foreground/40" />
+              <p className="mb-1 font-medium">Bankintegration (PSD2) är inte aktiverad</p>
+              <p className="mb-4 max-w-md text-sm text-muted-foreground">
+                Aktivera tillägget Enable Banking för att koppla ditt bankkonto, eller importera
+                transaktioner manuellt via bankfil.
+              </p>
+              <Button variant="outline" onClick={() => setMode('bank')}>
+                Importera bankfil istället
+              </Button>
+            </CardContent>
+          </Card>
+        )
+      )}
+      {mode === 'stripe' && (
+        hasStripeExtension && StripePanel ? (
+          <StripePanel />
+        ) : (
+          <Card>
+            <CardContent className="flex flex-col items-center justify-center py-12 text-center">
+              <CreditCard className="mb-4 h-10 w-10 text-muted-foreground/40" />
+              <p className="mb-1 font-medium">{t('stripe_not_enabled_title')}</p>
+              <p className="max-w-md text-sm text-muted-foreground">
+                {t('stripe_not_enabled_description')}
+              </p>
+            </CardContent>
+          </Card>
+        )
+      )}
       {mode === 'bank' && <BankFileImportWizard />}
       {mode === 'sie' && <SIEImportWizard />}
       {mode === 'csv_data' && <CSVDataImportWizard />}
       {mode === 'migration' && <MigrationWizard userId={userId} />}
     </div>
+  )
+}
+
+// Quiet action row (concept scene 32): borderless list row with title, muted
+// sub-line and a chevron; chips only for the recommended/gated exceptions.
+function ImportRow({
+  title,
+  sub,
+  chip,
+  chips,
+  disabled = false,
+  expanded,
+  onClick,
+  id,
+}: {
+  title: string
+  sub: string
+  chip?: React.ReactNode
+  /** Logo chips under the sub line (provider marks, as on the live page). */
+  chips?: React.ReactNode
+  disabled?: boolean
+  /** For rows that fold a panel open below the grid (cloud backup). */
+  expanded?: boolean
+  onClick: () => void
+  id?: string
+}) {
+  return (
+    <button
+      type="button"
+      id={id}
+      onClick={onClick}
+      disabled={disabled}
+      aria-expanded={expanded}
+      className={cn(
+        'group flex w-full items-center justify-between gap-4 border-b border-border/60 px-1 py-3 text-left',
+        'transition-colors duration-150 hover:bg-secondary/35',
+        'disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent',
+      )}
+    >
+      <span className="min-w-0">
+        <span className="flex flex-wrap items-center gap-2 text-sm font-medium">
+          {title}
+          {chip}
+        </span>
+        <span className="mt-0.5 block text-xs leading-5 text-muted-foreground">{sub}</span>
+        {chips && <span className="mt-2 flex flex-wrap gap-2">{chips}</span>}
+      </span>
+      <ChevronRight
+        className={cn(
+          'h-4 w-4 shrink-0 text-muted-foreground/40 transition-transform duration-150',
+          'group-hover:translate-x-0.5 group-hover:text-muted-foreground',
+          expanded && 'rotate-90',
+        )}
+        aria-hidden="true"
+      />
+    </button>
+  )
+}
+
+// Provider mark chip (same recipe as the pre-migration live page): tiny logo
+// on a quiet bordered chip, so integrations read as first-class brands.
+// `mono` is for light-on-transparent marks (Enable Banking): the marketing
+// site's grayscale+brightness treatment makes them read on a light ground,
+// with the inverse lift in dark mode.
+function LogoChip({ src, name, mono = false }: { src: string; name: string; mono?: boolean }) {
+  return (
+    <span className="flex items-center gap-2 rounded border border-border bg-muted/30 px-2 py-1">
+      <img
+        src={src}
+        alt=""
+        className={cn(
+          'h-4 w-4 shrink-0 rounded-sm object-contain',
+          mono &&
+            'opacity-90 [filter:grayscale(100%)_brightness(0.18)] dark:[filter:grayscale(100%)_brightness(1.5)]',
+        )}
+      />
+      <span className="text-[11px] font-medium text-muted-foreground">{name}</span>
+    </span>
   )
 }

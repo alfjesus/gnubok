@@ -4,6 +4,19 @@ import { UpdateCustomerSchema } from '@/lib/api/schemas'
 import { validateVatNumber } from '@/lib/vat/vies-client'
 import { withRouteContext } from '@/lib/api/with-route-context'
 import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
+import { encryptCustomerPersonalNumber, maskCustomerRow } from '@/lib/customers/protect-personal-number'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
+
+/**
+ * Shape produced by maskCustomerPersonalNumber: no read path ever returns the
+ * stored personnummer, only '********-1234'. A client that PATCHes back a
+ * customer it just read therefore submits the mask, which must mean "leave the
+ * stored value alone", never "store this literally" and never "clear it".
+ * components/customers/CustomerForm.tsx strips it before sending, but that
+ * guard belongs here too: any other client (script, agent, future UI) that
+ * skips it would otherwise destroy the value.
+ */
+const MASKED_PERSONAL_NUMBER = /^\*{8}-\d{4}$/
 
 export const GET = withRouteContext(
   'customer.get',
@@ -26,7 +39,7 @@ export const GET = withRouteContext(
       opLog.error('customer fetch failed', error)
       return errorResponseFromCode('INTERNAL_ERROR', opLog, {
         requestId,
-        details: { reason: error.message },
+        details: { reason: getUserErrorMessage(error) },
       })
     }
 
@@ -37,7 +50,7 @@ export const GET = withRouteContext(
       .eq('company_id', companyId)
       .order('invoice_date', { ascending: false })
 
-    return NextResponse.json({ data: { ...data, invoices: invoices || [] } })
+    return NextResponse.json({ data: { ...maskCustomerRow(data), invoices: invoices || [] } })
   },
 )
 
@@ -55,9 +68,37 @@ export const PATCH = withRouteContext(
     if (!result.success) return result.response
     const body = result.data
 
+    const { data: existing, error: existingError } = await supabase
+      .from('customers')
+      .select('id, customer_type')
+      .eq('id', id)
+      .eq('company_id', companyId)
+      .single()
+
+    if (existingError || !existing) {
+      if (existingError?.code === 'PGRST116') {
+        return errorResponseFromCode('CUSTOMER_NOT_FOUND', opLog, { requestId })
+      }
+      opLog.error('customer lookup before update failed', existingError)
+      return errorResponseFromCode('CUSTOMER_UPDATE_FAILED', opLog, { requestId })
+    }
+
+    // The masked sentinel counts as "field not supplied": it carries no new
+    // value, so it must not be validated, stored or treated as a clear.
+    const personalNumberSubmitted =
+      body.personal_number !== undefined &&
+      !(typeof body.personal_number === 'string' && MASKED_PERSONAL_NUMBER.test(body.personal_number))
+
+    const effectiveType = body.customer_type ?? existing.customer_type
+    if (personalNumberSubmitted && body.personal_number && effectiveType !== 'individual') {
+      return errorResponseFromCode('CUSTOMER_PERSONAL_NUMBER_NOT_ALLOWED', opLog, { requestId })
+    }
+
     const updateData: Record<string, unknown> = {}
     if (body.name !== undefined) updateData.name = body.name
     if (body.customer_type !== undefined) updateData.customer_type = body.customer_type
+    // Empty string clears the customer number, same as an explicit null.
+    if (body.customer_number !== undefined) updateData.customer_number = body.customer_number || null
     if (body.email !== undefined) updateData.email = body.email
     if (body.phone !== undefined) updateData.phone = body.phone
     if (body.address_line1 !== undefined) updateData.address_line1 = body.address_line1
@@ -67,6 +108,13 @@ export const PATCH = withRouteContext(
     if (body.country !== undefined) updateData.country = body.country
     if (body.org_number !== undefined) updateData.org_number = body.org_number
     if (body.vat_number !== undefined) updateData.vat_number = body.vat_number
+    if (personalNumberSubmitted) {
+      // Stored as ciphertext; customers_personal_number_check accepts that
+      // shape only (20260726110000).
+      updateData.personal_number = encryptCustomerPersonalNumber(body.personal_number)
+    } else if (body.customer_type !== undefined && effectiveType !== 'individual') {
+      updateData.personal_number = null
+    }
     if (body.language !== undefined) updateData.language = body.language
     if (body.default_payment_terms !== undefined) updateData.default_payment_terms = body.default_payment_terms
     if (body.notes !== undefined) updateData.notes = body.notes
@@ -80,6 +128,9 @@ export const PATCH = withRouteContext(
       .single()
 
     if (error) {
+      if (error.code === 'PGRST116') {
+        return errorResponseFromCode('CUSTOMER_NOT_FOUND', opLog, { requestId })
+      }
       if (error.code === '23505') {
         return errorResponseFromCode('CUSTOMER_DUPLICATE_ORG_NUMBER', opLog, {
           requestId,
@@ -89,7 +140,7 @@ export const PATCH = withRouteContext(
       opLog.error('customer update failed', error)
       return errorResponseFromCode('CUSTOMER_UPDATE_FAILED', opLog, {
         requestId,
-        details: { reason: error.message },
+        details: { reason: getUserErrorMessage(error) },
       })
     }
 
@@ -125,7 +176,7 @@ export const PATCH = withRouteContext(
       }
     }
 
-    return NextResponse.json({ data })
+    return NextResponse.json({ data: maskCustomerRow(data) })
   },
   { requireWrite: true },
 )
@@ -150,7 +201,7 @@ export const DELETE = withRouteContext(
       opLog.error('customer delete failed', error)
       return errorResponseFromCode('CUSTOMER_DELETE_FAILED', opLog, {
         requestId,
-        details: { reason: error.message },
+        details: { reason: getUserErrorMessage(error) },
       })
     }
 
