@@ -1623,6 +1623,13 @@ export interface FiscalPeriod {
   closing_entry_id: string | null
   opening_balance_entry_id: string | null
   previous_period_id: string | null
+  tax_depreciation_method?: 'rakenskapsenlig' | 'restvarde' | null
+  tax_depreciation_rule?: 'huvudregel_30' | 'kompletteringsregel_20' | null
+  tax_depreciation_opening_value?: number | null
+  tax_depreciation_base?: number | null
+  tax_depreciation_deduction?: number | null
+  tax_depreciation_closing_value?: number | null
+  tax_depreciation_calculation?: Record<string, unknown> | null
   created_at: string
   updated_at: string
 }
@@ -3334,12 +3341,15 @@ export type AssetCategory =
   | 'computer'
   | 'other_tangible'
 
+/** Read type includes historical per-asset tax-method values retained on
+ *  disposed rows. New and active assets may only be written as linear. */
 export type DepreciationMethod =
   | 'linear'
   | 'declining_balance_30'
   | 'declining_balance_20'
   | 'restvardesavskrivning_25'
 
+export type WritableDepreciationMethod = 'linear'
 export type AssetDisposalType = 'sale' | 'scrap' | 'business_transfer'
 export type AssetJamkningDirection = 'increase' | 'decrease' | 'none' | 'transferred'
 
@@ -3382,8 +3392,8 @@ export interface Asset {
   bas_asset_account: string
   bas_accumulated_account: string
   bas_expense_account: string
-  /** Book-value floor for restvärdeavskrivning (IL 18 kap 13§ st.3). Required
-   *  iff depreciation_method = 'restvardesavskrivning_25'; null otherwise. */
+  /** Deprecated legacy field. New tax depreciation is pooled per fiscal
+   *  period and ordinary per-asset depreciation is linear. */
   restvarde_target: number | null
   disposed_at: string | null
   disposed_proceeds: number | null
