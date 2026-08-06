@@ -28,6 +28,7 @@ import {
 import { validateBalanceContinuity } from '@/lib/reports/continuity-check'
 import type {
   YearEndValidation,
+  YearEndBlocker,
   YearEndPreview,
   YearEndResult,
   CreateJournalEntryLineInput,
@@ -47,7 +48,10 @@ export async function validateYearEndReadiness(
   userId: string,
   fiscalPeriodId: string
 ): Promise<YearEndValidation> {
-  const errors: string[] = []
+  // Each blocker carries a stable machine code (YearEndBlockerCode) that the
+  // bokslut wizard matches on to attach remediation links; `errors` mirrors
+  // the messages for consumers of the plain string list.
+  const blockers: YearEndBlocker[] = []
   const warnings: string[] = []
 
   // Fetch the period
@@ -58,14 +62,20 @@ export async function validateYearEndReadiness(
     .eq('company_id', companyId)
     .single()
 
-  // The error/warning strings below are Swedish: they render verbatim in the
+  // The blocker/warning strings below are Swedish: they render verbatim in the
   // bokslut wizard (a "stays Swedish" surface per .claude/rules/i18n.md).
-  // The MCP year_end_readiness tool classifies them by regex; keep
-  // extensions/general/mcp-server/server.ts in sync when changing wording.
+  // Blockers are routed on `code`, never on the wording, so rewording a
+  // message is safe. Adding a NEW code is not: the MCP year_end_readiness tool
+  // maps every YearEndBlockerCode to its public `kind`, so a new code needs a
+  // matching entry in extensions/general/mcp-server/server.ts.
   if (fetchError || !period) {
+    const notFound: YearEndBlocker[] = [
+      { code: 'PERIOD_NOT_FOUND', message: 'Räkenskapsperioden hittades inte' },
+    ]
     return {
       ready: false,
-      errors: ['Räkenskapsperioden hittades inte'],
+      blockers: notFound,
+      errors: notFound.map((b) => b.message),
       warnings: [],
       draftCount: 0,
       voucherGaps: [],
@@ -78,17 +88,23 @@ export async function validateYearEndReadiness(
   // Check: period must have ended (BFNAR 2017:3 / ÅRL 2:1)
   const today = new Date().toISOString().split('T')[0]
   if (period.period_end > today) {
-    errors.push('Perioden kan inte stängas: slutdatumet har inte passerat ännu')
+    blockers.push({
+      code: 'PERIOD_NOT_ENDED',
+      message: 'Perioden kan inte stängas: slutdatumet har inte passerat ännu',
+    })
   }
 
   // Check: period not already closed
   if (period.is_closed) {
-    errors.push('Perioden är redan stängd')
+    blockers.push({ code: 'PERIOD_ALREADY_CLOSED', message: 'Perioden är redan stängd' })
   }
 
   // Check: closing entry doesn't already exist
   if (period.closing_entry_id) {
-    errors.push('Bokslutsverifikation finns redan för perioden')
+    blockers.push({
+      code: 'CLOSING_ENTRY_EXISTS',
+      message: 'Bokslutsverifikation finns redan för perioden',
+    })
   }
 
   // Check: no draft entries
@@ -101,7 +117,10 @@ export async function validateYearEndReadiness(
 
   const drafts = draftCount ?? 0
   if (drafts > 0) {
-    errors.push(`${drafts} utkast måste bokföras eller raderas innan bokslut`)
+    blockers.push({
+      code: 'DRAFT_ENTRIES',
+      message: `${drafts} utkast måste bokföras eller raderas innan bokslut`,
+    })
   }
 
   // Check: voucher continuity across all series
@@ -156,9 +175,10 @@ export async function validateYearEndReadiness(
         )
       } else {
         unexplainedGaps.push(gap)
-        errors.push(
-          `Oförklarat verifikationsnummerglapp i serie ${gap.series}: ${gap.gap_start}-${gap.gap_end}`
-        )
+        blockers.push({
+          code: 'UNEXPLAINED_VOUCHER_GAP',
+          message: `Oförklarat verifikationsnummerglapp i serie ${gap.series}: ${gap.gap_start}-${gap.gap_end}`,
+        })
       }
     }
   }
@@ -197,9 +217,10 @@ export async function validateYearEndReadiness(
         })
 
         if (sequenceCounter < actualMax) {
-          errors.push(
-            `Nummerserien i serie ${row.voucher_series} stämmer inte: räknaren står på ${sequenceCounter} men högsta verifikationsnummer är ${actualMax}`
-          )
+          blockers.push({
+            code: 'SEQUENCE_COUNTER_BEHIND',
+            message: `Nummerserien i serie ${row.voucher_series} stämmer inte: räknaren står på ${sequenceCounter} men högsta verifikationsnummer är ${actualMax}`,
+          })
         } else {
           warnings.push(
             `Nummerräknaren ligger före bokförda verifikationer i serie ${row.voucher_series}: räknare=${sequenceCounter}, högsta verifikationsnummer=${actualMax}`
@@ -214,9 +235,10 @@ export async function validateYearEndReadiness(
   const trialBalanceBalanced = trialBalance.isBalanced
 
   if (!trialBalanceBalanced) {
-    errors.push(
-      `Råbalansen balanserar inte: debet=${trialBalance.totalDebit}, kredit=${trialBalance.totalCredit}`
-    )
+    blockers.push({
+      code: 'TRIAL_BALANCE_UNBALANCED',
+      message: `Råbalansen balanserar inte: debet=${trialBalance.totalDebit}, kredit=${trialBalance.totalCredit}`,
+    })
   }
 
   // Check: at least some entries exist
@@ -291,7 +313,10 @@ export async function validateYearEndReadiness(
 
   // Check: continuity_verified flag from prior year-end
   if (period.continuity_verified === false) {
-    errors.push('IB/UB-kontinuiteten stämmer inte för perioden: åtgärda avvikelserna innan bokslut')
+    blockers.push({
+      code: 'CONTINUITY_MISMATCH',
+      message: 'IB/UB-kontinuiteten stämmer inte för perioden: åtgärda avvikelserna innan bokslut',
+    })
   }
 
   // Check: next period state. A pre-existing next period (from SIE import,
@@ -307,7 +332,10 @@ export async function validateYearEndReadiness(
   const nextPeriod = await findNextPeriod(supabase, companyId, fiscalPeriodId)
   if (nextPeriod) {
     if (nextPeriod.opening_balance_entry_id) {
-      errors.push('Nästa räkenskapsperiod har redan ingående balanser bokförda')
+      blockers.push({
+        code: 'NEXT_PERIOD_HAS_IB',
+        message: 'Nästa räkenskapsperiod har redan ingående balanser bokförda',
+      })
     } else {
       warnings.push('Nästa räkenskapsperiod finns redan: ingående balanser bokförs i den')
     }
@@ -331,20 +359,23 @@ export async function validateYearEndReadiness(
     )
     unbookedTransactionCount = unbooked.untriaged + unbooked.businessUnbooked
     if (unbookedTransactionCount > 0) {
-      errors.push(
-        `${unbookedTransactionCount} transaktioner i perioden saknar bokföring: bokför dem eller markera dem som privata innan bokslut`,
-      )
+      blockers.push({
+        code: 'UNBOOKED_TRANSACTIONS',
+        message: `${unbookedTransactionCount} transaktioner i perioden saknar bokföring: bokför dem eller markera dem som privata innan bokslut`,
+      })
     }
   } catch (err) {
     log.warn('unbooked-transaction readiness check failed', err as Error)
-    errors.push(
-      'Kontrollen av obokförda transaktioner kunde inte genomföras: försök igen',
-    )
+    blockers.push({
+      code: 'UNBOOKED_CHECK_FAILED',
+      message: 'Kontrollen av obokförda transaktioner kunde inte genomföras: försök igen',
+    })
   }
 
   return {
-    ready: errors.length === 0,
-    errors,
+    ready: blockers.length === 0,
+    blockers,
+    errors: blockers.map((b) => b.message),
     warnings,
     draftCount: drafts,
     voucherGaps,

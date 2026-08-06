@@ -6,7 +6,7 @@ import { generateARReconciliation } from '@/lib/reports/ar-reconciliation'
 import { generateReconciliation as generateAPReconciliation } from '@/lib/reports/supplier-reconciliation'
 import { computeEfDeclarationPreview } from '@/lib/bokslut/enskild-firma/ef-declaration-preview'
 import { createLogger } from '@/lib/logger'
-import type { YearEndValidation } from '@/types'
+import type { YearEndBlocker, YearEndValidation } from '@/types'
 
 const log = createLogger('bokslut-readiness')
 
@@ -27,6 +27,10 @@ export interface BokslutReadinessReport {
   ready: boolean
   /** Blocking errors that prevent year-end execution (from year-end-service). */
   blockers: string[]
+  /** Same blockers with stable machine codes (same order as `blockers`).
+   *  The wizard matches on `code` to attach remediation links; `blockers`
+   *  stays as plain strings for existing consumers. */
+  blockerItems: YearEndBlocker[]
   /** Non-blocking warnings (from year-end-service). */
   warnings: string[]
   /** Soft reminders (Phase 2+ features not yet shipped, manual steps the user
@@ -247,6 +251,7 @@ export async function buildBokslutReadinessReport(
   return {
     ready: validation.ready,
     blockers: validation.errors,
+    blockerItems: validation.blockers,
     warnings: validation.warnings,
     reminders,
     draftCount: validation.draftCount,
