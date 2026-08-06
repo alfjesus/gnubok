@@ -3174,6 +3174,20 @@ const ASSETS: Record<string, StructuredErrorEntry> = {
     message_en:
       'Acquisition date, cost and category cannot be changed once the asset has been disposed or depreciation has been posted. Reverse (storno) first, or use the disposal flow.',
   },
+  // Generic on purpose: the flag covers accounts excluded from K2 for several
+  // different reasons (egenupparbetade immateriella, uppskjuten skatt,
+  // verkligt värde, säkringsredovisning, ...), so the static entry states only
+  // what the BAS chart says. The asset routes override it with an
+  // account-specific message from lib/bokslut/assets/k2-account-guard.ts,
+  // which cites BFNAR 2016:10 punkt 10.4 only when the intangible group is
+  // what actually triggered the gate.
+  K2_EXCLUDED_ACCOUNT: {
+    httpStatus: 422,
+    message_sv:
+      'Kontot är markerat Ej K2 i BAS-kontoplanen och förutsätter K3. Välj ett konto som är tillåtet enligt K2.',
+    message_en:
+      'The account is marked Ej K2 in the BAS chart of accounts and presumes the K3 framework. Pick an account that K2 permits.',
+  },
 }
 
 // Dimensions registry (kostnadsställe/projekt): dev_docs/dimensions_implementation_plan.md §6
