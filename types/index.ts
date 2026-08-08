@@ -525,6 +525,31 @@ export type ImportSource =
   | 'camt053'
   | 'manual'
 
+/**
+ * Closed vocabulary for HOW money moved (the payment rail), classified at
+ * ingest by classifyTransactionMethod() (lib/transactions/transaction-method.ts).
+ * Mirrored by the transactions_transaction_method_check DB constraint
+ * (migration 20260808090000): keep the three in sync when adding a value.
+ */
+export const TRANSACTION_METHODS = [
+  'card',
+  'transfer',
+  'bankgiro',
+  'plusgiro',
+  'swish',
+  'autogiro',
+  'e_invoice',
+  'international',
+  'deposit',
+  'withdrawal',
+  'salary',
+  'fee',
+  'interest',
+  'adjustment',
+] as const
+
+export type TransactionMethod = (typeof TRANSACTION_METHODS)[number]
+
 // Transaction
 export interface Transaction {
   id: string
@@ -579,6 +604,14 @@ export interface Transaction {
   journal_entry_id: string | null
   mcc_code: number | null
   merchant_name: string | null
+
+  // Payment rail classified at ingest (or by the 20260808090100 backfill);
+  // null = unclassifiable from the source data.
+  transaction_method: TransactionMethod | null
+  // Raw PSD2 transaction-type codes, verbatim provider evidence for the
+  // classification (previously dropped at insert). Null for non-PSD2 sources.
+  bank_transaction_code: string | null
+  proprietary_bank_transaction_code: string | null
 
   // Receipt link
   receipt_id: string | null
@@ -650,8 +683,11 @@ export interface Customer {
   customer_number: string | null
 
   // Contact
+  contact_person: string | null
   email: string | null
   phone: string | null
+  invoice_email_cc_addresses: string[] | null
+  invoice_email_bcc_addresses: string[] | null
 
   // Address
   address_line1: string | null
@@ -1048,9 +1084,9 @@ export type InvoiceDeliveryStatus = 'preparing' | 'pending' | 'sent' | 'failed' 
 
 /**
  * Delivery outcome reported by the email provider after the send itself
- * succeeded. Reported per message, never per recipient: a message with several
- * recipients gets one outcome, and the reason text names the address that
- * failed. `null` means no report has arrived yet.
+ * succeeded. The delivery keeps an aggregate outcome and, when the provider
+ * identifies affected recipients, outcomes keyed by stable To/CC positions.
+ * `null` means no report has arrived yet.
  */
 export type InvoiceDeliveryProviderStatus =
   | 'delayed'
@@ -1059,6 +1095,20 @@ export type InvoiceDeliveryProviderStatus =
   | 'bounced'
   | 'failed'
   | 'suppressed'
+
+export interface InvoiceDeliveryRecipientStatus {
+  status: InvoiceDeliveryProviderStatus
+  status_at: string
+}
+
+/**
+ * PII-free recipient references. `to:1` is the first immutable To address and
+ * `cc:1` the first immutable CC address. BCC recipients are never exposed.
+ */
+export type InvoiceDeliveryRecipientStatuses = Partial<Record<
+  `to:${number}` | `cc:${number}`,
+  InvoiceDeliveryRecipientStatus
+>>
 
 export interface InvoiceDelivery {
   id: string
@@ -1080,6 +1130,7 @@ export interface InvoiceDelivery {
   provider_status: InvoiceDeliveryProviderStatus | null
   provider_status_at: string | null
   provider_status_detail: string | null
+  provider_recipient_statuses: InvoiceDeliveryRecipientStatuses
   error_code: string | null
   document_attachment_id: string | null
   attachment_filename: string | null
@@ -1229,9 +1280,12 @@ export interface RecurringInvoiceSchedule {
 
   name: string
 
-  // Monthly cadence, day-of-month 1-31. Clamped to last day of month in
-  // shorter months (handled by computeNextRunDate).
+  // Day-of-month anchor, 1-31. Clamped to last day of month in shorter
+  // months (handled by computeNextRunDate).
   day_of_month: number
+  // Months between runs: 1 = monthly, 3 = quarterly, 6 = half-yearly,
+  // 12 = yearly. next_run_date is the month anchor the interval advances from.
+  interval_months: number
   // Whole hour (0-23) in Europe/Stockholm time at which the schedule sends.
   // The hourly cron only fires schedules matching the current Stockholm hour.
   send_hour: number
@@ -1241,6 +1295,10 @@ export interface RecurringInvoiceSchedule {
   your_reference: string | null
   our_reference: string | null
   notes: string | null
+
+  // Dimension bag {sie_dim_no: code} copied onto every generated invoice's
+  // default_dimensions at spawn time.
+  default_dimensions?: Record<string, string>
 
   auto_send: boolean
   status: RecurringInvoiceScheduleStatus
@@ -1269,6 +1327,9 @@ export interface RecurringInvoiceScheduleItem {
   unit_price: number
   // null = inherit customer's default VAT rate at spawn time
   vat_rate: number | null
+  // Per-item bag copied onto the generated invoice_items.dimensions; merges
+  // over the schedule default on that item's revenue line.
+  dimensions?: Record<string, string>
   created_at: string
 }
 
@@ -1296,8 +1357,11 @@ export interface CreateCustomerInput {
   name: string
   customer_type: CustomerType
   customer_number?: string | null
+  contact_person?: string | null
   email?: string
   phone?: string
+  invoice_email_cc_addresses?: string[] | null
+  invoice_email_bcc_addresses?: string[] | null
   address_line1?: string
   address_line2?: string
   postal_code?: string
@@ -1595,6 +1659,13 @@ export interface FiscalPeriod {
   closing_entry_id: string | null
   opening_balance_entry_id: string | null
   previous_period_id: string | null
+  tax_depreciation_method?: 'rakenskapsenlig' | 'restvarde' | null
+  tax_depreciation_rule?: 'huvudregel_30' | 'kompletteringsregel_20' | null
+  tax_depreciation_opening_value?: number | null
+  tax_depreciation_base?: number | null
+  tax_depreciation_deduction?: number | null
+  tax_depreciation_closing_value?: number | null
+  tax_depreciation_calculation?: Record<string, unknown> | null
   created_at: string
   updated_at: string
 }
@@ -1687,6 +1758,11 @@ export interface AccrualSchedule {
   posting_floor_date: string
   status: AccrualScheduleStatus
   description: string | null
+  // Dimensions bag ({sie_dim_no: object_code}) copied from the origin line
+  // (invoice default_dimensions merged with the item bag); carried onto both
+  // dissolution lines. jsonb DEFAULT '{}'. Optional in TS for pre-migration
+  // fixtures.
+  dimensions?: Record<string, string>
   created_at: string
   updated_at: string
   // Relations
@@ -1813,6 +1889,10 @@ export interface CategorizationTemplate {
   vat_account: string | null
   category: TransactionCategory | null
   line_pattern: LinePatternEntry[] | null
+  // Bag {sie_dim_no: code} learned from the latest tagged booking; applied to
+  // the business line on the legacy single-line template path (line_pattern
+  // entries carry their own bags on the multi-line path).
+  default_dimensions?: Record<string, string>
   occurrence_count: number
   confidence: number
   last_seen_date: string | null
@@ -1950,6 +2030,18 @@ export interface BalanceSheetReport {
   imbalance_diagnosis?: BalanceImbalanceDiagnosis
 }
 
+/**
+ * Highest POSTED voucher number per series inside a reported window.
+ *
+ * Reconciliation aid, not statutory (BFL does not require it). Deliberately the
+ * last posted number, not `voucher_sequences.last_number`: the sequence counter
+ * is an allocation high-water mark that can sit ahead of the books.
+ */
+export interface LatestVoucherPerSeries {
+  series: string
+  last_number: number
+}
+
 export interface ResultatrapportRow {
   account_number: string
   account_name: string
@@ -1971,6 +2063,8 @@ export interface ResultatrapportReport {
   net_result_prior: number
   period: { start: string; end: string }
   prior_period: { start: string; end: string } | null
+  /** Omitted when the window holds no posted vouchers, or the report is dimension-filtered. */
+  latest_vouchers?: LatestVoucherPerSeries[]
 }
 
 // Resultat per projekt/kostnadsställe: value-as-column P&L matrix over one
@@ -2031,6 +2125,8 @@ export interface BalansrapportReport {
   period: { start: string; end: string }
   /** Present only when the underlying trial balance does not balance. */
   imbalance_diagnosis?: BalanceImbalanceDiagnosis
+  /** Omitted when the window holds no posted vouchers. */
+  latest_vouchers?: LatestVoucherPerSeries[]
 }
 
 export interface SIEExportOptions {
@@ -2154,6 +2250,10 @@ export type PendingOperationType =
   // Payroll: salary run creation + AGI declaration
   | 'create_salary_run'
   | 'generate_agi'
+  // Körjournal: log a trip (pure travel documentation) + book the period's
+  // milersättning as one verifikat (7331 at schablon rate)
+  | 'log_mileage_trip'
+  | 'book_mileage_period'
   // Mark invoice paid by linking an existing posted verifikat (no new JE)
   | 'link_invoice_voucher'
   // Supplier-side mirror: mark a leverantörsfaktura paid by linking an existing
@@ -2597,7 +2697,7 @@ export interface SIEAccountMapping {
 // ============================================================
 
 export type InboxItemStatus = 'received' | 'error'
-export type InboxItemSource = 'email' | 'upload'
+export type InboxItemSource = 'email' | 'upload' | 'whatsapp'
 
 export type CompanyInboxStatus = 'active' | 'deprecated' | 'blocked'
 
@@ -2660,6 +2760,13 @@ export interface InvoiceInboxItem {
   error_message: string | null
   raw_email_payload: Record<string, unknown> | null
 
+  // WhatsApp channel (migration 20260802092000). whatsapp_message_id links
+  // back to the delivering chat message; channel_context holds verified
+  // human answers from the chat (kept OUT of extracted_data on purpose:
+  // retry-extraction overwrites that container wholesale).
+  whatsapp_message_id?: string | null
+  channel_context?: InboxChannelContext | null
+
   // Audit chain (processing_history correlation)
   correlation_id: string | null
 
@@ -2670,6 +2777,123 @@ export interface InvoiceInboxItem {
   document?: DocumentAttachment
   supplier?: Supplier
   supplier_invoice?: SupplierInvoice
+}
+
+// Chat-sourced context attached to an inbox item. `raw_answer` + timestamps
+// double as the Skatteverket representation documentation trail.
+export interface InboxChannelContext {
+  channel: 'whatsapp'
+  caption?: string | null
+  company_selected_via?: 'button' | 'list' | 'numbered' | 'pin' | 'default' | 'single'
+  representation?: {
+    participants: { name: string; company: string | null }[]
+    purpose: string | null
+    event_date: string | null
+    raw_answer: string
+    answered_at: string
+    /** True when the user answered `nej` (or the LLM read a denial): the
+     *  receipt is NOT representation and the question is settled. */
+    denied?: boolean
+  }
+  user_note?: string | null
+  /** What the user actually typed when answering a context question, kept
+   *  next to the LLM paraphrase in user_note. The paraphrase is what renders;
+   *  this is the durable human answer, mirroring the representation branch
+   *  (whatsapp_messages.body_text is purged at 90 days, so it is no trail). */
+  context_answer?: {
+    raw_answer: string
+    answered_at: string
+  }
+  quality?: {
+    resend_requested_at: string
+    resent?: boolean
+    /** Set on the OLD item when a re-sent, sharper file created a fresh item
+     *  (WORM archive + anchored-doc invariant forbid swapping the document
+     *  out from under the original). */
+    superseded?: boolean
+  }
+  pending_question?: {
+    type: 'representation' | 'context' | 'resend'
+    asked_at: string
+    status: 'open' | 'answered' | 'moved_to_app'
+  }
+}
+
+// ============================================================
+// WhatsApp Channel Types (migrations 20260802090000/091000)
+// ============================================================
+
+export interface WhatsAppPhoneLink {
+  id: string
+  user_id: string
+  phone_hash: string
+  phone_enc: string
+  phone_masked: string
+  wa_profile_name: string | null
+  default_company_id: string | null
+  last_company_id: string | null
+  verified_at: string
+  revoked_at: string | null
+  muted_at: string | null
+  last_message_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export type WhatsAppConversationState =
+  | 'idle'
+  | 'awaiting_company'
+  | 'awaiting_representation'
+  | 'awaiting_context'
+  | 'awaiting_resend'
+
+export interface WhatsAppConversation {
+  id: string
+  phone_link_id: string
+  state: WhatsAppConversationState
+  context: Record<string, unknown>
+  company_id: string | null
+  service_window_expires_at: string | null
+  debounce_until: string | null
+  pending_ack: boolean
+  last_inbound_at: string | null
+  last_outbound_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export type WhatsAppMessageProcessingStatus =
+  | 'received'
+  | 'processing'
+  | 'done'
+  | 'skipped'
+  | 'error'
+
+export interface WhatsAppMessage {
+  id: string
+  direction: 'inbound' | 'outbound'
+  wamid: string | null
+  sender_phone_hash: string | null
+  phone_link_id: string | null
+  conversation_id: string | null
+  message_type: string
+  body_text: string | null
+  media_id: string | null
+  media_mime: string | null
+  media_sha256: string | null
+  media_filename: string | null
+  raw_payload: Record<string, unknown> | null
+  processing_status: WhatsAppMessageProcessingStatus
+  attempts: number
+  error_message: string | null
+  inbox_item_id: string | null
+  delivery_status: string | null
+  correlation_id: string | null
+  /** When a combined burst ack (M4/M5) covered this ingested row.
+   *  NULL = not yet acked (the burst winner's work queue). */
+  acked_at: string | null
+  created_at: string
+  updated_at: string
 }
 
 // ============================================================
@@ -3085,6 +3309,7 @@ export type DocumentUploadSource =
   | 'scan'
   | 'api'
   | 'system'
+  | 'whatsapp'
 
 export interface DocumentAttachment {
   id: string
@@ -3214,8 +3439,38 @@ export interface SequenceMismatch {
 // Year-End Closing Types (Årsbokslut)
 // ============================================================
 
+/**
+ * Stable machine codes for year-end readiness blockers. One code per
+ * blockers.push site in validateYearEndReadiness: the wizard matches on
+ * these to attach remediation links, so codes must never be renamed once
+ * shipped. The Swedish message stays the display text.
+ */
+export type YearEndBlockerCode =
+  | 'PERIOD_NOT_FOUND'
+  | 'PERIOD_NOT_ENDED'
+  | 'PERIOD_ALREADY_CLOSED'
+  | 'CLOSING_ENTRY_EXISTS'
+  | 'DRAFT_ENTRIES'
+  | 'UNEXPLAINED_VOUCHER_GAP'
+  | 'SEQUENCE_COUNTER_BEHIND'
+  | 'TRIAL_BALANCE_UNBALANCED'
+  | 'CONTINUITY_MISMATCH'
+  | 'NEXT_PERIOD_HAS_IB'
+  | 'UNBOOKED_TRANSACTIONS'
+  | 'UNBOOKED_CHECK_FAILED'
+
+export interface YearEndBlocker {
+  code: YearEndBlockerCode
+  /** Swedish, user-facing: bokslut is a stays-Swedish surface. */
+  message: string
+}
+
 export interface YearEndValidation {
   ready: boolean
+  /** Blocking errors with stable machine codes. */
+  blockers: YearEndBlocker[]
+  /** Blocker messages only; mirrors `blockers`. Kept so existing consumers
+   *  of the string list (v1 compliance check, MCP tool) stay unchanged. */
   errors: string[]
   warnings: string[]
   draftCount: number
@@ -3223,6 +3478,14 @@ export interface YearEndValidation {
   unexplainedGaps: VoucherGap[]
   sequenceMismatches: SequenceMismatch[]
   trialBalanceBalanced: boolean
+  /**
+   * Bank transactions in the period with no verifikat (untriaged +
+   * business-confirmed-but-unbooked). Blocking: lockPeriod refuses to lock
+   * over them, so surfacing the count here stops executeYearEndClosing from
+   * aborting mid-flow at the lock step. Optional: absent on the early
+   * period-not-found return.
+   */
+  unbookedTransactionCount?: number
 }
 
 export interface YearEndPreview {
@@ -3286,11 +3549,17 @@ export type AssetCategory =
   | 'computer'
   | 'other_tangible'
 
+/** Read type includes historical per-asset tax-method values retained on
+ *  disposed rows. New and active assets may only be written as linear. */
 export type DepreciationMethod =
   | 'linear'
   | 'declining_balance_30'
   | 'declining_balance_20'
   | 'restvardesavskrivning_25'
+
+export type WritableDepreciationMethod = 'linear'
+export type AssetDisposalType = 'sale' | 'scrap' | 'business_transfer'
+export type AssetJamkningDirection = 'increase' | 'decrease' | 'none' | 'transferred'
 
 /**
  * K3 component (BFNAR 2012:1 ch 17.4: komponentavskrivning). When a
@@ -3331,11 +3600,15 @@ export interface Asset {
   bas_asset_account: string
   bas_accumulated_account: string
   bas_expense_account: string
-  /** Book-value floor for restvärdeavskrivning (IL 18 kap 13§ st.3). Required
-   *  iff depreciation_method = 'restvardesavskrivning_25'; null otherwise. */
+  /** Deprecated legacy field. New tax depreciation is pooled per fiscal
+   *  period and ordinary per-asset depreciation is linear. */
   restvarde_target: number | null
   disposed_at: string | null
   disposed_proceeds: number | null
+  /** How the asset left the register. Null for legacy disposal records. */
+  disposal_type?: AssetDisposalType | null
+  /** Posted voucher that atomically completed the disposal. */
+  disposal_journal_entry_id?: string | null
   /** Output VAT on disposal proceeds (ML 3 kap 3 § / 7 kap 3 §). Defaults to
    *  0: only nonzero when the sale was momspliktig. The VAT account
    *  (2611/2621/2631) is derived from disposed_vat_treatment. */
@@ -3344,9 +3617,7 @@ export interface Asset {
    *  without VAT data. Constrained by DB CHECK to the same enum as
    *  VatTreatment. */
   disposed_vat_treatment: VatTreatment | null
-  /** Jämkning amount per ML 8a kap 7 §: input VAT paid back on disposal
-   *  inside the correction period. Defaults to 0; positive number = debt
-   *  to the state booked on 2641 credit. */
+  /** Absolute input VAT adjustment under ML (2023:200), chapter 15. */
   jamkning_amount: number
   /** Remaining months in the korrigeringstid at disposal date. Audit
    *  metadata only: the booking sits on the journal entry. */
@@ -3357,6 +3628,12 @@ export interface Asset {
   /** Original input VAT that was deducted at acquisition. Audit metadata
    *  the user supplies (or the system derives from the supplier invoice). */
   jamkning_original_input_vat: number | null
+  /** Current-law adjustment metadata. Old month fields remain for legacy rows. */
+  jamkning_direction?: AssetJamkningDirection | null
+  jamkning_remaining_years?: number | null
+  jamkning_total_years?: number | null
+  jamkning_original_deduction_percent?: number | null
+  jamkning_new_deduction_percent?: number | null
   /** K3 component depreciation (BFNAR 2012:1 ch.17.4). When non-null, the
    *  depreciation engine sums per-component linear depreciation instead of
    *  applying `depreciation_method` to the asset as a whole. Null for K2
@@ -3512,6 +3789,16 @@ export interface RawTransaction {
    * doesn't accidentally collide BG numbers with IBAN strings.
    */
   counterparty_account?: string | null
+  /**
+   * Payment rail the source already knows structurally (e.g. the Stripe feed's
+   * balance-transaction type). Beats every ingest-side heuristic; leave unset
+   * to let classifyTransactionMethod() derive it from codes/description/MCC.
+   */
+  transaction_method?: TransactionMethod | null
+  /** ISO 20022 bank transaction code from PSD2, verbatim (e.g. PMNT-CCRD-POSD). */
+  bank_transaction_code?: string | null
+  /** ASPSP-proprietary transaction code from PSD2, verbatim. */
+  proprietary_bank_transaction_code?: string | null
 }
 
 /** Options for the transaction ingestion pipeline */
@@ -3559,7 +3846,32 @@ export interface IngestResult {
 
 // ── Invoice extraction (used by invoice-inbox extension and core utils) ──
 
+export type ExtractedDocumentKind =
+  | 'receipt'
+  | 'supplier_invoice'
+  | 'government_letter'
+  | 'other'
+export type ExtractedPaymentMethod = 'card' | 'swish' | 'cash' | 'invoice' | 'other'
+export type ExtractedMerchantCategory =
+  | 'restaurant'
+  | 'cafe'
+  | 'taxi'
+  | 'parking'
+  | 'fuel'
+  | 'grocery'
+  | 'hotel'
+  | 'other'
+export type ExtractedLegibility = 'good' | 'partial' | 'unreadable'
+
 export interface InvoiceExtractionResult {
+  // Classification fields (2026-08): optional because extractions stored
+  // before they existed lack them. They route UI emphasis and clarifying
+  // questions only: never bookings.
+  documentKind?: ExtractedDocumentKind | null
+  merchantCategory?: ExtractedMerchantCategory | null
+  legibility?: ExtractedLegibility | null
+  purchaseTime?: string | null
+  payment?: { method: ExtractedPaymentMethod | null; cardLast4: string | null } | null
   supplier: {
     name: string | null
     orgNumber: string | null
@@ -3585,10 +3897,15 @@ export interface InvoiceExtractionResult {
     subtotal: number | null
     vatAmount: number | null
     total: number | null
+    // Öresavrundning line on Swedish receipts; negative when rounded down.
+    roundingAmount?: number | null
   }
   vatBreakdown: VatBreakdownItem[]
   confidence: number
   suggestedTemplateId?: string
+  // Set by the caller (not the model) when a long PDF was sliced before
+  // extraction: fields were read from the first `analyzed` of `total` pages.
+  pages?: { total: number; analyzed: number }
 }
 
 export interface ExtractedInvoiceLineItem {
@@ -3913,4 +4230,65 @@ export interface StoredStagedOperation {
   title?: string | null
   risk_level?: string | null
   preview_data?: unknown
+}
+
+// ============================================================
+// Körjournal (mileage trips)
+// ============================================================
+
+export type MileageVehicleType = 'own_car' | 'company_car_fossil' | 'company_car_electric'
+
+export type MileageTripStatus = 'draft' | 'booked'
+
+/** A `mileage_trips` row: one business trip in the körjournal. */
+export interface MileageTrip {
+  id: string
+  company_id: string
+  user_id: string
+  employee_id: string | null
+  trip_date: string
+  vehicle_type: MileageVehicleType
+  vehicle_registration: string | null
+  odometer_start: number | null
+  odometer_end: number | null
+  distance_km: number
+  from_location: string
+  to_location: string
+  purpose: string
+  visited: string | null
+  is_round_trip: boolean
+  status: MileageTripStatus
+  journal_entry_id: string | null
+  salary_run_id: string | null
+  notes: string | null
+  created_via: 'manual' | 'mcp' | 'import'
+  created_at: string
+  updated_at: string
+}
+
+export interface CreateMileageTripInput {
+  trip_date: string
+  vehicle_type?: MileageVehicleType
+  vehicle_registration?: string | null
+  odometer_start?: number | null
+  odometer_end?: number | null
+  distance_km: number
+  from_location: string
+  to_location: string
+  purpose: string
+  visited?: string | null
+  is_round_trip?: boolean
+  employee_id?: string | null
+  notes?: string | null
+  created_via?: 'manual' | 'mcp' | 'import'
+}
+
+/** Per-vehicle-type aggregation of draft trips for a period. */
+export interface MileagePeriodSummary {
+  vehicle_type: MileageVehicleType
+  trip_count: number
+  total_km: number
+  total_mil: number
+  rate_per_mil: number
+  amount: number
 }

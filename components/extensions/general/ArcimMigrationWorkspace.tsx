@@ -40,18 +40,21 @@ import {
 } from 'lucide-react'
 import type { WorkspaceComponentProps } from '@/lib/extensions/workspace-registry'
 
-type ArcimProvider = 'fortnox' | 'visma' | 'briox' | 'bokio' | 'bjornlunden'
+type ArcimProvider = 'fortnox' | 'visma' | 'briox' | 'bokio' | 'bjornlunden' | 'wint'
 
 // `sieViaApi`: the provider serves its general ledger as SIE over the API:
 // no manual SIE upload needed. Deliberately duplicated from
 // extensions/general/arcim-migration/types.ts (core code must not import from
 // @/extensions/: CI enforces it). Keep both lists in sync.
+// WINT is env-gated server-side (WINT_MIGRATION_ENABLED): the wizard renders
+// whatever GET /providers returns, so no client-side gate is needed here.
 const ARCIM_PROVIDERS: { id: ArcimProvider; name: string; authType: 'oauth' | 'token'; sieViaApi: boolean }[] = [
   { id: 'fortnox', name: 'Fortnox', authType: 'oauth', sieViaApi: true },
   { id: 'visma', name: 'Visma', authType: 'oauth', sieViaApi: false },
   { id: 'bokio', name: 'Bokio', authType: 'token', sieViaApi: false },
   { id: 'bjornlunden', name: 'Björn Lundén', authType: 'token', sieViaApi: true },
   { id: 'briox', name: 'Briox', authType: 'token', sieViaApi: true },
+  { id: 'wint', name: 'WINT', authType: 'token', sieViaApi: true },
 ]
 
 /**
@@ -68,6 +71,34 @@ function apiErrorMessage(data: unknown, fallback: string): string {
     if (typeof message === 'string' && message) return message
   }
   return fallback
+}
+
+/**
+ * Marks an error whose message is already user-facing Swedish (server
+ * envelopes, ImportResult.errors). The catch blocks must show these
+ * verbatim: routing them through getErrorMessage would test them against
+ * its Swedish-pattern heuristic and swallow any miss into the generic
+ * "Något gick fel. Försök igen.", hiding the real reason the migration
+ * stopped.
+ */
+class UserFacingError extends Error {}
+
+/**
+ * Build the throwable for a failed API response: an extracted server
+ * message passes through to the UI verbatim, while the technical fallback
+ * (e.g. "HTTP 500") stays a plain Error so getErrorMessage maps it to a
+ * friendly message.
+ */
+function apiError(data: unknown, fallback: string): Error {
+  const extracted = apiErrorMessage(data, '')
+  return extracted ? new UserFacingError(extracted) : new Error(fallback)
+}
+
+/** Resolve the message a catch block should display. */
+function displayError(err: unknown, nonErrorFallback?: string): string {
+  if (err instanceof UserFacingError) return err.message
+  if (!(err instanceof Error) && nonErrorFallback) return nonErrorFallback
+  return getUserErrorMessage(err)
 }
 
 /** Pull the structured error `code` from an envelope, if present. */
@@ -89,10 +120,10 @@ interface SkipReasons {
 
 interface MigrationResults {
   companyInfo?: { imported: boolean }
-  customers?: { total: number; imported: number; skipped: number; skipReasons?: SkipReasons }
-  suppliers?: { total: number; imported: number; skipped: number; skipReasons?: SkipReasons }
-  salesInvoices?: { total: number; imported: number; skipped: number; skipReasons?: SkipReasons }
-  supplierInvoices?: { total: number; imported: number; skipped: number; skipReasons?: SkipReasons }
+  customers?: { total: number; imported: number; updated?: number; skipped: number; skipReasons?: SkipReasons; errorSample?: string }
+  suppliers?: { total: number; imported: number; skipped: number; skipReasons?: SkipReasons; errorSample?: string }
+  salesInvoices?: { total: number; imported: number; skipped: number; skipReasons?: SkipReasons; errorSample?: string }
+  supplierInvoices?: { total: number; imported: number; skipped: number; skipReasons?: SkipReasons; errorSample?: string }
 }
 import AccountMappingStep from '@/components/import/AccountMappingStep'
 import type { AccountMapping, ImportResult, ParsedSIEFile } from '@/lib/import/types'
@@ -225,7 +256,10 @@ interface ConnectionStatus {
   }
 }
 
-const COMING_SOON_PROVIDERS = new Set<ArcimProvider>([])
+// WINT shows as a disabled "Kommer snart" card until the integration is
+// verified against a live WINT account. Launch = remove it here AND set
+// WINT_MIGRATION_ENABLED=true (the server-side /connect gate).
+const COMING_SOON_PROVIDERS = new Set<ArcimProvider>(['wint'])
 
 const PROVIDER_LOGOS: Record<ArcimProvider, string> = {
   fortnox: '/logos/fortnox.svg',
@@ -233,6 +267,7 @@ const PROVIDER_LOGOS: Record<ArcimProvider, string> = {
   bokio: '/logos/bokio.png',
   bjornlunden: '/logos/bjornlunden.png',
   briox: '/logos/Briox_logo.png',
+  wint: '/logos/wint.svg',
 }
 
 function ProviderStep({
@@ -263,7 +298,7 @@ function ProviderStep({
           <div className="min-w-0 flex-1">
             <p className="text-sm font-medium">SIE-import krävs först</p>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              Bokio och Visma hämtar endast kunder, leverantörer och fakturor via API:et. Bokföringsdata (kontoplan, verifikationer och balanser) måste importeras via SIE-fil först. Gäller inte Fortnox, Briox och Björn Lundén: där hämtar vi SIE direkt via API:et.
+              Bokio och Visma hämtar endast kunder, leverantörer och fakturor via API:et. Bokföringsdata (kontoplan, verifikationer och balanser) måste importeras via SIE-fil först. Gäller inte Fortnox, Briox, Björn Lundén och WINT: där hämtar vi bokföringen direkt via API:et.
             </p>
             <Link
               href="/import?mode=sie"
@@ -472,24 +507,34 @@ function ConnectStep({
 
   // BL uses server-side client credentials: only needs company ID, no API key
   const isClientCredentials = provider === 'bjornlunden'
+  // WINT has no API keys: the "token" is the user's WINT login (e-post +
+  // lösenord), exchanged server-side for ett tokenpar; lösenordet sparas aldrig.
+  const isWintLogin = provider === 'wint'
   const needsApiToken = !isClientCredentials
-  // Briox: the account ID is the `clientid` half of the token exchange
-  const needsCompanyId = provider === 'bokio' || provider === 'bjornlunden' || provider === 'briox'
+  // Briox: the account ID is the `clientid` half of the token exchange;
+  // WINT reuses the same field for the login e-mail.
+  const needsCompanyId = provider === 'bokio' || provider === 'bjornlunden' || provider === 'briox' || provider === 'wint'
   const companyIdLabel = provider === 'briox'
     ? 'Konto-ID'
     : provider === 'bjornlunden'
       ? 'Företagsnyckel (User-Key)'
-      : 'Företags-ID'
+      : provider === 'wint'
+        ? 'E-postadress'
+        : 'Företags-ID'
 
   const tokenDescription = isClientCredentials
     ? `Ange din företagsnyckel (User-Key) från Björn Lundén. ${branding.appName.toLowerCase()} ansluter automatiskt via sin integrationspartner-åtkomst.`
-    : provider === 'briox'
-      ? `Ange ditt konto-ID och din applikationstoken från Briox för att ge ${branding.appName.toLowerCase()} tillgång att läsa din bokföringsdata.`
-      : `Ange din API-nyckel från ${providerName} för att ge ${branding.appName.toLowerCase()} tillgång att läsa din bokföringsdata.`
+    : isWintLogin
+      ? `Logga in med dina WINT-uppgifter för att ge ${branding.appName.toLowerCase()} tillgång att läsa din bokföringsdata. Lösenordet används en gång för att skapa anslutningen och sparas aldrig.`
+      : provider === 'briox'
+        ? `Ange ditt konto-ID och din applikationstoken från Briox för att ge ${branding.appName.toLowerCase()} tillgång att läsa din bokföringsdata.`
+        : `Ange din API-nyckel från ${providerName} för att ge ${branding.appName.toLowerCase()} tillgång att läsa din bokföringsdata.`
 
   const tokenHelpText = isClientCredentials
     ? `Företagsnyckeln (User-Key) är ett GUID som du hittar i Lundify under Integrationer → kugghjulet vid integrationen, eller i aktiveringsmejlet från Björn Lundén.`
-    : provider === 'bokio'
+    : isWintLogin
+      ? `Använd samma e-postadress och lösenord som när du loggar in på app.wint.se. Kräver ditt WINT-konto BankID-inloggning kan anslutningen inte skapas ännu: be i så fall WINT om en SIE-fil och importera den manuellt.`
+      : provider === 'bokio'
       ? `Du hittar din API-nyckel i ${providerName} under Inställningar \u2192 Integrationer \u2192 API. Ditt företags-ID är det GUID som syns i URL:en när du är inloggad, t.ex. https://app.bokio.se/ditt-företags-id/settings-r/private-integrations.`
       : provider === 'briox'
         ? `Skapa din applikationstoken i Briox under Admin \u2192 Anv\u00e4ndare \u2192 kugghjulet vid din anv\u00e4ndare \u2192 Applikationstoken. Ditt konto-ID \u00e4r det l\u00e5nga numret inom parentes bredvid f\u00f6retagsnamnet under "Ditt konto" i menyn till h\u00f6ger.`
@@ -581,38 +626,50 @@ function ConnectStep({
               <p className="text-sm text-muted-foreground">
                 {tokenHelpText}
               </p>
-              <div className="space-y-3">
+              {/* WINT is a login form: e-mail reads above password (CSS order;
+                  the button keeps its place). Other token providers keep
+                  token-first order. */}
+              <div className={cn('space-y-3', isWintLogin && 'flex flex-col gap-3 space-y-0')}>
                 {needsApiToken && (
-                  <div>
+                  <div className={cn(isWintLogin && 'order-2')}>
                     <label htmlFor="apiToken" className="text-sm font-medium">
-                      {provider === 'briox' ? 'Applikationstoken' : 'API-nyckel'}
+                      {provider === 'briox' ? 'Applikationstoken' : isWintLogin ? 'Lösenord' : 'API-nyckel'}
                     </label>
                     <Input
                       id="apiToken"
                       name="apiToken_nocomplete"
                       type="password"
                       autoComplete="new-password"
-                      placeholder={provider === 'briox' ? 'Klistra in din applikationstoken' : 'Klistra in din API-nyckel'}
+                      placeholder={
+                        provider === 'briox'
+                          ? 'Klistra in din applikationstoken'
+                          : isWintLogin
+                            ? 'Ditt lösenord hos WINT'
+                            : 'Klistra in din API-nyckel'
+                      }
                       value={apiToken}
                       onChange={(e) => setApiToken(e.target.value)}
                     />
                   </div>
                 )}
                 {needsCompanyId && (
-                  <div>
+                  <div className={cn(isWintLogin && 'order-1')}>
                     <label htmlFor="companyId" className="text-sm font-medium">
                       {companyIdLabel}
                     </label>
                     <Input
                       id="companyId"
                       name="companyId_nocomplete"
+                      type={isWintLogin ? 'email' : 'text'}
                       autoComplete="new-password"
                       placeholder={
                         isClientCredentials
                           ? 'Företagsnyckel, t.ex. 1f0e2d3c-4b5a-...'
                           : provider === 'briox'
                             ? 'Det långa numret inom parentes, t.ex. 35649125'
-                            : 'GUID från URL:en, t.ex. 14ccad83-67f6-49bd-...'
+                            : isWintLogin
+                              ? 'namn@foretaget.se'
+                              : 'GUID från URL:en, t.ex. 14ccad83-67f6-49bd-...'
                       }
                       value={companyId}
                       onChange={(e) => setCompanyId(e.target.value)}
@@ -620,7 +677,7 @@ function ConnectStep({
                   </div>
                 )}
                 <Button
-                  className="min-h-11"
+                  className={cn('min-h-11', isWintLogin && 'order-3')}
                   onClick={() => onTokenSubmit(apiToken, companyId)}
                   disabled={!canSubmit}
                 >
@@ -1497,7 +1554,7 @@ function ResultStep({
   // Check if anything meaningful was imported via entities
   // Company info is always re-fetched (upsert) so it doesn't count as "new"
   const entityImported = results && (
-    (results.customers && (results.customers.imported > 0 || results.customers.skipped > 0)) ||
+    (results.customers && (results.customers.imported > 0 || (results.customers.updated ?? 0) > 0 || results.customers.skipped > 0)) ||
     (results.suppliers && (results.suppliers.imported > 0 || results.suppliers.skipped > 0)) ||
     (results.salesInvoices && (results.salesInvoices.imported > 0 || results.salesInvoices.skipped > 0)) ||
     (results.supplierInvoices && (results.supplierInvoices.imported > 0 || results.supplierInvoices.skipped > 0))
@@ -1559,7 +1616,7 @@ function ResultStep({
       {/* ── API import results (company info, customers, etc.) ── */}
       {results && (() => {
         const hasCompanyInfo = results.companyInfo?.imported
-        const hasCustomers = results.customers && (results.customers.imported > 0 || results.customers.skipped > 0)
+        const hasCustomers = results.customers && (results.customers.imported > 0 || (results.customers.updated ?? 0) > 0 || results.customers.skipped > 0)
         const hasSuppliers = results.suppliers && (results.suppliers.imported > 0 || results.suppliers.skipped > 0)
         const hasSalesInvoices = results.salesInvoices && (results.salesInvoices.imported > 0 || results.salesInvoices.skipped > 0)
         const hasSupplierInvoices = results.supplierInvoices && (results.supplierInvoices.imported > 0 || results.supplierInvoices.skipped > 0)
@@ -1586,36 +1643,38 @@ function ResultStep({
                 <EntityResultRow
                   icon={<Users className="h-4 w-4" />}
                   label="Kunder"
-                  status="success"
-                  statusText={`${results.customers!.imported} importerade`}
-                  detail={results.customers!.skipped > 0 ? formatSkipReasons(results.customers!.skipReasons, 'customer') ?? `${results.customers!.skipped} hoppades över` : undefined}
+                  status={entityRowStatus(results.customers!.imported, results.customers!.skipReasons)}
+                  statusText={results.customers!.updated
+                    ? `${results.customers!.imported} importerade, ${results.customers!.updated} kompletterade`
+                    : `${results.customers!.imported} importerade`}
+                  detail={results.customers!.skipped > 0 ? formatSkipReasons(results.customers!.skipReasons, 'customer', results.customers!.errorSample) ?? `${results.customers!.skipped} hoppades över` : undefined}
                 />
               )}
               {hasSuppliers && (
                 <EntityResultRow
                   icon={<Truck className="h-4 w-4" />}
                   label="Leverantörer"
-                  status="success"
+                  status={entityRowStatus(results.suppliers!.imported, results.suppliers!.skipReasons)}
                   statusText={`${results.suppliers!.imported} importerade`}
-                  detail={results.suppliers!.skipped > 0 ? formatSkipReasons(results.suppliers!.skipReasons, 'supplier') ?? `${results.suppliers!.skipped} hoppades över` : undefined}
+                  detail={results.suppliers!.skipped > 0 ? formatSkipReasons(results.suppliers!.skipReasons, 'supplier', results.suppliers!.errorSample) ?? `${results.suppliers!.skipped} hoppades över` : undefined}
                 />
               )}
               {hasSalesInvoices && (
                 <EntityResultRow
                   icon={<FileText className="h-4 w-4" />}
                   label="Kundfakturor"
-                  status="success"
+                  status={entityRowStatus(results.salesInvoices!.imported, results.salesInvoices!.skipReasons)}
                   statusText={`${results.salesInvoices!.imported} importerade`}
-                  detail={results.salesInvoices!.skipped > 0 ? formatSkipReasons(results.salesInvoices!.skipReasons, 'invoice') ?? `${results.salesInvoices!.skipped} hoppades över` : undefined}
+                  detail={results.salesInvoices!.skipped > 0 ? formatSkipReasons(results.salesInvoices!.skipReasons, 'invoice', results.salesInvoices!.errorSample) ?? `${results.salesInvoices!.skipped} hoppades över` : undefined}
                 />
               )}
               {hasSupplierInvoices && (
                 <EntityResultRow
                   icon={<FileText className="h-4 w-4" />}
                   label="Leverantörsfakturor"
-                  status="success"
+                  status={entityRowStatus(results.supplierInvoices!.imported, results.supplierInvoices!.skipReasons)}
                   statusText={`${results.supplierInvoices!.imported} importerade`}
-                  detail={results.supplierInvoices!.skipped > 0 ? formatSkipReasons(results.supplierInvoices!.skipReasons, 'invoice') ?? `${results.supplierInvoices!.skipped} hoppades över` : undefined}
+                  detail={results.supplierInvoices!.skipped > 0 ? formatSkipReasons(results.supplierInvoices!.skipReasons, 'invoice', results.supplierInvoices!.errorSample) ?? `${results.supplierInvoices!.skipped} hoppades över` : undefined}
                 />
               )}
             </div>
@@ -1683,7 +1742,11 @@ function ResultStep({
   )
 }
 
-function formatSkipReasons(reasons?: SkipReasons, entityType?: 'customer' | 'supplier' | 'invoice'): string | undefined {
+function formatSkipReasons(
+  reasons?: SkipReasons,
+  entityType?: 'customer' | 'supplier' | 'invoice',
+  errorSample?: string,
+): string | undefined {
   if (!reasons) return undefined
   const parts: string[] = []
   if (reasons.duplicate) parts.push(`${reasons.duplicate} fanns redan`)
@@ -1692,8 +1755,19 @@ function formatSkipReasons(reasons?: SkipReasons, entityType?: 'customer' | 'sup
     const matchLabel = entityType === 'invoice' ? 'utan matchning' : 'utan matchning'
     parts.push(`${reasons.noMatch} ${matchLabel}`)
   }
-  if (reasons.failed) parts.push(`${reasons.failed} misslyckades`)
+  if (reasons.failed) {
+    parts.push(
+      errorSample
+        ? `${reasons.failed} misslyckades: ${errorSample.slice(0, 140)}`
+        : `${reasons.failed} misslyckades`
+    )
+  }
   return parts.length > 0 ? parts.join(', ') : undefined
+}
+
+/** A step that failed everything it tried is an error, not a green checkmark. */
+function entityRowStatus(imported: number, reasons?: SkipReasons): 'success' | 'error' {
+  return imported === 0 && (reasons?.failed ?? 0) > 0 ? 'error' : 'success'
 }
 
 /** Simple row for non-SIE entity results (customers, invoices, etc.) */
@@ -1706,7 +1780,7 @@ function EntityResultRow({
 }: {
   icon: React.ReactNode
   label: string
-  status: 'success' | 'skipped'
+  status: 'success' | 'skipped' | 'error'
   statusText: string
   detail?: string
 }) {
@@ -1718,7 +1792,7 @@ function EntityResultRow({
         <p className="text-sm text-muted-foreground">{statusText}</p>
         {detail && <p className="text-sm text-muted-foreground/70">{detail}</p>}
       </div>
-      <StatusIcon status={status === 'success' ? 'success' : 'warning'} />
+      <StatusIcon status={status === 'skipped' ? 'warning' : status} />
     </div>
   )
 }
@@ -2092,11 +2166,11 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
         const validationErrors = data?.error === 'validation' ? data.validation?.errors : undefined
         if (Array.isArray(validationErrors)) {
           setErrorDetails(validationErrors.filter((e): e is string => typeof e === 'string'))
-          throw new Error(
+          throw new UserFacingError(
             'Bokföringsdatan hos leverantören klarade inte valideringen. Felen nedan måste rättas i källsystemet innan importen kan fortsätta.'
           )
         }
-        throw new Error(apiErrorMessage(data, `HTTP ${res.status}`))
+        throw apiError(data, `HTTP ${res.status}`)
       }
 
       const data = await res.json()
@@ -2112,7 +2186,7 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
         setStep('options')
       }
     } catch (err) {
-      setError(err instanceof Error ? getUserErrorMessage(err) : 'Kunde inte hämta SIE-data')
+      setError(displayError(err, 'Kunde inte hämta SIE-data'))
     } finally {
       setIsLoading(false)
     }
@@ -2194,7 +2268,7 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
 
           if (!res.ok) {
             const data = await res.json().catch(() => ({}))
-            throw new Error(apiErrorMessage(data, `SIE import HTTP ${res.status}`))
+            throw apiError(data, `SIE import HTTP ${res.status}`)
           }
 
           const result = await res.json() as ImportResult
@@ -2205,7 +2279,7 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
           // to /migrate would hit its SIE-guard, whose "SIE måste importeras
           // först" message masks the real error.
           if (!result.success) {
-            throw new Error(result.errors.length > 0
+            throw new UserFacingError(result.errors.length > 0
               ? result.errors.join('\n')
               : 'SIE-importen misslyckades utan felmeddelande.')
           }
@@ -2238,7 +2312,7 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
 
         if (!res.ok) {
           const data = await res.json().catch(() => ({}))
-          throw new Error(apiErrorMessage(data, `HTTP ${res.status}`))
+          throw apiError(data, `HTTP ${res.status}`)
         }
 
         const data = await res.json()
@@ -2262,8 +2336,7 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
         description: 'Din bokföringsdata har importerats.',
       })
     } catch (err) {
-      const msg = getUserErrorMessage(err)
-      setError(msg)
+      setError(displayError(err))
       setStep('result')
     }
   }, [consentId, migrationOptions, sieData, toast])

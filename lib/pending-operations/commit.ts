@@ -24,7 +24,10 @@ import {
 } from '@/lib/currency/supplier-invoice-rate'
 import { roundOre } from '@/lib/money'
 import { validateVatNumber } from '@/lib/vat/vies-client'
-import { normalizeVatRateToDecimal } from '@/lib/vat/supplier-invoice-line-checks'
+import {
+  normalizeVatRateToDecimal,
+  normalizeVatRateToFraction,
+} from '@/lib/vat/supplier-invoice-line-checks'
 import {
   createInvoicePaymentJournalEntry,
   createInvoiceCashEntry,
@@ -32,6 +35,7 @@ import {
   createCreditNoteJournalEntry,
 } from '@/lib/bookkeeping/invoice-entries'
 import { resolveSettlementAccount } from '@/lib/bookkeeping/settlement-account'
+import { cashPartialBlockReason, supplierCreditNoteNeedsJournalEntry } from '@/lib/bookkeeping/booking-mode'
 import { ensureManualCashAccount } from '@/lib/cash-accounts/service'
 import { createJournalEntry, findFiscalPeriod, getSwedishLocalDate, reverseEntry, validateBalance } from '@/lib/bookkeeping/engine'
 import {
@@ -57,6 +61,12 @@ import { linkInvoiceToVoucher } from '@/lib/invoices/voucher-matching'
 import { planInvoicePayment } from '@/lib/invoices/apply-invoice-payment'
 import { findDuplicatePaymentCandidatesForInvoice } from '@/lib/invoices/duplicate-payment-candidates'
 import { linkSupplierInvoiceToVoucher } from '@/lib/invoices/supplier-voucher-matching'
+import { clearSettledInvoiceSuggestions } from '@/lib/invoices/clear-settled-invoice-suggestions'
+import { paidAtFromDate } from '@/lib/invoices/paid-at'
+import {
+  clearSettledBatchAllocationSuggestions,
+  type BatchAllocationResult,
+} from '@/lib/invoices/clear-settled-batch-allocations'
 import { linkTransactionToJournalEntry } from '@/lib/transactions/link-journal-entry'
 import { getErrorEntry } from '@/lib/errors/structured-errors'
 import { parseSIEFile } from '@/lib/import/sie-parser'
@@ -115,6 +125,7 @@ import {
 import {
   computeInitialRunDate,
   computeNextRunDate,
+  rollNextRunDateForward,
   getStockholmDateHour,
 } from '@/lib/invoices/recurring-schedule-service'
 import { UpdateInvoiceParamsSchema } from '@/lib/pending-operations/schemas/update-invoice'
@@ -125,6 +136,7 @@ import {
 } from '@/lib/invoices/build-invoice-write'
 import { isEditableInvoiceDraft } from '@/lib/invoices/is-editable-draft'
 import { replaceInvoiceItems } from '@/lib/invoices/replace-invoice-items'
+import { applyRecurringScheduleUpdate } from '@/lib/invoices/apply-recurring-schedule-update'
 import { BulkBookInboxSchema } from '@/lib/api/schemas'
 import { ensureArticleNumber } from '@/lib/articles/ensure-article-number'
 import { isValidRevenueAccount } from '@/lib/articles/validate-revenue-account'
@@ -159,10 +171,13 @@ export interface CommitResult {
   error?: string
   http_status?: number
   auto_rejected?: boolean
-  // Set when the commit failed because the booking posts to BAS accounts not
-  // active in the company chart. Recoverable: the op is left 'pending' so the
-  // caller can activate the accounts and retry. Lets the route rebuild the
-  // structured ACCOUNTS_NOT_IN_CHART envelope (code + account_numbers).
+  // Structured-error registry code for the failure, when one is known, so a
+  // caller can branch on the failure mode instead of parsing `error` text.
+  // ACCOUNTS_NOT_IN_CHART is the recoverable case: the booking posts to BAS
+  // accounts not active in the company chart, the op is left 'pending', and
+  // the route rebuilds the structured envelope (code + account_numbers).
+  // Other codes (e.g. INVOICE_RECURRING_UPDATE_PARTIAL) are informational:
+  // callers that do not recognize the code fall back to `error`.
   code?: string
   account_numbers?: string[]
 }
@@ -238,6 +253,10 @@ async function recordSkippedInvoiceJournalEntry(
 type ExecutorResult = {
   data?: Record<string, unknown>
   error?: string
+  // Structured-error registry code for `error`, when the executor has one.
+  // Surfaced as CommitResult.code and persisted in result_data.error_code so a
+  // caller can branch on the failure mode instead of parsing the message text.
+  errorCode?: string
   status?: number
   // Set when the executor already performed an irreversible side-effect
   // (posted voucher, persisted credit note) before the failure in `error`:
@@ -541,6 +560,7 @@ async function commitCreateRecurringSchedule(
       customer_id: validated.customer_id,
       name: validated.name,
       day_of_month: validated.day_of_month,
+      interval_months: validated.interval_months,
       send_hour: validated.send_hour,
       payment_terms_days: validated.payment_terms_days,
       currency: validated.currency,
@@ -548,6 +568,7 @@ async function commitCreateRecurringSchedule(
       our_reference: validated.our_reference ?? null,
       notes: validated.notes ?? null,
       auto_send: validated.auto_send,
+      default_dimensions: validated.default_dimensions ?? {},
       next_run_date: nextRunDate,
       status: 'active',
     })
@@ -566,6 +587,7 @@ async function commitCreateRecurringSchedule(
     unit: item.unit,
     unit_price: item.unit_price,
     vat_rate: item.vat_rate ?? null,
+    dimensions: item.dimensions ?? {},
   }))
 
   const { error: itemsError } = await supabase
@@ -590,6 +612,7 @@ async function commitCreateRecurringSchedule(
       name: validated.name,
       customer_id: validated.customer_id,
       day_of_month: validated.day_of_month,
+      interval_months: validated.interval_months,
       send_hour: validated.send_hour,
       currency: validated.currency,
       auto_send: validated.auto_send,
@@ -624,7 +647,7 @@ async function commitUpdateRecurringSchedule(
 
   const { data: existing, error: existingError } = await supabase
     .from('recurring_invoice_schedules')
-    .select('id, status, auto_send, customer_id, day_of_month, next_run_date')
+    .select('id, status, auto_send, customer_id, day_of_month, interval_months, next_run_date')
     .eq('id', scheduleId)
     .eq('company_id', companyId)
     .maybeSingle()
@@ -671,16 +694,29 @@ async function commitUpdateRecurringSchedule(
     const dayChanged =
       changes.day_of_month !== undefined && changes.day_of_month !== existing.day_of_month
     const effectiveDay = changes.day_of_month ?? existing.day_of_month
+    const effectiveInterval = changes.interval_months ?? existing.interval_months ?? 1
     const { date: todayStockholm } = getStockholmDateHour(new Date())
     const stockholmToday = new Date(`${todayStockholm}T00:00:00Z`)
 
     const staleOnReactivate = reactivating && existing.next_run_date <= todayStockholm
     if (staleOnReactivate || dayChanged) {
-      const rolled = computeInitialRunDate(stockholmToday, effectiveDay)
-      updateRow.next_run_date =
-        rolled === todayStockholm
-          ? computeNextRunDate(stockholmToday, effectiveDay)
-          : rolled
+      if (effectiveInterval === 1) {
+        // Monthly keeps its long-standing today-anchored semantics.
+        const rolled = computeInitialRunDate(stockholmToday, effectiveDay)
+        updateRow.next_run_date =
+          rolled === todayStockholm
+            ? computeNextRunDate(stockholmToday, effectiveDay)
+            : rolled
+      } else {
+        // Interval schedules roll on their own month grid so an edit or
+        // reactivation cannot shift a quarterly schedule off its phase.
+        updateRow.next_run_date = rollNextRunDateForward(
+          existing.next_run_date,
+          stockholmToday,
+          effectiveDay,
+          effectiveInterval,
+        )
+      }
     }
 
     // A conscious reactivation invalidates any lingering warning.
@@ -689,73 +725,40 @@ async function commitUpdateRecurringSchedule(
     }
   }
 
-  if (Object.keys(updateRow).length > 0) {
-    const { error: updateError } = await supabase
-      .from('recurring_invoice_schedules')
-      .update(updateRow)
-      .eq('id', scheduleId)
-      .eq('company_id', companyId)
-
-    if (updateError) return { error: updateError.message, status: 500 }
-  }
-
-  let itemsReplaced = false
-  if (items) {
-    // Provided = replace all; omitted = keep existing (the schema contract).
-    // Snapshot first so a failed insert can restore the previous lines: an
-    // item-less schedule makes every cron run throw "schedule has no items"
-    // and silently skip billing dates.
-    const { data: previousItems } = await supabase
-      .from('recurring_invoice_schedule_items')
-      .select('sort_order, description, quantity, unit, unit_price, vat_rate')
-      .eq('schedule_id', scheduleId)
-
-    await supabase
-      .from('recurring_invoice_schedule_items')
-      .delete()
-      .eq('schedule_id', scheduleId)
-
-    const itemRows = items.map((item, idx) => ({
-      schedule_id: scheduleId,
-      sort_order: idx,
-      description: item.description,
-      quantity: item.quantity,
-      unit: item.unit,
-      unit_price: item.unit_price,
-      vat_rate: item.vat_rate ?? null,
-    }))
-
-    const { error: itemsError } = await supabase
-      .from('recurring_invoice_schedule_items')
-      .insert(itemRows)
-
-    if (itemsError) {
-      // Restore the snapshot so the schedule stays valid for the cron.
-      if (previousItems && previousItems.length > 0) {
-        const restoreRows = previousItems.map((row) => ({
-          schedule_id: scheduleId,
-          sort_order: row.sort_order,
-          description: row.description,
-          quantity: row.quantity,
-          unit: row.unit,
-          unit_price: row.unit_price,
-          vat_rate: row.vat_rate,
-        }))
-        const { error: restoreError } = await supabase
-          .from('recurring_invoice_schedule_items')
-          .insert(restoreRows)
-        if (restoreError) {
-          log.error(
-            'failed to restore schedule items after failed replace: schedule may be left empty',
-            restoreError,
-            { scheduleId },
-          )
-        }
+  // Items provided = replace all; omitted = keep existing (the schema
+  // contract). The shared helper compensates BOTH writes on failure, so an
+  // item failure cannot leave the header fields half-saved.
+  const result = await applyRecurringScheduleUpdate(supabase, {
+    scheduleId,
+    companyId,
+    fields: updateRow,
+    items,
+    log,
+  })
+  if (!result.ok) {
+    if (result.stage !== 'header' && (!result.itemsRestored || !result.headerRestored)) {
+      // Same registry sentence the PATCH route returns, so the two surfaces
+      // cannot drift on what the user is told.
+      const partial = getErrorEntry('INVOICE_RECURRING_UPDATE_PARTIAL')
+      log.error('recurring schedule update left a partial state', result.error, {
+        scheduleId,
+        companyId,
+        stage: result.stage,
+        itemsRestored: result.itemsRestored,
+        headerRestored: result.headerRestored,
+      })
+      return {
+        error: `${partial?.message_sv ?? 'Ändringen kunde inte slutföras.'} (${result.error.message})`,
+        // Machine-readable twin of the PATCH route's envelope code, so an
+        // MCP/staged-op caller can detect the partial state without
+        // substring-matching the Swedish sentence.
+        errorCode: 'INVOICE_RECURRING_UPDATE_PARTIAL',
+        status: 500,
       }
-      return { error: itemsError.message, status: 500 }
     }
-    itemsReplaced = true
+    return { error: result.error.message, status: 500 }
   }
+  const itemsReplaced = Boolean(items)
 
   return {
     data: {
@@ -2003,6 +2006,26 @@ async function commitMarkInvoicePaid(
   }
   const { newPaidAmount, newRemaining, newStatus } = payment.plan
 
+  // The generated cash entry books the FULL invoice: refuse to complete a
+  // previously part-paid, never-booked kontantmetoden invoice (it would book
+  // the full total a second time on the settlement account). A partial cannot
+  // arise here (this path always settles the full remaining), but the shared
+  // predicate covers it for safety.
+  const cashBlock = cashPartialBlockReason({
+    invoiceAlreadyBooked,
+    accountingMethod,
+    priorPaidAmount: inv.paid_amount,
+    paysRemainingInFull: newStatus === 'paid',
+  })
+  if (isRealInvoice && cashBlock) {
+    return {
+      error:
+        getErrorEntry('INVOICE_PAID_CASH_PARTIAL_UNSUPPORTED')?.message_sv ??
+        'Kontantmetoden kan inte bokföra delbetalningar av en obokförd faktura automatiskt.',
+      status: 400,
+    }
+  }
+
   if (isRealInvoice) {
     if (useCashEntry) {
       const je = await createInvoiceCashEntry(
@@ -2030,7 +2053,7 @@ async function commitMarkInvoicePaid(
     }
   }
 
-  const now = new Date().toISOString()
+  const paidAt = newStatus === 'paid' ? paidAtFromDate(paymentDate) : null
   // CAS guard: only flip from a payable status so a concurrently-settled
   // invoice no-ops here instead of double-booking the payment.
   const { data: updateResult, error: updateError } = await supabase
@@ -2039,7 +2062,7 @@ async function commitMarkInvoicePaid(
       status: newStatus,
       paid_amount: newPaidAmount,
       remaining_amount: newRemaining,
-      ...(newStatus === 'paid' ? { paid_at: now } : {}),
+      ...(paidAt ? { paid_at: paidAt } : {}),
     })
     .eq('id', invoiceId)
     .eq('company_id', companyId)
@@ -2074,6 +2097,13 @@ async function commitMarkInvoicePaid(
     }
   }
 
+  // Fully settled: retire every transaction's suggestion pointer at this
+  // invoice (issue #1259). No exceptTransactionId: this flow is not driven by
+  // a bank transaction, so any pointer at it is now dead.
+  if (newStatus === 'paid') {
+    await clearSettledInvoiceSuggestions(supabase, companyId, 'invoice', invoiceId)
+  }
+
   // Notify subscribers: invoice.paid fans out to registered webhooks
   // (lib/webhooks/handler.ts). Best-effort: the payment is already committed,
   // so an emit failure must not fail the operation. Parity with the v1 and
@@ -2087,7 +2117,7 @@ async function commitMarkInvoicePaid(
           status: newStatus,
           paid_amount: newPaidAmount,
           remaining_amount: newRemaining,
-          paid_at: newStatus === 'paid' ? now : (invoice as Invoice).paid_at,
+          paid_at: paidAt ?? (invoice as Invoice).paid_at,
         } as Invoice,
         companyId,
         userId,
@@ -2170,6 +2200,8 @@ async function commitSendInvoice(
     to: customer.email,
     configuredCc: company.invoice_email_cc_addresses,
     configuredBcc: company.invoice_email_bcc_addresses,
+    customerCc: customer.invoice_email_cc_addresses,
+    customerBcc: customer.invoice_email_bcc_addresses,
     legacyCc: company.email || userEmail,
   })
   if (exceedsInvoiceEmailRecipientLimit(recipients)) {
@@ -2507,8 +2539,7 @@ async function commitMatchTransactionInvoice(
     }
   }
   const { newPaidAmount, newRemaining, isFullyPaid, newStatus } = payment.plan
-
-  const now = new Date().toISOString()
+  const paidAt = isFullyPaid ? paidAtFromDate(transaction.date) : null
 
   // Read-only prevalidation, deliberately hoisted ABOVE the irreversible
   // storno below (issue #842): resolveSettlementAccount can throw
@@ -2525,6 +2556,27 @@ async function commitMatchTransactionInvoice(
   // the match-invoice route fix: see that handler for the full rationale.
   const invoiceAlreadyBooked = !!(invoice as { journal_entry_id?: string | null }).journal_entry_id
   const useCashEntry = !invoiceAlreadyBooked && accountingMethod === 'cash' && isFullyPaid
+
+  // Reject cash-method partials and part-paid completions on never-booked
+  // invoices BEFORE the irreversible storno below. The old fallback booked an
+  // accrual-style clearing entry against an EMPTY 1510 (negative receivable,
+  // no revenue, no moms: bokslutsmetoden reports moms at payment, per
+  // installment), and the cash builder books the FULL invoice, so
+  // neither shape is bookable here. Mirrors the dashboard and v1 match routes.
+  const cashBlock = cashPartialBlockReason({
+    invoiceAlreadyBooked,
+    accountingMethod,
+    priorPaidAmount: (invoice as { paid_amount?: number | null }).paid_amount,
+    paysRemainingInFull: isFullyPaid,
+  })
+  if (cashBlock) {
+    return {
+      error:
+        getErrorEntry('INVOICE_PAID_CASH_PARTIAL_UNSUPPORTED')?.message_sv ??
+        'Kontantmetoden kan inte bokföra delbetalningar av en obokförd faktura automatiskt.',
+      status: 400,
+    }
+  }
 
   // Debit the cash account THIS transaction actually belongs to, never a
   // hardcoded 1930: cash_account_id -> cash_accounts.ledger_account is the
@@ -2584,7 +2636,7 @@ async function commitMatchTransactionInvoice(
     .from('invoices')
     .update({
       status: newStatus,
-      paid_at: isFullyPaid ? now : null,
+      paid_at: paidAt,
       paid_amount: newPaidAmount,
       remaining_amount: newRemaining,
     })
@@ -2607,9 +2659,9 @@ async function commitMatchTransactionInvoice(
     }
   }
 
-  const paymentNotes = (accountingMethod === 'cash' && !isFullyPaid)
-    ? 'Kontantmetoden: intäkt bokförs vid slutbetalning' : null
-
+  // No cash-method note here anymore: pure kontantmetoden partials are now
+  // rejected above, and for an invoice booked at send the clearing entry
+  // handles a partial correctly, so the note would be misleading.
   await supabase.from('invoice_payments').insert({
     user_id: userId,
     company_id: companyId,
@@ -2620,8 +2672,17 @@ async function commitMatchTransactionInvoice(
     exchange_rate: invoice.exchange_rate,
     journal_entry_id: journalEntryId,
     transaction_id: transactionId,
-    notes: paymentNotes,
+    notes: null,
   })
+
+  // The invoice is now settled, so every OTHER transaction still carrying a
+  // suggestion pointer at it is dead: retire them (issue #1259). This
+  // operation's own row is cleared by the update just below.
+  if (isFullyPaid) {
+    await clearSettledInvoiceSuggestions(supabase, companyId, 'invoice', invoiceId, {
+      exceptTransactionId: transactionId,
+    })
+  }
 
   await supabase
     .from('transactions')
@@ -2637,7 +2698,25 @@ async function commitMatchTransactionInvoice(
   try {
     await eventBus.emit({
       type: 'invoice.match_confirmed',
-      payload: { invoice: invoice as Invoice, transaction: transaction as Transaction, userId, companyId },
+      payload: {
+        invoice: {
+          ...(invoice as Invoice),
+          status: newStatus,
+          paid_at: paidAt,
+          paid_amount: newPaidAmount,
+          remaining_amount: newRemaining,
+        } as Invoice,
+        transaction: {
+          ...(transaction as Transaction),
+          invoice_id: invoiceId,
+          potential_invoice_id: null,
+          journal_entry_id: journalEntryId,
+          is_business: true,
+          category: 'income_services',
+        } as Transaction,
+        userId,
+        companyId,
+      },
     })
   } catch { /* non-critical */ }
 
@@ -3713,7 +3792,7 @@ async function commitCreditSupplierInvoice(
     line_total: item.line_total,
     account_number: item.account_number,
     vat_code: item.vat_code,
-    vat_rate: item.vat_rate,
+    vat_rate: normalizeVatRateToFraction(item.vat_rate),
     vat_amount: item.vat_amount,
     dimensions: item.dimensions ?? {},
   }))
@@ -3724,14 +3803,17 @@ async function commitCreditSupplierInvoice(
   const accountingMethod = settings?.accounting_method || 'accrual'
 
   let journalEntryId: string | null = null
-  if (accountingMethod === 'accrual') {
+  // Kontantmetoden skips only while the original is still UNPAID: a paid one
+  // was already booked by its payment verifikat (expense + 2641 ingående
+  // moms), and leaving that un-reversed overstates cost and moms deduction.
+  if (supplierCreditNoteNeedsJournalEntry(accountingMethod, original)) {
     try {
       const je = await createSupplierCreditNoteEntry(
         supabase,
         companyId,
         userId,
         creditNote,
-        creditItems as never,
+        original.items as never,
         original.supplier?.supplier_type || 'swedish_business',
         original.supplier?.name
       )
@@ -4579,6 +4661,106 @@ async function commitCreateSalaryRun(
   }
 }
 
+async function commitLogMileageTrip(
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  params: Record<string, unknown>
+): Promise<ExecutorResult> {
+  try {
+    const { createTrip } = await import('@/lib/mileage/mileage-service')
+    const trip = await createTrip(supabase, companyId, userId, {
+      trip_date: params.trip_date as string,
+      vehicle_type: params.vehicle_type as never,
+      vehicle_registration: (params.vehicle_registration as string) || null,
+      odometer_start: (params.odometer_start as number) ?? null,
+      odometer_end: (params.odometer_end as number) ?? null,
+      distance_km: params.distance_km as number,
+      from_location: params.from_location as string,
+      to_location: params.to_location as string,
+      purpose: params.purpose as string,
+      visited: (params.visited as string) || null,
+      is_round_trip: params.is_round_trip === true,
+      employee_id: (params.employee_id as string) || null,
+      notes: (params.notes as string) || null,
+      created_via: 'mcp',
+    })
+    return {
+      data: {
+        mileage_trip_id: trip.id,
+        trip_date: trip.trip_date,
+        distance_km: trip.distance_km,
+        status: trip.status,
+      },
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to log mileage trip'
+    // Input-validation failures from the service are permanent for these
+    // params: 400 so agents fix the arguments instead of retrying blindly.
+    const isValidation = /registreringsnummer|hittades inte/i.test(message)
+    return { error: message, status: isValidation ? 400 : 500 }
+  }
+}
+
+async function commitBookMileagePeriod(
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  params: Record<string, unknown>
+): Promise<ExecutorResult> {
+  try {
+    const { bookMileagePeriod } = await import('@/lib/mileage/mileage-service')
+    const result = await bookMileagePeriod(supabase, companyId, userId, {
+      from: params.from as string,
+      to: params.to as string,
+      entryDate: params.entry_date as string,
+      counterAccount: (params.counter_account as never) || '2820',
+      employeeId: (params.employee_id as string) || undefined,
+      createdVia: 'mcp',
+      // Staged approvals freeze the trip set: what was previewed is exactly
+      // what may be booked; drift fails the commit instead of booking blind.
+      expectedTripIds: Array.isArray(params.trip_ids)
+        ? (params.trip_ids as string[])
+        : undefined,
+    })
+    if (!result.ok) {
+      if (result.code === 'NO_TRIPS') {
+        return { error: 'No unbooked trips in the selected period', status: 400 }
+      }
+      if (result.code === 'MIXED_EMPLOYEES') {
+        return { error: 'The period spans several employees; book per employee via employee_id', status: 400 }
+      }
+      if (result.code === 'PERIOD_NOT_OPEN') {
+        return { error: 'The entry date falls in a closed or locked period', status: 400 }
+      }
+      if (result.code === 'TRIPS_CHANGED' || result.code === 'CLAIM_LOST') {
+        return {
+          error: 'The körjournal changed since this booking was staged; stage it again to get a fresh preview',
+          status: 409,
+        }
+      }
+      return {
+        error: `Voucher ${result.journalEntryId} was created but trips could not all be linked; review the körjournal before booking again`,
+        status: 500,
+      }
+    }
+    return {
+      data: {
+        journal_entry_id: result.journalEntryId,
+        voucher: `${result.voucherSeries ?? ''}${result.voucherNumber ?? ''}`,
+        trip_count: result.tripCount,
+        total_amount: result.totalAmount,
+        summaries: result.summaries,
+      },
+    }
+  } catch (err) {
+    return {
+      error: err instanceof Error ? err.message : 'Failed to book mileage period',
+      status: 500,
+    }
+  }
+}
+
 async function commitGenerateAgi(
   supabase: SupabaseClient,
   userId: string,
@@ -5075,7 +5257,13 @@ async function commitMatchBatchAllocate(
     })
     return { error: error.message || 'Database error', status: 500 }
   }
-  const result = data as { ok: boolean; code?: string; details?: unknown; journal_entry_id?: string }
+  const result = data as {
+    ok: boolean
+    code?: string
+    details?: unknown
+    journal_entry_id?: string
+    allocations?: BatchAllocationResult[]
+  }
   if (!result || !result.ok) {
     return {
       error: result?.code || 'match_batch_allocate failed',
@@ -5083,6 +5271,12 @@ async function commitMatchBatchAllocate(
       data: result?.details as Record<string, unknown> | undefined,
     }
   }
+  // Every allocation the RPC settled in full retires its suggestion pointer
+  // from the company's OTHER transactions (issue #1259): the RPC only nulls
+  // them on the source tx. Same helper as the HTTP twin
+  // (app/api/transactions/[id]/match-batch/route.ts) so the two cannot drift.
+  await clearSettledBatchAllocationSuggestions(supabase, companyId, result.allocations ?? [], txId)
+
   // Structured audit-trail entry on success (compliance-swarm V16). Tx
   // count + JE id + the source tx id only: no amounts, no
   // counterparty identifiers, no descriptions. txId is included
@@ -5478,6 +5672,12 @@ async function commitPendingOperationInner(
       case 'create_salary_run':
         result = await commitCreateSalaryRun(supabase, userId, companyId, pendingOp.params)
         break
+      case 'log_mileage_trip':
+        result = await commitLogMileageTrip(supabase, userId, companyId, pendingOp.params)
+        break
+      case 'book_mileage_period':
+        result = await commitBookMileagePeriod(supabase, userId, companyId, pendingOp.params)
+        break
       case 'generate_agi':
         result = await commitGenerateAgi(supabase, userId, companyId, pendingOp.params)
         break
@@ -5648,7 +5848,11 @@ async function commitPendingOperationInner(
         resolved_at: new Date().toISOString(),
         result_data: isAutoReject
           ? { auto_rejected: true, reason: result.error }
-          : { error: result.error, http_status: result.status },
+          : {
+              error: result.error,
+              http_status: result.status,
+              ...(result.errorCode ? { error_code: result.errorCode } : {}),
+            },
       })
       .eq('id', pendingOp.id)
     if (isAutoReject) {
@@ -5663,6 +5867,7 @@ async function commitPendingOperationInner(
       status: 'failed',
       error: result.error,
       http_status: result.status ?? 500,
+      ...(result.errorCode ? { code: result.errorCode } : {}),
     }
   }
 

@@ -55,6 +55,7 @@ export type MomsBox =
  */
 export const ACCOUNT_TO_BOX: Record<string, MomsBox> = {
   // Domestic revenue (taxable) → Box 05
+  '3000': '05',  // Försäljning inom Sverige (gruppkonto)
   '3001': '05',  // Försäljning varor/tjänster 25%
   '3002': '05',  // Försäljning varor/tjänster 12%
   '3003': '05',  // Försäljning varor/tjänster 6%
@@ -80,6 +81,11 @@ export const ACCOUNT_TO_BOX: Record<string, MomsBox> = {
 
   // Non-EU services → Box 40
   '3305': '40',  // Försäljning tjänster export utanför EU
+
+  // Domestic reverse-charge sales (buyer liable for VAT) → Box 41
+  '3231': '41',  // Försäljning byggsektorn, omvänd betalningsskyldighet
+  '3232': '41',  // Omvänd betalningsskyldighet, övriga (skrot m.m.)
+  '3233': '41',  // Omvänd betalningsskyldighet, övriga
 
   // VAT-exempt sales → Box 42
   '3004': '42',  // Momsfri försäljning (AB)

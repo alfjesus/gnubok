@@ -3,6 +3,7 @@ import type { SupabaseClient } from '@supabase/supabase-js'
 import {
   computeNextRunDate,
   computeInitialRunDate,
+  rollNextRunDateForward,
   getStockholmDateHour,
   executeRecurringSchedule,
 } from '@/lib/invoices/recurring-schedule-service'
@@ -152,6 +153,104 @@ describe('computeNextRunDate', () => {
   it('rejects invalid day_of_month', () => {
     expect(() => computeNextRunDate(new Date(), 0)).toThrow()
     expect(() => computeNextRunDate(new Date(), 32)).toThrow()
+  })
+
+  it('advances a quarter with interval 3', () => {
+    const result = computeNextRunDate(new Date(Date.UTC(2026, 0, 15)), 15, 3)
+    expect(result).toBe('2026-04-15')
+  })
+
+  it('advances a quarter across the year boundary', () => {
+    const result = computeNextRunDate(new Date(Date.UTC(2026, 10, 15)), 15, 3)
+    expect(result).toBe('2027-02-15')
+  })
+
+  it('clamps day 31 when a quarterly step lands in February', () => {
+    // Nov 30 + 3 months = Feb; 2027 February has 28 days.
+    const result = computeNextRunDate(new Date(Date.UTC(2026, 10, 30)), 31, 3)
+    expect(result).toBe('2027-02-28')
+  })
+
+  it('advances a full year with interval 12, keeping leap-day clamp', () => {
+    // 2028-02-29 (leap) + 12 months, day 29 -> 2029-02-28.
+    const result = computeNextRunDate(new Date(Date.UTC(2028, 1, 29)), 29, 12)
+    expect(result).toBe('2029-02-28')
+  })
+
+  it('rejects invalid interval_months', () => {
+    expect(() => computeNextRunDate(new Date(), 15, 0)).toThrow()
+    expect(() => computeNextRunDate(new Date(), 15, 13)).toThrow()
+    expect(() => computeNextRunDate(new Date(), 15, 1.5)).toThrow()
+  })
+})
+
+describe('rollNextRunDateForward', () => {
+  const today = new Date(Date.UTC(2026, 6, 6)) // 2026-07-06
+
+  it('monthly: rolls a stale date to the next occurrence on or after today', () => {
+    expect(rollNextRunDateForward('2026-07-05', today, 5, 1, { allowToday: true }))
+      .toBe('2026-08-05')
+    expect(rollNextRunDateForward('2026-05-15', today, 15, 1, { allowToday: true }))
+      .toBe('2026-07-15')
+  })
+
+  it('monthly: allowToday keeps an occurrence landing on today', () => {
+    expect(rollNextRunDateForward('2026-06-06', today, 6, 1, { allowToday: true }))
+      .toBe('2026-07-06')
+  })
+
+  it('monthly: default (strictly future) skips today', () => {
+    expect(rollNextRunDateForward('2026-06-06', today, 6, 1)).toBe('2026-08-06')
+  })
+
+  it('quarterly: preserves the month phase across a missed run', () => {
+    // Jan 15 quarterly run missed; today is Jul 6 -> Jul 15, NOT Feb/Aug 15.
+    expect(rollNextRunDateForward('2026-01-15', today, 15, 3, { allowToday: true }))
+      .toBe('2026-07-15')
+    // Apr 5 missed -> Jul 5 already past today -> Oct 5.
+    expect(rollNextRunDateForward('2026-04-05', today, 5, 3, { allowToday: true }))
+      .toBe('2026-10-05')
+  })
+
+  it('yearly: rolls a missed run a whole year forward', () => {
+    expect(rollNextRunDateForward('2026-03-01', today, 1, 12, { allowToday: true }))
+      .toBe('2027-03-01')
+  })
+
+  it('keeps a future anchor as-is (day edit within the anchor month)', () => {
+    // Quarterly schedule anchored on Oct; day edited to 20 -> stays in Oct.
+    expect(rollNextRunDateForward('2026-10-15', today, 20, 3)).toBe('2026-10-20')
+  })
+
+  it('re-derives the day from day_of_month when the anchor was clamped', () => {
+    // Anchor 2026-02-28 stored for a day-31 schedule; monthly roll from a
+    // stale date recovers day 31 in months that have it.
+    expect(rollNextRunDateForward('2026-02-28', today, 31, 1, { allowToday: true }))
+      .toBe('2026-07-31')
+  })
+
+  it('clamps per month while stepping (quarterly day 31 through February)', () => {
+    const winter = new Date(Date.UTC(2027, 1, 10)) // 2027-02-10
+    expect(rollNextRunDateForward('2026-11-30', winter, 31, 3, { allowToday: true }))
+      .toBe('2027-02-28')
+  })
+
+  it('rejects malformed anchors and invalid cadence', () => {
+    expect(() => rollNextRunDateForward('2026-1-5', today, 5, 1)).toThrow()
+    expect(() => rollNextRunDateForward('2026-01-05', today, 5, 0)).toThrow()
+    expect(() => rollNextRunDateForward('2026-01-05', today, 0, 1)).toThrow()
+  })
+
+  it('rejects calendar-invalid anchors that pass the shape regex', () => {
+    expect(() => rollNextRunDateForward('2026-13-05', today, 5, 1)).toThrow()
+    expect(() => rollNextRunDateForward('2026-00-05', today, 5, 1)).toThrow()
+    expect(() => rollNextRunDateForward('2026-02-31', today, 31, 1)).toThrow()
+    expect(() => rollNextRunDateForward('2026-04-00', today, 5, 1)).toThrow()
+  })
+
+  it('rejects fractional day_of_month', () => {
+    expect(() => rollNextRunDateForward('2026-01-05', today, 5.5, 1)).toThrow()
+    expect(() => computeNextRunDate(today, 15.5)).toThrow()
   })
 })
 
@@ -644,5 +743,138 @@ describe('executeRecurringSchedule foreign-currency rate fetch', () => {
     })
 
     expect(result.invoiceId).toBe('inv-1')
+  })
+})
+
+describe('executeRecurringSchedule dimension propagation', () => {
+  const { supabase, enqueue, reset } = createQueuedMockSupabase()
+  const client = supabase as unknown as SupabaseClient
+  const today = new Date('2026-07-06T06:30:00Z')
+
+  const customer = makeCustomer({ id: 'cust-1', email: 'kund@test.se' })
+
+  // The queued mock's chain proxy discards call args by design, so capture
+  // .insert payloads per table with a thin wrapper around the original
+  // implementation (grabbed once, before any override, to avoid re-wrapping).
+  const originalFrom = supabase.from.getMockImplementation()!
+  const inserted: Record<string, unknown[]> = {}
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    reset()
+    eventBus.clear()
+    for (const key of Object.keys(inserted)) delete inserted[key]
+    supabase.from.mockImplementation((table: string) => {
+      const chain = originalFrom(table) as object
+      return new Proxy(chain, {
+        get(target, prop, receiver) {
+          if (prop === 'insert') {
+            return (rows: unknown) => {
+              ;(inserted[table] ??= []).push(rows)
+              return (Reflect.get(target, prop, receiver) as (r: unknown) => unknown)(rows)
+            }
+          }
+          return Reflect.get(target, prop, receiver)
+        },
+      })
+    })
+  })
+
+  function makeTaggedSchedule() {
+    return {
+      id: 'sched-1',
+      company_id: 'company-1',
+      user_id: 'user-1',
+      customer_id: 'cust-1',
+      name: 'Monthly retainer',
+      day_of_month: 6,
+      send_hour: 8,
+      payment_terms_days: 30,
+      currency: 'SEK',
+      your_reference: null,
+      our_reference: null,
+      notes: null,
+      auto_send: false,
+      status: 'active',
+      next_run_date: '2026-07-06',
+      last_run_at: null,
+      last_invoice_id: null,
+      last_run_warning: null,
+      generated_count: 0,
+      default_dimensions: { '1': 'KS1', '6': 'P001' },
+      items: [
+        {
+          id: 'si-1',
+          schedule_id: 'sched-1',
+          sort_order: 0,
+          description: 'Konsulttimmar',
+          quantity: 10,
+          unit: 'tim',
+          unit_price: 1000,
+          vat_rate: 25,
+          dimensions: { '6': 'P002' },
+        },
+        {
+          id: 'si-2',
+          schedule_id: 'sched-1',
+          sort_order: 1,
+          description: 'Resersättning',
+          quantity: 1,
+          unit: 'st',
+          unit_price: 500,
+          vat_rate: 25,
+        },
+      ],
+    } as unknown as Parameters<typeof executeRecurringSchedule>[1]
+  }
+
+  function enqueueCreatePath() {
+    enqueue({ data: customer, error: null }) // customers select
+    enqueue({ data: { id: 'inv-1', invoice_number: null, document_type: 'invoice' }, error: null }) // invoices insert
+    enqueue({ data: null, error: null }) // invoice_items insert
+    enqueue({
+      data: { id: 'inv-1', invoice_number: 'F-1', customer, items: [] },
+      error: null,
+    }) // re-fetch with relations
+  }
+
+  it('copies the schedule bag onto the invoice and per-item bags onto items', async () => {
+    enqueueCreatePath()
+
+    await executeRecurringSchedule(client, makeTaggedSchedule(), today, {
+      suppressAutoSend: true,
+    })
+
+    expect(inserted['invoices']).toHaveLength(1)
+    expect(inserted['invoices'][0]).toMatchObject({
+      default_dimensions: { '1': 'KS1', '6': 'P001' },
+    })
+
+    const itemRows = inserted['invoice_items'][0] as Array<Record<string, unknown>>
+    expect(itemRows).toHaveLength(2)
+    expect(itemRows[0].dimensions).toEqual({ '6': 'P002' })
+    // An untagged template item lands as an explicit empty bag, matching the
+    // invoice_items column default (never undefined/null).
+    expect(itemRows[1].dimensions).toEqual({})
+  })
+
+  it('a legacy schedule row without the columns spawns empty bags', async () => {
+    enqueueCreatePath()
+    const schedule = makeTaggedSchedule() as unknown as Record<string, unknown>
+    delete schedule.default_dimensions
+    for (const item of schedule.items as Array<Record<string, unknown>>) {
+      delete item.dimensions
+    }
+
+    await executeRecurringSchedule(
+      client,
+      schedule as unknown as Parameters<typeof executeRecurringSchedule>[1],
+      today,
+      { suppressAutoSend: true },
+    )
+
+    expect(inserted['invoices'][0]).toMatchObject({ default_dimensions: {} })
+    const itemRows = inserted['invoice_items'][0] as Array<Record<string, unknown>>
+    expect(itemRows.every((row) => JSON.stringify(row.dimensions) === '{}')).toBe(true)
   })
 })

@@ -103,6 +103,7 @@ export const POST = withRouteContext(
         customer_id: input.customer_id,
         name: input.name,
         day_of_month: input.day_of_month,
+        interval_months: input.interval_months,
         send_hour: input.send_hour,
         payment_terms_days: input.payment_terms_days,
         currency: input.currency,
@@ -110,6 +111,7 @@ export const POST = withRouteContext(
         our_reference: input.our_reference ?? null,
         notes: input.notes ?? null,
         auto_send: input.auto_send,
+        default_dimensions: input.default_dimensions ?? {},
         next_run_date: nextRunDate,
         status: 'active',
       })
@@ -129,6 +131,7 @@ export const POST = withRouteContext(
       unit: item.unit,
       unit_price: item.unit_price,
       vat_rate: item.vat_rate ?? null,
+      dimensions: item.dimensions ?? {},
     }))
 
     const { error: itemsError } = await supabase

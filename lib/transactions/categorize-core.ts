@@ -24,10 +24,13 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { eventBus } from '@/lib/events'
 import { buildMappingResultFromCategory } from '@/lib/bookkeeping/category-mapping'
+import { applySettlementAccount } from '@/lib/bookkeeping/mapping-engine'
+import { resolveSettlementAccount } from '@/lib/bookkeeping/settlement-account'
 import { createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
 import { upsertCounterpartyTemplate } from '@/lib/bookkeeping/counterparty-templates'
 import { isBookkeepingError } from '@/lib/bookkeeping/errors'
 import { linkToJournalEntry } from '@/lib/core/documents/document-service'
+import { renderChannelContextNotes } from '@/lib/documents/channel-context-notes'
 import {
   detectBookingDuplicate,
   type BookedDuplicateCandidate,
@@ -36,7 +39,7 @@ import {
 import { hasLiveJournalEntryLink } from '@/lib/transactions/link-journal-entry'
 import { appendProcessingHistory } from '@/lib/processing-history/append'
 import { createLogger } from '@/lib/logger'
-import type { Transaction, TransactionCategory, EntityType, VatTreatment } from '@/types'
+import type { InboxChannelContext, Transaction, TransactionCategory, EntityType, VatTreatment } from '@/types'
 
 const log = createLogger('transactions/categorize-core')
 
@@ -329,9 +332,16 @@ export async function categorizeMatchedTransaction(
   const entityType: EntityType = (settings?.entity_type as EntityType) || 'enskild_firma'
   const fiscalYearStartMonth = settings?.fiscal_year_start_month ?? 1
 
-  const mappingResult = buildMappingResultFromCategory(
+  let mappingResult = buildMappingResultFromCategory(
     category, transaction as Transaction, isBusiness, entityType, vatTreatment, vatAmount
   )
+  const settlementAccount = await resolveSettlementAccount(
+    supabase,
+    companyId,
+    transaction.cash_account_id,
+    log,
+  )
+  mappingResult = applySettlementAccount(mappingResult, settlementAccount)
   // Dimensions PR7: tag the business lines of the generated verifikat.
   if (dimensions && Object.keys(dimensions).length > 0) {
     mappingResult.dimensions = dimensions
@@ -447,6 +457,11 @@ export interface BulkBookInboxInput {
   vat_amount?: number
   notes?: string
   allow_duplicate?: boolean
+  /**
+   * Shared dimensions bag applied to the business lines of every generated
+   * verifikat in the batch (same semantics as single categorize).
+   */
+  dimensions?: Record<string, string>
 }
 
 export interface BulkBookInboxResult {
@@ -471,7 +486,7 @@ export async function bulkBookMatchedInboxItems(
   companyId: string,
   input: BulkBookInboxInput,
 ): Promise<BulkBookInboxResult> {
-  const { item_ids, category, vat_treatment, vat_amount, notes, allow_duplicate } = input
+  const { item_ids, category, vat_treatment, vat_amount, notes, allow_duplicate, dimensions } = input
 
   const booked: BulkBookInboxResult['booked'] = []
   const skipped: BulkBookInboxResult['skipped'] = []
@@ -487,7 +502,7 @@ export async function bulkBookMatchedInboxItems(
   for (const itemId of item_ids) {
     const { data: item, error: itemError } = await supabase
       .from('invoice_inbox_items')
-      .select('id, matched_transaction_id, created_journal_entry_id, created_supplier_invoice_id')
+      .select('id, matched_transaction_id, created_journal_entry_id, created_supplier_invoice_id, channel_context')
       .eq('id', itemId)
       .eq('company_id', companyId)
       .maybeSingle()
@@ -509,6 +524,24 @@ export async function bulkBookMatchedInboxItems(
       continue
     }
 
+    // WhatsApp-sourced underlag carry verified human context (representation
+    // deltagare + syfte, sender note) in channel_context. Thread it into the
+    // verifikat description ALONGSIDE the caller's shared batch note: bulk
+    // booking never shows a per-item notes field, so dropping the chat
+    // answers here would silently lose the Skatteverket representation
+    // documentation that only exists on this one item.
+    //
+    // Answers only, never the photo caption (the renderer leaves it out
+    // unless asked for it): this loop books without any per-item review and
+    // the verifikat description is immutable under BFL 5 kap, so unreviewed
+    // chat text must not land there. Captions only reach a verifikat through
+    // Bokför direkt, where the user reads them in an editable field first.
+    const channelNotes = renderChannelContextNotes(
+      (item as { channel_context?: InboxChannelContext | null }).channel_context,
+    )
+    const itemNotes =
+      [notes?.trim(), channelNotes].filter(Boolean).join(' · ') || undefined
+
     let result: CategorizeCoreResult
     try {
       result = await categorizeMatchedTransaction(
@@ -516,7 +549,7 @@ export async function bulkBookMatchedInboxItems(
         userId,
         companyId,
         item.matched_transaction_id as string,
-        { category, vatTreatment: vat_treatment, vatAmount: vat_amount, notes, allowDuplicate: allow_duplicate },
+        { category, vatTreatment: vat_treatment, vatAmount: vat_amount, notes: itemNotes, allowDuplicate: allow_duplicate, dimensions },
         // Snapshot copies so the guard sees only the prior bookings of this batch.
         { excludeTransactionIds: [...bookedTransactionIds], excludeJournalEntryIds: [...bookedJournalEntryIds] },
       )

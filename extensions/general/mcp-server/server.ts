@@ -1,5 +1,13 @@
 import { NextResponse, after } from 'next/server'
 import {
+  TASKS_EXTENSION_ID,
+  isTaskCapableClient,
+  createMcpTask,
+  resolveMcpTask,
+  taskToWire,
+  type McpTaskRow,
+} from './tasks'
+import {
   extractBearerToken,
   validateApiKey,
   createServiceClientNoCookies,
@@ -10,6 +18,8 @@ import { createLogger } from '@/lib/logger'
 import { roundOre, sumOre } from '@/lib/money'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { buildMappingResultFromCategory } from '@/lib/bookkeeping/category-mapping'
+import { applySettlementAccount } from '@/lib/bookkeeping/mapping-engine'
+import { resolveSettlementAccount } from '@/lib/bookkeeping/settlement-account'
 import { buildTransactionEntryLines, createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
 import { upsertCounterpartyTemplate, findCounterpartyTemplatesBatch, formatCounterpartyName } from '@/lib/bookkeeping/counterparty-templates'
 import { formatVoucherLabel, hasLiveJournalEntryLink } from '@/lib/transactions/link-journal-entry'
@@ -34,6 +44,7 @@ import {
   rcInputTotalsFromDeclaration,
   calculateVatDeclaration,
 } from '@/lib/reports/vat-declaration'
+import { fetchDynamicRuta05Accounts } from '@/lib/reports/vat-revenue-accounts'
 // The momsdeklaration completeness checks live in core (lib/reports) and are
 // shared with the web UI's "Kontroll av underlaget" gate. The MCP surface
 // imports them instead of mirroring them: a hand-rolled copy here is exactly
@@ -126,8 +137,10 @@ import {
 } from '@/lib/salary/agi-submission-state'
 import { generateSupplierLedger } from '@/lib/reports/supplier-ledger'
 import { getReconciliationStatus } from '@/lib/reconciliation/bank-reconciliation'
+import { resolveCashAccountScope } from '@/lib/reconciliation/cash-account-scope'
 import { createInvoicePaymentJournalEntry, createInvoiceCashEntry, createInvoiceJournalEntry } from '@/lib/bookkeeping/invoice-entries'
 import { findMatchingInvoices } from '@/lib/invoices/invoice-matching'
+import { sanitizeDeliveryRecipientStatuses } from '@/lib/invoices/delivery-recipient-statuses'
 import { listRotRutCandidates, createRotRutPayoutRequest } from '@/lib/invoices/rot-rut-service'
 import { importRotRutBeslutFile } from '@/lib/invoices/rot-rut-beslut-import'
 import { RotRutBeslutFileSchema } from '@/lib/api/schemas'
@@ -159,7 +172,12 @@ import {
   generateInvoiceEmailText,
   generateInvoiceEmailSubject,
 } from '@/lib/email/invoice-templates'
-import { uploadDocument, MAX_DOCUMENT_SIZE } from '@/lib/core/documents/document-service'
+import {
+  completePendingDocumentUpload,
+  createPendingDocumentUpload,
+  uploadDocument,
+  MAX_DOCUMENT_SIZE,
+} from '@/lib/core/documents/document-service'
 import { extractInvoiceFields, ExtractionSchema as InvoiceExtractionSchema, AgentExtractionSchema } from '@/extensions/general/invoice-inbox/lib/extract-invoice-fields'
 // Skatteverket filing tools (PR5). Cross-extension lib import, same sanctioned
 // pattern as invoice-inbox above: the CI guard only checks lib/, app/api/,
@@ -177,7 +195,7 @@ import { appendProcessingHistory } from '@/lib/processing-history/append'
 import { getUserCompanies } from '@/lib/company/context'
 // ensureInitialized() is called by the extension router (ext/[...path]/route.ts)
 // which dispatches to this handler: no duplicate call needed here.
-import type { Transaction, TransactionCategory, EntityType, VatTreatment, Invoice, Currency, CompanySettings, Customer, InvoiceItem, PendingOperation, VatPeriodType, VatDeclarationRutor } from '@/types'
+import type { Transaction, TransactionCategory, EntityType, VatTreatment, Invoice, Currency, CompanySettings, Customer, InvoiceItem, PendingOperation, VatPeriodType, VatDeclarationRutor, YearEndBlockerCode } from '@/types'
 
 // ── Actor context ────────────────────────────────────────────
 
@@ -243,6 +261,11 @@ interface McpTool {
   // _meta.ui.resourceUri on the RESULT, so the host renders the widget only when
   // asked. (Contrast _meta above, on the definition, which renders on every call.)
   uiResourceUri?: string
+  // Tasks extension: when this predicate returns true for a call from a
+  // task-capable client, the dispatcher returns a CreateTaskResult and runs
+  // execute() after the response instead of blocking on it. Not serialized
+  // into tools/list.
+  shouldRunAsTask?: (args: Record<string, unknown>) => boolean
   execute: (
     args: Record<string, unknown>,
     companyId: string,
@@ -273,6 +296,146 @@ const VALID_CATEGORIES = [
 const VALID_VAT_TREATMENTS = [
   'standard_25', 'reduced_12', 'reduced_6', 'reverse_charge', 'export', 'exempt',
 ] as const
+
+const MCP_DOCUMENT_MIME_TYPES = [
+  'application/pdf',
+  'image/jpeg',
+  'image/png',
+  'image/heic',
+  'image/webp',
+] as const
+
+const MCP_DOCUMENT_MIME_TYPE_SET = new Set<string>(MCP_DOCUMENT_MIME_TYPES)
+
+function resolveMcpDocumentMimeType(fileName: string, requestedMimeType: unknown): string {
+  let mimeType = typeof requestedMimeType === 'string' ? requestedMimeType : undefined
+  if (!mimeType) {
+    const extension = fileName.split('.').pop()?.toLowerCase()
+    const mimeMap: Record<string, string> = {
+      pdf: 'application/pdf',
+      jpg: 'image/jpeg',
+      jpeg: 'image/jpeg',
+      png: 'image/png',
+      heic: 'image/heic',
+      webp: 'image/webp',
+    }
+    mimeType = extension ? mimeMap[extension] : undefined
+    if (!mimeType) throw new Error(`Cannot infer MIME type from extension: .${extension}`)
+  }
+  if (!MCP_DOCUMENT_MIME_TYPE_SET.has(mimeType)) {
+    throw new Error(`Unsupported file type: ${mimeType}. Allowed: PDF, JPEG, PNG, HEIC, WebP`)
+  }
+  return mimeType
+}
+
+interface DocumentInboxResult {
+  document_id: string
+  inbox_item_id: string
+  status: string
+  extracted_data: Record<string, unknown>
+  matched_supplier_id: string | null
+}
+
+async function findCompletedDocumentInboxItem(
+  supabase: SupabaseClient,
+  companyId: string,
+  userId: string,
+  inboxItemId: string
+): Promise<DocumentInboxResult | null> {
+  const { data, error } = await supabase
+    .from('invoice_inbox_items')
+    .select('id, document_id, status, extracted_data, matched_supplier_id')
+    .eq('id', inboxItemId)
+    .eq('company_id', companyId)
+    .eq('user_id', userId)
+    .maybeSingle()
+  if (error) throw new Error(`Failed to check completed document upload: ${error.message}`)
+  if (!data) return null
+  if (data.document_id !== inboxItemId) {
+    throw new Error('Upload ID collides with an unrelated inbox item')
+  }
+  return {
+    document_id: data.document_id,
+    inbox_item_id: data.id,
+    status: data.status,
+    extracted_data: (data.extracted_data ?? {}) as Record<string, unknown>,
+    matched_supplier_id: data.matched_supplier_id,
+  }
+}
+
+async function createDocumentInboxItem(
+  supabase: SupabaseClient,
+  companyId: string,
+  userId: string,
+  documentId: string,
+  fileName: string,
+  mimeType: string,
+  buffer: Buffer,
+  reservedInboxItemId?: string
+): Promise<DocumentInboxResult> {
+  if (reservedInboxItemId) {
+    const existing = await findCompletedDocumentInboxItem(
+      supabase,
+      companyId,
+      userId,
+      reservedInboxItemId,
+    )
+    if (existing) return existing
+  }
+
+  const { data: extracted } = await extractInvoiceFields({ buffer, mimeType, fileName })
+
+  let matchedSupplierId: string | null = null
+  if (extracted.supplier.orgNumber) {
+    const { data: supplier } = await supabase
+      .from('suppliers')
+      .select('id')
+      .eq('company_id', companyId)
+      .eq('org_number', extracted.supplier.orgNumber)
+      .limit(1)
+      .maybeSingle()
+    if (supplier) matchedSupplierId = supplier.id
+  }
+
+  const { data: inbox, error: inboxError } = await supabase
+    .from('invoice_inbox_items')
+    .insert({
+      // Literal payload keeps the no-phantom-columns scanner able to resolve
+      // every column; the legacy path gets an explicit UUID instead of the DB
+      // default.
+      id: reservedInboxItemId ?? crypto.randomUUID(),
+      company_id: companyId,
+      user_id: userId,
+      status: 'received',
+      source: 'upload',
+      document_id: documentId,
+      extracted_data: extracted as unknown as Record<string, unknown>,
+      matched_supplier_id: matchedSupplierId,
+    })
+    .select('id, status')
+    .single()
+
+  if (inboxError) {
+    if (reservedInboxItemId) {
+      const concurrent = await findCompletedDocumentInboxItem(
+        supabase,
+        companyId,
+        userId,
+        reservedInboxItemId,
+      )
+      if (concurrent) return concurrent
+    }
+    throw new Error(`Failed to create inbox item: ${inboxError.message}`)
+  }
+
+  return {
+    document_id: documentId,
+    inbox_item_id: inbox.id,
+    status: inbox.status,
+    extracted_data: extracted as unknown as Record<string, unknown>,
+    matched_supplier_id: matchedSupplierId,
+  }
+}
 
 // ── Pending operations staging ───────────────────────────────
 
@@ -769,7 +932,7 @@ async function categorizeTransactionCore(
   const entityType: EntityType = (settings?.entity_type as EntityType) || 'enskild_firma'
 
   // Build mapping
-  const mappingResult = buildMappingResultFromCategory(
+  let mappingResult = buildMappingResultFromCategory(
     category,
     transaction as Transaction,
     isBusiness,
@@ -777,6 +940,13 @@ async function categorizeTransactionCore(
     vatTreatment,
     vatAmount
   )
+  const settlementAccount = await resolveSettlementAccount(
+    supabase,
+    companyId,
+    transaction.cash_account_id,
+    log,
+  )
+  mappingResult = applySettlementAccount(mappingResult, settlementAccount)
 
   if (!mappingResult.debit_account || !mappingResult.credit_account) {
     throw new Error(
@@ -1162,10 +1332,17 @@ const SKV_AGI_STATUS_OUTPUT_SCHEMA = {
  *  rare case of taxable EU goods (momspliktig EU-leverans, e.g. when the
  *  buyer's VAT number is invalid).
  *
- *  Companies using non-standard charts must either book to one of these
- *  or extend the list: Accounted's BAS chart only ships 3001/3002/3003/3004
- *  by default, but 30xx alternates are common in custom charts. */
+ *  This hand-maintained widening predates #1261 and is kept so no company
+ *  loses a figure it already saw. It is no longer the only path: a company's
+ *  own class 3 konto marked with a moms-sats is resolved at runtime by
+ *  fetchDynamicRuta05Accounts and unioned in below, which is what actually
+ *  covers non-standard charts (Accounted's BAS chart ships no varugrupp
+ *  accounts at all). */
 const RUTA_05_ACCOUNTS = [
+  // The 30xx gruppkonto. ACCOUNT_RUTA maps it to ruta05, so leaving it out here
+  // made a balance on 3000 appear in the filed projection but not in
+  // report.rutor.ruta05.
+  '3000',
   // Domestic sales by VAT rate (canonical BAS)
   '3001', '3002', '3003', '3005', '3006', '3007', '3008',
   // Taxable EU goods (momspliktig, buyer's VAT number invalid or buyer is private)
@@ -1208,7 +1385,8 @@ export interface VatReportWithRutor {
    * The two also differ on ruta 05 by design: `report.rutor.ruta05` sums the
    * widened RUTA_05_ACCOUNTS list for display, while this one is the canonical
    * ACCOUNT_RUTA projection, i.e. what would actually be filed. Checks run on
-   * the filed shape, never on the display shape.
+   * the filed shape, never on the display shape. The company's own ruta 05
+   * accounts feed BOTH: they are part of the filing, not a display widening.
    */
   declarationRutor: VatDeclarationRutor
   /**
@@ -1344,7 +1522,12 @@ export async function computeVatReportWithRutor(
     return t ? Math.round((t.debit - t.credit) * 100) / 100 : 0
   }
 
-  const ruta05 = RUTA_05_ACCOUNTS.reduce((sum, acc) => sum + creditBalance(acc), 0)
+  // The company's own momspliktiga intäktskonton join the hand-maintained list.
+  // Deduped: an account can appear in both (e.g. 3041 with a moms-sats set),
+  // and counting it twice would inflate ruta 05.
+  const dynamicRuta05 = await fetchDynamicRuta05Accounts(supabase, companyId)
+  const ruta05Accounts = [...new Set([...RUTA_05_ACCOUNTS, ...dynamicRuta05.accounts])]
+  const ruta05 = ruta05Accounts.reduce((sum, acc) => sum + creditBalance(acc), 0)
   const ruta10 = creditBalance('2611')
   const ruta11 = creditBalance('2621')
   const ruta12 = creditBalance('2631')
@@ -1423,7 +1606,11 @@ export async function computeVatReportWithRutor(
   // Same `accountTotals` the report is built from, projected through core's
   // ACCOUNT_RUTA map so the completeness checks see the full declaration
   // (incl. rutor 20-24 and 50) instead of the trimmed report view.
-  return { report, declarationRutor: rutorFromTotals(accountTotals), accountTotals }
+  return {
+    report,
+    declarationRutor: rutorFromTotals(accountTotals, dynamicRuta05.accounts),
+    accountTotals,
+  }
 }
 
 /**
@@ -1516,6 +1703,19 @@ interface VatCloseBlocker {
 }
 
 /**
+ * Hint for the uncategorized_transactions blocker. Must name BOTH resolution
+ * paths: categorize/auto-match creates NEW bookkeeping, so for a transaction
+ * whose affärshändelse is already booked on an existing verifikat the agent
+ * needs gnubok_link_transaction_to_journal_entry instead; a hint that only
+ * offers the booking tools dead-ends that case into "contact support"
+ * (2026-08-06 support case). Exported so the test can pin the contract.
+ */
+export const UNCATEGORIZED_TRANSACTIONS_HINT =
+  'Kategorisera via gnubok_categorize_transaction eller kör gnubok_auto_match_period. ' +
+  'Är affärshändelsen redan bokförd på ett befintligt verifikat: koppla i stället med ' +
+  'gnubok_link_transaction_to_journal_entry (ingen ny bokföring skapas).'
+
+/**
  * Completeness codes that describe the omvänd-skattskyldighet pair. They keep
  * the pre-existing `reverse_charge_input_missing` blocker kind so clients
  * already switching on it do not lose the case they were watching for.
@@ -1525,6 +1725,56 @@ const RC_COMPLETENESS_CODES = new Set<VatDeclarationCheck['code']>([
   'RC_OUTPUT_MISSING',
   'RC_INPUT_VAT_MISMATCH',
 ])
+
+/**
+ * gnubok_year_end_readiness: YearEndBlockerCode to the blocker `kind` this
+ * tool publishes. The kinds are the public contract agents switch on, so they
+ * are deliberately NOT the codes themselves: a code may be renamed or split
+ * without breaking a consumer, as long as it keeps mapping to the same kind.
+ *
+ * UNBOOKED_CHECK_FAILED shares 'unbooked_transactions' with the real count:
+ * the fail-closed variant means "we could not tell", and an agent should react
+ * to it the same way (go look at the transactions, then re-run readiness).
+ *
+ * Exported so the tool-description test can assert that every kind an agent
+ * can receive is actually named in the description it plans against: the
+ * description drifted once already (it advertised FX revaluation, a WARNING,
+ * as a blocker and never mentioned unbooked transactions, the common one).
+ */
+export const YEAR_END_BLOCKER_KIND: Record<YearEndBlockerCode, string> = {
+  PERIOD_NOT_FOUND: 'period_not_found',
+  PERIOD_NOT_ENDED: 'period_not_ended',
+  PERIOD_ALREADY_CLOSED: 'period_already_closed',
+  CLOSING_ENTRY_EXISTS: 'closing_entry_exists',
+  DRAFT_ENTRIES: 'draft_entries',
+  UNEXPLAINED_VOUCHER_GAP: 'unexplained_voucher_gap',
+  SEQUENCE_COUNTER_BEHIND: 'sequence_mismatch',
+  TRIAL_BALANCE_UNBALANCED: 'trial_balance_unbalanced',
+  CONTINUITY_MISMATCH: 'opening_balance_continuity',
+  NEXT_PERIOD_HAS_IB: 'next_period_ib_posted',
+  UNBOOKED_TRANSACTIONS: 'unbooked_transactions',
+  UNBOOKED_CHECK_FAILED: 'unbooked_transactions',
+}
+
+/**
+ * Wording fallback for a blocker whose code is not in YEAR_END_BLOCKER_KIND.
+ * Kept so an unmapped or legacy English message still routes somewhere useful
+ * instead of collapsing to 'other'.
+ */
+function classifyYearEndBlockerMessage(message: string): string {
+  if (/draft journal entries|utkast måste bokföras/i.test(message)) return 'draft_entries'
+  if (/unbooked transaction|saknar bokföring|obokförda transaktioner/i.test(message)) return 'unbooked_transactions'
+  if (/voucher gap|verifikationsnummerglapp/i.test(message)) return 'unexplained_voucher_gap'
+  if (/Sequence counter integrity|Nummerserien i serie/i.test(message)) return 'sequence_mismatch'
+  if (/Trial balance is not balanced|Råbalansen balanserar inte/i.test(message)) return 'trial_balance_unbalanced'
+  if (/already closed|redan stängd/i.test(message)) return 'period_already_closed'
+  if (/has not yet ended|slutdatumet har inte passerat/i.test(message)) return 'period_not_ended'
+  if (/closing entry already exists|Bokslutsverifikation finns redan/i.test(message)) return 'closing_entry_exists'
+  if (/continuity check failed|IB\/UB-kontinuiteten/i.test(message)) return 'opening_balance_continuity'
+  if (/opening balances already posted|redan ingående balanser bokförda/i.test(message)) return 'next_period_ib_posted'
+  if (/Fiscal period not found|Räkenskapsperioden hittades inte/i.test(message)) return 'period_not_found'
+  return 'other'
+}
 
 interface VatCloseSanityAnomaly {
   kind: 'output_vat_ratio_drift' | 'input_vat_ratio_drift' | 'revenue_drop' | 'revenue_spike'
@@ -1729,6 +1979,48 @@ async function countMissingUnderlagInPeriod(
   return Math.max(0, fromStart - afterEnd)
 }
 
+/**
+ * Resolve the cash-account identity before comparing its bank feed with the
+ * ledger. The cashAccountId is what prevents another same-currency account
+ * from being included in the transaction total.
+ *
+ * The lookup itself lives in lib/reconciliation/cash-account-scope.ts so the
+ * bokslut readiness aggregator (core code, which cannot import from
+ * @/extensions/) resolves the scope the exact same way. It keeps the fail-closed
+ * contract this function introduced in #1295: a cash_accounts lookup error
+ * throws rather than degrading into the unscoped currency-only path.
+ *
+ * Pass accountNumber only when the CALLER named an account; leaving it
+ * undefined means "the company's bank account", which additionally falls back
+ * to the primary cash account for companies that have no 1930 row at all.
+ */
+async function getScopedReconciliationStatus(
+  supabase: SupabaseClient,
+  companyId: string,
+  dateFrom: string | undefined,
+  dateTo: string | undefined,
+  accountNumber?: string,
+) {
+  const scope = await resolveCashAccountScope(supabase, companyId, accountNumber)
+
+  if (!scope.found && accountNumber !== undefined && accountNumber !== '1930') {
+    throw new Error(`Okänt kassakonto ${accountNumber} för det här företaget`)
+  }
+
+  const status = await getReconciliationStatus(
+    supabase,
+    companyId,
+    dateFrom,
+    dateTo,
+    scope.accountNumber,
+    scope.currency,
+    scope.cashAccountId,
+    scope.includeUnassigned,
+  )
+
+  return { status, scope }
+}
+
 export async function computeVatCloseCheck(
   args: Record<string, unknown>,
   companyId: string,
@@ -1760,7 +2052,7 @@ export async function computeVatCloseCheck(
   )
 
   // 4) Blocker scans: run in parallel
-  const [uncategorizedRes, unapprovedRes, reconRes, missingUnderlag] = await Promise.all([
+  const [uncategorizedRes, unapprovedRes, recon, missingUnderlag] = await Promise.all([
     supabase
       .from('transactions')
       .select('id', { count: 'exact', head: true })
@@ -1773,7 +2065,10 @@ export async function computeVatCloseCheck(
       .eq('company_id', companyId)
       .eq('status', 'registered')
       .gte('invoice_date', start).lte('invoice_date', end),
-    getReconciliationStatus(supabase, companyId, start, end),
+    // No account_number argument: the close check wants "the company's bank
+    // account", so the scope resolver may land on the primary cash account for
+    // a company that has no 1930 row.
+    getScopedReconciliationStatus(supabase, companyId, start, end),
     // Verifikat in the period that genuinely lack an underlag (BFL 5 kap
     // 6-7 §), counted over the SHARED SQL predicate. Never re-derive this
     // locally: countMissingUnderlagInPeriod documents what the hand-rolled
@@ -1789,7 +2084,7 @@ export async function computeVatCloseCheck(
       severity: 'high',
       count: uncategorizedCount,
       message: `${uncategorizedCount} okategoriserade banktransaktioner i perioden`,
-      hint: 'Kategorisera via gnubok_categorize_transaction eller kör gnubok_auto_match_period.',
+      hint: UNCATEGORIZED_TRANSACTIONS_HINT,
     })
   }
   const unapprovedCount = unapprovedRes.count ?? 0
@@ -1802,12 +2097,17 @@ export async function computeVatCloseCheck(
       hint: 'Attestera via gnubok_approve_supplier_invoice: ingående moms (ruta 48) påverkas.',
     })
   }
+  const reconRes = recon.status
   if (!reconRes.is_reconciled) {
     blockers.push({
       kind: 'bank_unreconciled',
       severity: Math.abs(reconRes.difference) > 100 ? 'high' : 'medium',
       count: reconRes.unmatched_transaction_count + reconRes.unmatched_gl_line_count,
-      message: `Bankavstämning visar differens ${reconRes.difference.toFixed(2)} kr (${reconRes.unmatched_transaction_count} omatchade banktransaktioner, ${reconRes.unmatched_gl_line_count} omatchade huvudbokslinjer på 1930)`,
+      // The account is named from the RESOLVED scope, not hard-coded: for a
+      // company with no 1930 row this check now reconciles its primary cash
+      // account, and a message pointing at 1930 would send the user to an
+      // account with no lines on it.
+      message: `Bankavstämning visar differens ${reconRes.difference.toFixed(2)} kr (${reconRes.unmatched_transaction_count} omatchade banktransaktioner, ${reconRes.unmatched_gl_line_count} omatchade huvudbokslinjer på ${recon.scope.accountNumber})`,
       hint: 'Granska via gnubok_get_reconciliation_status och matcha: moms beräknas från huvudboken så differenser döljer fel.',
     })
   }
@@ -3851,7 +4151,7 @@ export const tools: McpTool[] = [
   {
     name: 'gnubok_categorize_transaction',
     title: 'Categorize Bank Transaction',
-    description: 'Categorize a bank transaction. Stages the verifikat — cost line booked NET of moms, bank line gross; preview.lines shows the exact entry. Commit via gnubok_approve_pending_operation. vat_amount overrides computed moms; reverse_charge rejected when the underlag shows seller VAT.',
+    description: 'Categorize a bank transaction. Stages the verifikat: cost line NET of moms, bank line gross; dimensions bag tags the cost line. vat_amount overrides computed moms; reverse_charge rejected when the underlag shows seller VAT. Commit via gnubok_approve_pending_operation.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -4506,6 +4806,7 @@ export const tools: McpTool[] = [
           description: 'Filter by invoice status',
         },
         limit: { type: 'number', description: 'Max results (default 50, max 100)' },
+        offset: { type: 'integer', minimum: 0, description: 'Number of results to skip for pagination (default 0)' },
       },
     },
     outputSchema: paginatedSchema('invoices', { type: 'object' }),
@@ -4517,11 +4818,12 @@ export const tools: McpTool[] = [
     },
     async execute(args, companyId, userId, supabase) {
       const limit = Math.min(Math.max(1, Number(args.limit) || 50), 100)
+      const offset = Math.max(0, Math.floor(Number(args.offset) || 0))
       const status = args.status as string | undefined
 
       let query = supabase
         .from('invoices')
-        .select('id, invoice_number, status, customer_id, total, currency, invoice_date, due_date, document_type, customers(name)', { count: 'exact' })
+        .select('id, invoice_number, status, customer_id, total, currency, invoice_date, due_date, document_type, default_dimensions, customers(name)', { count: 'exact' })
         .eq('company_id', companyId)
 
       if (status) {
@@ -4530,11 +4832,13 @@ export const tools: McpTool[] = [
 
       const { data, error, count } = await query
         .order('invoice_date', { ascending: false })
-        .limit(limit)
+        .order('id', { ascending: false })
+        .range(offset, offset + limit)
 
       if (error) throw new Error(`Database error: ${error.message}`)
 
-      const invoices = (data ?? []).map((inv: Record<string, unknown>) => ({
+      const rows = data ?? []
+      const invoices = rows.slice(0, limit).map((inv: Record<string, unknown>) => ({
         id: inv.id,
         invoice_number: inv.invoice_number,
         status: inv.status,
@@ -4544,12 +4848,20 @@ export const tools: McpTool[] = [
         invoice_date: inv.invoice_date,
         due_date: inv.due_date,
         document_type: inv.document_type,
+        default_dimensions: inv.default_dimensions ?? {},
       }))
+
+      const hasMore = count == null
+        ? rows.length > limit
+        : offset + invoices.length < count
+      const total = count ?? offset + invoices.length + (hasMore ? 1 : 0)
 
       return {
         invoices,
         count: invoices.length,
-        total_count: count ?? invoices.length,
+        total_count: total,
+        has_more: hasMore,
+        ...(hasMore ? { next_offset: offset + invoices.length } : {}),
       }
     },
   },
@@ -4843,7 +5155,10 @@ export const tools: McpTool[] = [
         supabase,
         companyId,
         periodId!,
-        dimFilter.filter ? { dimensions: dimFilter.filter } : undefined,
+        // Saldobalans is the ledger as posted, resultatavslut included.
+        dimFilter.filter
+          ? { closingEntry: 'include' as const, dimensions: dimFilter.filter }
+          : { closingEntry: 'include' as const },
       )
 
       const rows = trialBalance.rows
@@ -5049,7 +5364,7 @@ export const tools: McpTool[] = [
       const [incomeStatement, trialBalance, arLedger, monthlyBreakdown, paidInvoices] =
         await Promise.all([
           generateIncomeStatement(supabase, companyId, periodId!),
-          generateTrialBalance(supabase, companyId, periodId!),
+          generateTrialBalance(supabase, companyId, periodId!, { closingEntry: 'include' }),
           generateARLedger(supabase, companyId),
           generateMonthlyBreakdown(supabase, companyId, periodId!),
           supabase
@@ -5350,6 +5665,19 @@ export const tools: McpTool[] = [
                 type: ['string', 'null'],
                 description: 'Provider reason text for a failure, with address local parts masked.',
               },
+              provider_recipient_statuses: {
+                type: 'object',
+                description: 'PII-free outcomes keyed by stable To/CC positions such as to:1 and cc:1. BCC is never included.',
+                additionalProperties: {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: {
+                    status: { type: 'string' },
+                    status_at: { type: 'string' },
+                  },
+                  required: ['status', 'status_at'],
+                },
+              },
               error_code: { type: ['string', 'null'] },
               to_addresses: {
                 type: 'array',
@@ -5416,6 +5744,7 @@ export const tools: McpTool[] = [
         provider_status: string | null
         provider_status_at: string | null
         provider_status_detail: string | null
+        provider_recipient_statuses: Record<string, { status: string; status_at: string }> | null
         error_code: string | null
         attachment_filename: string | null
         sent_at: string | null
@@ -5430,6 +5759,9 @@ export const tools: McpTool[] = [
         provider_status: row.provider_status ?? null,
         provider_status_at: row.provider_status_at ?? null,
         provider_status_detail: row.provider_status_detail ?? null,
+        provider_recipient_statuses: sanitizeDeliveryRecipientStatuses(
+          row.provider_recipient_statuses,
+        ),
         error_code: row.error_code ?? null,
         to_addresses: row.to_addresses ?? [],
         cc_addresses: row.cc_addresses ?? [],
@@ -5703,7 +6035,7 @@ export const tools: McpTool[] = [
 
       let query = supabase
         .from('supplier_invoices')
-        .select('id, supplier_invoice_number, invoice_date, due_date, status, total, total_sek, currency, vat_treatment, remaining_amount, supplier:suppliers(id, name)')
+        .select('id, supplier_invoice_number, invoice_date, due_date, status, total, total_sek, currency, vat_treatment, remaining_amount, default_dimensions, supplier:suppliers(id, name)')
         .eq('company_id', companyId)
 
       if (status !== 'all') {
@@ -7003,7 +7335,7 @@ export const tools: McpTool[] = [
   {
     name: 'gnubok_query_journal',
     title: 'Query Journal Lines',
-    description: "Flexible journal-line query for ad-hoc questions. Filters: account, date, amount, voucher series/number, source type, status, project, cost center, free-text. Optional group_by aggregation. Returns lines + totals over the full match set (see totals_scope).",
+    description: "Flexible journal-line query for ad-hoc questions. Filters: account, date, amount, voucher, source, status, dimensions bag, free-text. group_by/group_by_dimension aggregation; include_dimensions returns each line's bag. Lines + totals over the full match set (totals_scope).",
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -7021,8 +7353,17 @@ export const tools: McpTool[] = [
         voucher_number_to: { type: 'number', description: 'Highest voucher number (inclusive)' },
         source_type: { type: 'string', description: 'Filter by source: bank_transaction, invoice_created, supplier_invoice, currency_revaluation, year_end, opening_balance, etc.' },
         status: { type: 'string', enum: ['posted', 'reversed', 'all'], description: 'Default: posted' },
-        project: { type: 'string', description: 'Filter by project code' },
-        cost_center: { type: 'string', description: 'Filter by cost center' },
+        project: { type: 'string', description: 'Filter by project code (SIE dim 6)' },
+        cost_center: { type: 'string', description: 'Filter by cost center (SIE dim 1)' },
+        dimensions: {
+          type: 'object',
+          additionalProperties: { type: 'string' },
+          description: 'Filter: SIE dim no → value (code OR name, resolved server-side), e.g. {"6":"P001"}. Containment match; covers custom dims unlike project/cost_center.',
+        },
+        include_dimensions: {
+          type: 'boolean',
+          description: "Return each line's dimensions bag (default false).",
+        },
         group_by: { type: 'string', enum: ['account_number', 'voucher_series', 'source_type', 'cost_center', 'project'], description: 'Aggregate matching lines into groups by this field. Mutually exclusive with group_by_dimension.' },
         group_by_dimension: { type: 'string', description: 'Aggregate by SIE dimension number (e.g. "6" = projekt) from each line\'s dimensions bag; untagged → "(utan dimension)". Mutually exclusive with group_by.' },
         limit: { type: 'number', minimum: 1, maximum: 500, description: 'Max lines returned 1-500 (default 100). Totals/groups cover the FULL match set even when truncated, except under free-text search (see totals_scope).' },
@@ -7066,6 +7407,7 @@ export const tools: McpTool[] = [
           description: 'Present when group_by/group_by_dimension is set; sorted by |net| desc. Scope follows totals_scope.',
         },
         applied_filters: { type: 'object' },
+        ...DIMENSION_FILTER_OUTPUT_PROPS,
       },
       required: ['lines', 'total_lines', 'returned_lines', 'totals', 'totals_scope'],
     },
@@ -7094,6 +7436,10 @@ export const tools: McpTool[] = [
       const sourceType = args.source_type as string | undefined
       const project = args.project as string | undefined
       const costCenter = args.cost_center as string | undefined
+      const includeDimensions = args.include_dimensions === true
+      // Resolve-don't-select: value NAMES resolve to registry codes; the
+      // containment filter then hits the GIN index on the jsonb bag.
+      const dimFilter = await resolveReportDimensionFilter(supabase, companyId, args.dimensions)
 
       const GROUP_BY_FIELDS = ['account_number', 'voucher_series', 'source_type', 'cost_center', 'project'] as const
       const groupBy = args.group_by as (typeof GROUP_BY_FIELDS)[number] | undefined
@@ -7115,9 +7461,10 @@ export const tools: McpTool[] = [
       }
       const wantsGroups = Boolean(groupBy || groupByDimension)
 
-      // The dimensions jsonb only rides along when a group needs it: it is
+      // The dimensions jsonb only rides along when something needs it (a
+      // dimension group, the bag filter's echo, or include_dimensions): it is
       // the widest column on the line and the aggregate pass fetches ALL rows.
-      const dimsSelect = groupByDimension ? ', dimensions' : ''
+      const dimsSelect = groupByDimension || includeDimensions || dimFilter.filter ? ', dimensions' : ''
       // Free-text legs only. The embed survives here on purpose: each leg is
       // capped at `legLimit` rows, and that cap (which drives legCapHit and
       // the `truncated` signal) has no equivalent in the two-step fetch,
@@ -7165,6 +7512,7 @@ export const tools: McpTool[] = [
 
         if (project) q = q.eq('project', project)
         if (costCenter) q = q.eq('cost_center', costCenter)
+        if (dimFilter.filter) q = q.contains('dimensions', dimFilter.filter)
 
         return q
       }
@@ -7195,6 +7543,7 @@ export const tools: McpTool[] = [
         }
         if (project) l = l.eq('project', project)
         if (costCenter) l = l.eq('cost_center', costCenter)
+        if (dimFilter.filter) l = l.contains('dimensions', dimFilter.filter)
         return l
       }
 
@@ -7402,6 +7751,7 @@ export const tools: McpTool[] = [
           line_description: r.line_description,
           project: r.project,
           cost_center: r.cost_center,
+          ...(includeDimensions ? { dimensions: r.dimensions ?? {} } : {}),
           currency: r.currency,
         }
       })
@@ -7490,9 +7840,12 @@ export const tools: McpTool[] = [
           status,
           project: project ?? null,
           cost_center: costCenter ?? null,
+          dimensions: dimFilter.filter ?? null,
           group_by: groupBy ?? null,
           group_by_dimension: groupByDimension ?? null,
         },
+        ...(dimFilter.filter ? { dimension_filter: dimFilter.filter } : {}),
+        ...(dimFilter.resolutions.length > 0 ? { dimension_resolutions: dimFilter.resolutions } : {}),
       }
     },
   },
@@ -8227,6 +8580,11 @@ export const tools: McpTool[] = [
         vat_amount: { type: 'number', exclusiveMinimum: 0, description: "The underlag's exact moms override; only valid with a rate-based vat_treatment. Rarely needed in bulk: all items share one value." },
         notes: { type: 'string', description: 'Audit-trail note appended to every verifikation. Keep under 200 chars.' },
         allow_duplicate: { type: 'boolean', description: 'Override the per-item duplicate-booking guard (default false). Set true only after the user confirms these bank lines are genuinely separate events.' },
+        dimensions: {
+          type: 'object',
+          additionalProperties: { type: 'string' },
+          description: 'Shared dims bag {sie_dim_no: kod eller namn} applied to the business lines of every verifikat. Unknown values rejected: never auto-created.',
+        },
       },
       required: ['item_ids', 'category'],
     },
@@ -8246,6 +8604,15 @@ export const tools: McpTool[] = [
       const notes = typeof args.notes === 'string' && args.notes.trim().length > 0
         ? args.notes.trim()
         : undefined
+
+      // Resolve-don't-select: codes AND natural-language names resolve against
+      // the registry; the staged params carry only resolved codes.
+      const { bags: resolvedDimBags, resolutions: dimensionResolutions } = await resolveDimensionBags(
+        supabase,
+        companyId,
+        [parseDimensionsArg(args.dimensions, 'dimensions')],
+      )
+      const resolvedDimensions = resolvedDimBags[0]
 
       // Pre-flight: classify the selection so the preview (and the agent) sees
       // the real shape before staging. Tenant isolation via company_id.
@@ -8305,6 +8672,9 @@ export const tools: McpTool[] = [
           vat_amount: vatAmount ?? null,
           notes: notes ?? null,
           allow_duplicate: args.allow_duplicate === true,
+          dimensions: resolvedDimensions && Object.keys(resolvedDimensions).length > 0
+            ? resolvedDimensions
+            : null,
         },
         {
           item_count: itemIds.length,
@@ -8316,6 +8686,12 @@ export const tools: McpTool[] = [
           total_sek: Math.round(totalSek * 100) / 100,
           category: args.category,
           vat_treatment: args.vat_treatment ?? null,
+          ...(resolvedDimensions && Object.keys(resolvedDimensions).length > 0
+            ? { dimensions: resolvedDimensions }
+            : {}),
+          // Echoed for every non-exact dimension resolution (resolve-don't-
+          // select) so the agent can verify what a name attached to.
+          ...(dimensionResolutions.length > 0 ? { dimension_resolutions: dimensionResolutions } : {}),
         },
         actor,
         {
@@ -8871,7 +9247,7 @@ export const tools: McpTool[] = [
   {
     name: 'gnubok_get_reconciliation_status',
     title: 'Bank Reconciliation Status',
-    description: 'Bank reconciliation for one cash account: matched/unmatched counts, bank vs ledger balance, difference. Defaults to 1930; pass account_number for 1940/1932 etc. Optional date range.',
+    description: 'Bank reconciliation for one cash account: matched/unmatched counts, bank vs ledger balance, difference. Defaults to 1930, or the primary cash account if there is no 1930; pass account_number for 1940/1932 etc. Optional date range.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -8894,46 +9270,167 @@ export const tools: McpTool[] = [
     async execute(args, companyId, userId, supabase) {
       const dateFrom = args.date_from as string | undefined
       const dateTo = args.date_to as string | undefined
-      const accountNumber = (args.account_number as string | undefined) || '1930'
+      // Passed through as-is, undefined included: an omitted account_number is
+      // "the company's bank account", which resolves to 1930 and, for a company
+      // with no 1930 row, to its primary cash account. Substituting a literal
+      // '1930' here would instead make an unknown account an error case.
+      const accountNumber = args.account_number as string | undefined
 
-      // Pair the bank account with its currency + cash_account_id so EUR GL
-      // movements aren't compared against SEK transactions, and so a secondary
-      // same-currency account doesn't pool the primary's unassigned rows. Mirrors
-      // app/api/reconciliation/bank/status/route.ts.
-      const { data: cashAccount } = await supabase
-        .from('cash_accounts')
-        .select('id, currency, is_primary')
-        .eq('company_id', companyId)
-        .eq('ledger_account', accountNumber)
-        .maybeSingle()
-
-      if (!cashAccount && accountNumber !== '1930') {
-        throw new Error(`Okänt kassakonto ${accountNumber} för det här företaget`)
-      }
-
-      const currency = (cashAccount?.currency as string | undefined) ?? 'SEK'
-      const cashAccountId = cashAccount?.id as string | undefined
-      const includeUnassigned = cashAccount ? Boolean(cashAccount.is_primary) : true
-
-      return await getReconciliationStatus(
+      const { status } = await getScopedReconciliationStatus(
         supabase,
         companyId,
         dateFrom,
         dateTo,
         accountNumber,
-        currency,
-        cashAccountId,
-        includeUnassigned,
       )
+      return status
     },
   },
 
   // ── Document Inbox Tools ────────────────────────────────────
 
   {
+    name: 'gnubok_create_document_upload',
+    title: 'Create Document Upload',
+    description: 'Create a short-lived URL for a model-free document upload. PUT the raw file bytes (max 10 MB) to upload_url, then call gnubok_complete_document_upload with the same upload_id and file_name.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        file_name: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 255,
+          description: 'File name with extension, for example "faktura.pdf"',
+        },
+        mime_type: {
+          type: 'string',
+          enum: [...MCP_DOCUMENT_MIME_TYPES],
+          description: 'MIME type. Optional when it can be inferred from the file extension.',
+        },
+      },
+      required: ['file_name'],
+    },
+    outputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        upload_id: { type: 'string' },
+        upload_url: { type: 'string' },
+        expires_at: { type: 'string' },
+      },
+      required: ['upload_id', 'upload_url', 'expires_at'],
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+    async execute(args, companyId, userId, supabase) {
+      const fileName = args.file_name as string
+      // Validation only: reject unsupported types before handing out a signed
+      // URL. The resolved value is re-derived identically at complete time.
+      resolveMcpDocumentMimeType(fileName, args.mime_type)
+      const uploadId = crypto.randomUUID()
+      const reservation = await createPendingDocumentUpload(
+        supabase,
+        companyId,
+        userId,
+        uploadId,
+        fileName,
+      )
+      return {
+        upload_id: reservation.uploadId,
+        upload_url: reservation.signedUrl,
+        expires_at: reservation.expiresAt,
+      }
+    },
+  },
+
+  {
+    name: 'gnubok_complete_document_upload',
+    title: 'Complete Document Upload',
+    description: 'Validate and archive bytes sent to the URL from gnubok_create_document_upload, run AI extraction and create the inbox item. Idempotent: safe to retry with the same upload_id.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        upload_id: {
+          type: 'string',
+          format: 'uuid',
+          description: 'Reserved UUID returned by gnubok_create_document_upload',
+        },
+        file_name: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 255,
+          description: 'The same file name used to create the upload URL',
+        },
+        mime_type: {
+          type: 'string',
+          enum: [...MCP_DOCUMENT_MIME_TYPES],
+          description: 'MIME type. Optional when it can be inferred from the file extension.',
+        },
+      },
+      required: ['upload_id', 'file_name'],
+    },
+    outputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        document_id: { type: 'string' },
+        inbox_item_id: { type: 'string' },
+        status: { type: 'string' },
+        extracted_data: { type: 'object' },
+        matched_supplier_id: { type: 'string' },
+      },
+      required: ['document_id', 'inbox_item_id', 'status'],
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    async execute(args, companyId, userId, supabase) {
+      const uploadId = args.upload_id as string
+      const fileName = args.file_name as string
+      const mimeType = resolveMcpDocumentMimeType(fileName, args.mime_type)
+
+      const existingInbox = await findCompletedDocumentInboxItem(
+        supabase,
+        companyId,
+        userId,
+        uploadId,
+      )
+      if (existingInbox) return existingInbox
+
+      const completed = await completePendingDocumentUpload(
+        supabase,
+        companyId,
+        userId,
+        uploadId,
+        fileName,
+        mimeType,
+      )
+      return createDocumentInboxItem(
+        supabase,
+        companyId,
+        userId,
+        completed.document.id,
+        fileName,
+        mimeType,
+        Buffer.from(completed.buffer),
+        uploadId,
+      )
+    },
+  },
+
+  {
     name: 'gnubok_upload_document',
     title: 'Upload Document to Inbox',
-    description: 'Upload a PDF/JPEG/PNG/HEIC/WebP (max 20 MB) to the inbox. Runs AI field extraction (Bedrock OCR): requires the AI capability.',
+    description: 'Legacy inline-base64 upload for small files (max 10 MB). Prefer gnubok_create_document_upload so raw bytes bypass the model. Runs AI field extraction: requires the AI capability.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -8965,28 +9462,7 @@ export const tools: McpTool[] = [
     async execute(args, companyId, userId, supabase) {
       const fileName = args.file_name as string
       const base64Content = args.file_content_base64 as string
-      let mimeType = args.mime_type as string | undefined
-
-      if (!mimeType) {
-        const ext = fileName.split('.').pop()?.toLowerCase()
-        const mimeMap: Record<string, string> = {
-          pdf: 'application/pdf',
-          jpg: 'image/jpeg',
-          jpeg: 'image/jpeg',
-          png: 'image/png',
-          heic: 'image/heic',
-          webp: 'image/webp',
-        }
-        mimeType = ext ? mimeMap[ext] : undefined
-        if (!mimeType) throw new Error(`Cannot infer MIME type from extension: .${ext}`)
-      }
-
-      const allowedMimeTypes = new Set([
-        'application/pdf', 'image/jpeg', 'image/png', 'image/heic', 'image/webp',
-      ])
-      if (!allowedMimeTypes.has(mimeType)) {
-        throw new Error(`Unsupported file type: ${mimeType}. Allowed: PDF, JPEG, PNG, HEIC, WebP`)
-      }
+      const mimeType = resolveMcpDocumentMimeType(fileName, args.mime_type)
 
       const buffer = Buffer.from(base64Content, 'base64')
       if (buffer.byteLength > MAX_DOCUMENT_SIZE) {
@@ -8998,55 +9474,22 @@ export const tools: McpTool[] = [
         buffer: buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength),
         type: mimeType,
       }, { upload_source: 'api' })
-
-      const { data: extracted } = await extractInvoiceFields({
-        buffer,
-        mimeType,
+      return createDocumentInboxItem(
+        supabase,
+        companyId,
+        userId,
+        doc.id,
         fileName,
-      })
-
-      let matchedSupplierId: string | null = null
-      if (extracted.supplier.orgNumber) {
-        const { data: s } = await supabase
-          .from('suppliers')
-          .select('id')
-          .eq('company_id', companyId)
-          .eq('org_number', extracted.supplier.orgNumber)
-          .limit(1)
-          .maybeSingle()
-        if (s) matchedSupplierId = s.id
-      }
-
-      const { data: inbox, error: inboxError } = await supabase
-        .from('invoice_inbox_items')
-        .insert({
-          company_id: companyId,
-          user_id: userId,
-          status: 'received',
-          source: 'upload',
-          document_id: doc.id,
-          extracted_data: extracted as unknown as Record<string, unknown>,
-          matched_supplier_id: matchedSupplierId,
-        })
-        .select('id, status')
-        .single()
-
-      if (inboxError) throw new Error(`Failed to create inbox item: ${inboxError.message}`)
-
-      return {
-        document_id: doc.id,
-        inbox_item_id: inbox.id,
-        status: inbox.status,
-        extracted_data: extracted,
-        matched_supplier_id: matchedSupplierId,
-      }
+        mimeType,
+        buffer,
+      )
     },
   },
 
   {
     name: 'gnubok_list_inbox_items',
     title: 'List Inbox Items',
-    description: 'List document inbox items. `processed` covers all terminal links (transaction, supplier invoice, journal entry); booked receipts count as done. unprocessed_only=true returns docs still needing handling.',
+    description: 'List document inbox items, including each original file_name. `processed` covers all terminal links (transaction, supplier invoice, journal entry); booked receipts count as done. unprocessed_only=true returns docs still needing handling.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -9054,14 +9497,33 @@ export const tools: McpTool[] = [
         status: { type: 'string', enum: ['received', 'error'], description: 'Filter by status' },
         unprocessed_only: { type: 'boolean', description: 'When true, only return items with no terminal link yet (not matched to a transaction, supplier invoice, or journal entry), i.e. documents that still need handling. Default false.' },
         limit: { type: 'number', description: 'Max results (default 20, max 50)' },
+        cursor: {
+          type: 'string',
+          maxLength: 100,
+          pattern: '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})(?:__[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})?$',
+          description: 'Composite "<created_at>__<inbox_item_id>" from previous page (exclusive). Pass next_cursor verbatim.',
+        },
       },
     },
     outputSchema: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        items: { type: 'array', items: { type: 'object' } },
+        items: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              file_name: {
+                type: ['string', 'null'],
+                description: 'Original document file name, or null when the inbox item has no document',
+              },
+            },
+            required: ['file_name'],
+          },
+        },
         count: { type: 'number' },
+        next_cursor: { type: 'string', description: 'Pass as cursor on next call. Absent = no more pages.' },
       },
       required: ['items', 'count'],
     },
@@ -9075,17 +9537,52 @@ export const tools: McpTool[] = [
       const limit = Math.min(Math.max(1, Number(args.limit) || 20), 50)
       const status = args.status as string | undefined
       const unprocessedOnly = args.unprocessed_only === true
+      const cursor = typeof args.cursor === 'string' ? args.cursor : null
+
+      // Composite cursor: "<created_at>__<id>". Falls back to plain timestamp
+      // for backward compatibility with older callers.
+      let cursorTs: string | null = null
+      let cursorId: string | null = null
+      if (cursor) {
+        const sep = cursor.indexOf('__')
+        if (sep === -1) {
+          cursorTs = cursor
+        } else {
+          cursorTs = cursor.slice(0, sep)
+          cursorId = cursor.slice(sep + 2)
+        }
+      }
+      if (cursorTs && !z.string().datetime({ offset: true }).safeParse(cursorTs).success) {
+        throw new Error('Invalid cursor timestamp. Pass next_cursor verbatim.')
+      }
+      if (cursorId && !z.string().uuid().safeParse(cursorId).success) {
+        throw new Error('Invalid cursor inbox item ID. Pass next_cursor verbatim.')
+      }
+
+      const fetchSize = unprocessedOnly ? 200 : limit
 
       let query = supabase
         .from('invoice_inbox_items')
-        .select('id, status, source, created_at, extracted_data, matched_supplier_id, matched_transaction_id, created_supplier_invoice_id, created_journal_entry_id, email_from, email_subject, error_message')
+        .select(`
+          id, status, source, created_at, extracted_data, matched_supplier_id,
+          matched_transaction_id, created_supplier_invoice_id, created_journal_entry_id,
+          email_from, email_subject, error_message, document_attachments(file_name)
+        `)
         .eq('company_id', companyId)
         .order('created_at', { ascending: false })
+        .order('id', { ascending: false })
         // Fetch a wider window when filtering client-side so the limit
         // applies to the post-filter set rather than truncating before it.
-        .limit(unprocessedOnly ? 200 : limit)
+        .limit(fetchSize)
 
       if (status) query = query.eq('status', status)
+      if (cursorTs && cursorId) {
+        query = query.or(
+          `created_at.lt.${cursorTs},and(created_at.eq.${cursorTs},id.lt.${cursorId})`
+        )
+      } else if (cursorTs) {
+        query = query.lt('created_at', cursorTs)
+      }
 
       const { data, error } = await query
       if (error) throw new Error(`Database error: ${error.message}`)
@@ -9121,6 +9618,7 @@ export const tools: McpTool[] = [
           status: item.status,
           source: item.source,
           created_at: item.created_at,
+          file_name: item.document_attachments?.[0]?.file_name ?? null,
           vendor_name: vendorName,
           amount,
           invoice_date: invoiceDate,
@@ -9138,7 +9636,23 @@ export const tools: McpTool[] = [
       const filtered = unprocessedOnly ? mapped.filter((i) => !i.processed) : mapped
       const items = filtered.slice(0, limit)
 
-      return { items, count: items.length }
+      // A full returned page continues after its last item. When client-side
+      // filtering yields a short page from a full scan window, continue after
+      // the last inspected row so older unprocessed items remain reachable.
+      let nextCursor: string | null = null
+      if (items.length === limit) {
+        const last = items[items.length - 1]
+        nextCursor = `${last.created_at}__${last.id}`
+      } else if (data && data.length === fetchSize) {
+        const last = data[data.length - 1]
+        nextCursor = `${last.created_at}__${last.id}`
+      }
+
+      return {
+        items,
+        count: items.length,
+        ...(nextCursor ? { next_cursor: nextCursor } : {}),
+      }
     },
   },
 
@@ -9979,6 +10493,246 @@ export const tools: McpTool[] = [
     },
   },
   // ── Payroll (Lönehantering) ──────────────────────────────────
+  {
+    name: 'gnubok_list_mileage_trips',
+    title: 'List Mileage Trips (Körjournal)',
+    catalogVisibility: 'search',
+    description: 'List körjournal trips for the active company. Filter by date range, status (draft = not yet booked, booked) or employee. Use before gnubok_book_mileage_period to see what would be booked.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        from: { type: 'string', description: 'From date (YYYY-MM-DD)' },
+        to: { type: 'string', description: 'To date (YYYY-MM-DD)' },
+        status: { type: 'string', enum: ['draft', 'booked'], description: 'Filter by status' },
+        employee_id: { type: 'string', description: 'Filter by employee UUID' },
+      },
+    },
+    outputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        trips: { type: 'array', items: { type: 'object' } },
+        count: { type: 'number' },
+        total_km: { type: 'number' },
+        draft_km: { type: 'number' },
+      },
+      required: ['trips', 'count', 'total_km', 'draft_km'],
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    async execute(args, companyId, _userId, supabase) {
+      const { listTrips } = await import('@/lib/mileage/mileage-service')
+      const status = args.status as 'draft' | 'booked' | undefined
+      const rows = await listTrips(supabase, companyId, {
+        from: (args.from as string) || undefined,
+        to: (args.to as string) || undefined,
+        status: status === 'draft' || status === 'booked' ? status : undefined,
+        employeeId: (args.employee_id as string) || undefined,
+      })
+      const { roundOre: round2 } = await import('@/lib/money')
+      const trips = rows.map((t) => ({
+        mileage_trip_id: t.id,
+        trip_date: t.trip_date,
+        vehicle_type: t.vehicle_type,
+        vehicle_registration: t.vehicle_registration,
+        odometer_start: t.odometer_start,
+        odometer_end: t.odometer_end,
+        distance_km: Number(t.distance_km),
+        from_location: t.from_location,
+        to_location: t.to_location,
+        purpose: t.purpose,
+        visited: t.visited,
+        is_round_trip: t.is_round_trip,
+        status: t.status,
+        journal_entry_id: t.journal_entry_id,
+        salary_run_id: t.salary_run_id,
+      }))
+      return {
+        trips,
+        count: trips.length,
+        total_km: round2(trips.reduce((sum, t) => sum + t.distance_km, 0)),
+        draft_km: round2(
+          trips.filter((t) => t.status === 'draft').reduce((sum, t) => sum + t.distance_km, 0)
+        ),
+      }
+    },
+  },
+  {
+    name: 'gnubok_log_mileage_trip',
+    title: 'Log Mileage Trip (Körjournal)',
+    catalogVisibility: 'search',
+    description: 'Stage a körjournal trip (date, route, km, purpose per Skatteverket requirements). Approve via gnubok_approve_pending_operation. The trip stays a draft until booked via gnubok_book_mileage_period.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        trip_date: { type: 'string', description: 'Trip date (YYYY-MM-DD)' },
+        vehicle_type: { type: 'string', enum: ['own_car', 'company_car_fossil', 'company_car_electric'], description: 'Vehicle type; drives the tax-free rate (default own_car, 25 kr/mil)' },
+        vehicle_registration: { type: 'string', description: 'Registration number (regnr)' },
+        odometer_start: { type: 'number', description: 'Odometer at start (km)' },
+        odometer_end: { type: 'number', description: 'Odometer at arrival (km)' },
+        distance_km: { type: 'number', description: 'Distance in km' },
+        from_location: { type: 'string', description: 'Start location' },
+        to_location: { type: 'string', description: 'Destination' },
+        purpose: { type: 'string', description: 'Business purpose (ärende)' },
+        visited: { type: 'string', description: 'Who/which company was visited' },
+        is_round_trip: { type: 'boolean', description: 'Distance covers the return leg too' },
+        employee_id: { type: 'string', description: 'Employee UUID when the trip belongs to an employee' },
+        notes: { type: 'string', description: 'Free-text note' },
+      },
+      required: ['trip_date', 'distance_km', 'from_location', 'to_location', 'purpose'],
+    },
+    outputSchema: STAGED_OPERATION_SCHEMA,
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    async execute(args, companyId, userId, supabase, actor) {
+      const tripDate = args.trip_date as string
+      const distanceKm = args.distance_km as number
+      if (typeof tripDate !== 'string' || !ISO_DATE_RE.test(tripDate)) {
+        throw new Error('trip_date must be YYYY-MM-DD')
+      }
+      if (typeof distanceKm !== 'number' || !(distanceKm > 0)) {
+        throw new Error('distance_km must be a positive number')
+      }
+      const odoStart = args.odometer_start as number | undefined
+      const odoEnd = args.odometer_end as number | undefined
+      if (odoStart != null && odoEnd != null && odoEnd <= odoStart) {
+        throw new Error('odometer_end must be greater than odometer_start')
+      }
+
+      const vehicleType = (args.vehicle_type as string) || 'own_car'
+      if (vehicleType !== 'own_car' && !(args.vehicle_registration as string | undefined)?.trim()) {
+        throw new Error('vehicle_registration is required for a förmånsbil trip (körjournal must identify the vehicle)')
+      }
+      // Preview the tax-free allowance at the schablon rate; non-fatal if the
+      // payroll config year is missing.
+      let approxAmount: number | undefined
+      try {
+        const { loadPayrollConfig } = await import('@/lib/salary/payroll-config')
+        const { ratePerMil } = await import('@/lib/mileage/mileage-service')
+        const { roundOre } = await import('@/lib/money')
+        const config = await loadPayrollConfig(supabase, Number(tripDate.slice(0, 4)))
+        approxAmount = roundOre((distanceKm / 10) * ratePerMil(config, vehicleType as never))
+      } catch {
+        approxAmount = undefined
+      }
+
+      return stagePendingOperation(
+        supabase, companyId, userId, 'log_mileage_trip',
+        `Körjournal: ${args.from_location} till ${args.to_location} ${tripDate} (${distanceKm} km)`,
+        {
+          trip_date: tripDate,
+          vehicle_type: vehicleType,
+          vehicle_registration: args.vehicle_registration ?? null,
+          odometer_start: odoStart ?? null,
+          odometer_end: odoEnd ?? null,
+          distance_km: distanceKm,
+          from_location: args.from_location,
+          to_location: args.to_location,
+          purpose: args.purpose,
+          visited: args.visited ?? null,
+          is_round_trip: args.is_round_trip === true,
+          employee_id: args.employee_id ?? null,
+          notes: args.notes ?? null,
+        },
+        {
+          trip_date: tripDate,
+          route: `${args.from_location} → ${args.to_location}`,
+          distance_km: distanceKm,
+          purpose: args.purpose,
+          vehicle_type: vehicleType,
+          ...(approxAmount != null ? { tax_free_allowance_sek: approxAmount } : {}),
+        },
+        actor,
+        {
+          description: 'Once approved, the trip is a draft in the körjournal. Book the period via gnubok_book_mileage_period.',
+          tool: 'gnubok_book_mileage_period',
+        },
+      )
+    },
+  },
+  {
+    name: 'gnubok_book_mileage_period',
+    title: 'Book Mileage Period (Milersättning)',
+    catalogVisibility: 'search',
+    description: 'Stage booking of all draft körjournal trips in a date range as one milersättning verifikat: debit 7331 at the tax-free schablon rate, credit 2820/2893/1930. Approve via gnubok_approve_pending_operation. Call gnubok_list_mileage_trips first.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        from: { type: 'string', description: 'Period start (YYYY-MM-DD)' },
+        to: { type: 'string', description: 'Period end (YYYY-MM-DD)' },
+        entry_date: { type: 'string', description: 'Verifikat date (YYYY-MM-DD); must be in an open period' },
+        counter_account: { type: 'string', enum: ['2820', '2893', '1930'], description: 'Credit side: 2820 skuld till anställda (default), 2893 avräkning aktieägare, 1930 when already paid out from bank' },
+        employee_id: { type: 'string', description: 'Only book trips for this employee UUID' },
+      },
+      required: ['from', 'to', 'entry_date'],
+    },
+    outputSchema: STAGED_OPERATION_SCHEMA,
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    async execute(args, companyId, userId, supabase, actor) {
+      const from = args.from as string
+      const to = args.to as string
+      const entryDate = args.entry_date as string
+      for (const [label, value] of [['from', from], ['to', to], ['entry_date', entryDate]] as const) {
+        if (typeof value !== 'string' || !ISO_DATE_RE.test(value)) {
+          throw new Error(`${label} must be YYYY-MM-DD`)
+        }
+      }
+      if (from > to) throw new Error('from must be <= to')
+      if (from.slice(0, 4) !== to.slice(0, 4)) {
+        throw new Error('Schablon rates are per calendar year: book one year at a time')
+      }
+      const counterAccount = (args.counter_account as string) || '2820'
+
+      // Read-only preflight: aggregate the draft trips so the approver sees
+      // exactly what would be booked. The commit path re-reads atomically.
+      const { listTrips, summarizeTrips } = await import('@/lib/mileage/mileage-service')
+      const { loadPayrollConfig } = await import('@/lib/salary/payroll-config')
+      const { roundOre } = await import('@/lib/money')
+      const trips = await listTrips(supabase, companyId, {
+        from, to, status: 'draft',
+        employeeId: (args.employee_id as string) || undefined,
+      })
+      if (trips.length === 0) {
+        throw new Error('No unbooked trips in the selected period. Log trips first via gnubok_log_mileage_trip.')
+      }
+      if (new Set(trips.map((t) => t.employee_id ?? 'unassigned')).size > 1) {
+        throw new Error('The period spans several employees. Book per employee by passing employee_id (BFL motpart traceability).')
+      }
+      const config = await loadPayrollConfig(supabase, Number(to.slice(0, 4)))
+      const summaries = summarizeTrips(trips, config)
+      const totalAmount = roundOre(summaries.reduce((sum, s) => sum + s.amount, 0))
+
+      return stagePendingOperation(
+        supabase, companyId, userId, 'book_mileage_period',
+        `Bokför milersättning ${from} till ${to}: ${totalAmount} kr (${trips.length} resor)`,
+        {
+          from, to,
+          entry_date: entryDate,
+          counter_account: counterAccount,
+          // Freeze the previewed trip set: the commit fails if the drafts in
+          // range change between staging and approval.
+          trip_ids: trips.map((t) => t.id),
+          ...(args.employee_id ? { employee_id: args.employee_id } : {}),
+        },
+        {
+          trip_count: trips.length,
+          total_amount: totalAmount,
+          debit_account: '7331',
+          credit_account: counterAccount,
+          summaries: summaries.map((s) => ({
+            vehicle_type: s.vehicle_type,
+            total_mil: s.total_mil,
+            rate_per_mil: s.rate_per_mil,
+            amount: s.amount,
+          })),
+        },
+        actor,
+        undefined,
+        { dateForPeriodCheck: entryDate },
+      )
+    },
+  },
   {
     name: 'gnubok_list_employees',
     title: 'List Employees',
@@ -11176,12 +11930,29 @@ export const tools: McpTool[] = [
         jamkning_percentage: { type: 'number' },
         jamkning_valid_from: { type: 'string' },
         jamkning_valid_to: { type: 'string' },
+        default_dimensions: {
+          type: 'object',
+          additionalProperties: { type: 'string' },
+          description: 'Dims bag {sie_dim_no: kod eller namn} tagging this employee\'s salary cost lines on every run. Never auto-created.',
+        },
       },
       required: ['first_name', 'last_name', 'personnummer', 'employment_start'],
     },
     outputSchema: STAGED_OPERATION_SCHEMA,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     async execute(args, companyId, userId, supabase, actor) {
+      // Resolve-don't-select BEFORE schema validation: the bag may carry
+      // registry value NAMES, which the strict DimensionsBagSchema inside
+      // CreateEmployeeSchema would reject.
+      const { bags: employeeDimBags } = await resolveDimensionBags(
+        supabase,
+        companyId,
+        [parseDimensionsArg(args.default_dimensions, 'default_dimensions')],
+      )
+      if (args.default_dimensions !== undefined) {
+        args = { ...args, default_dimensions: employeeDimBags[0] ?? {} }
+      }
+
       const { CreateEmployeeSchema } = await import('@/lib/api/schemas')
       const parsed = CreateEmployeeSchema.safeParse(args)
       if (!parsed.success) {
@@ -11272,6 +12043,11 @@ export const tools: McpTool[] = [
         jamkning_percentage: { type: ['number', 'null'], description: 'null clears the beslut' },
         jamkning_valid_from: { type: ['string', 'null'] },
         jamkning_valid_to: { type: ['string', 'null'] },
+        default_dimensions: {
+          type: 'object',
+          additionalProperties: { type: 'string' },
+          description: 'Dims bag {sie_dim_no: kod eller namn} tagging salary cost lines. Replaces the whole bag; {} clears all tags. Omit to keep.',
+        },
       },
       required: ['employee_id'],
     },
@@ -11282,6 +12058,17 @@ export const tools: McpTool[] = [
       if (!employee_id) throw new Error('employee_id is required')
       if ('personnummer' in rest) {
         throw new Error('personnummer cannot be changed: identity is immutable post-create')
+      }
+
+      // Resolve-don't-select: names resolve to registry codes; an explicit {}
+      // stays {} (the clear-all-tags update).
+      if (rest.default_dimensions !== undefined) {
+        const { bags: employeeDimBags } = await resolveDimensionBags(
+          supabase,
+          companyId,
+          [parseDimensionsArg(rest.default_dimensions, 'default_dimensions')],
+        )
+        rest.default_dimensions = employeeDimBags[0] ?? {}
       }
 
       const patch: Record<string, unknown> = {}
@@ -11327,7 +12114,7 @@ export const tools: McpTool[] = [
   {
     name: 'gnubok_set_employee_opening_balances',
     title: 'Set Employee Opening Balances (Cutover)',
-    description: 'Stage payroll cutover state per employee: YTD gross/tax/net, vacation days remaining, sparade dagar by origin year, opening semesterlöneskuld SEK, karens adjustment. An omitted field keeps its stored value; send 0 to clear it. Locked after a booked run.',
+    description: 'Stage payroll cutover state per employee: YTD gross/tax/net, vacation days remaining and taken this year, sparade dagar by origin year, opening semesterlöneskuld SEK, karens adjustment. An omitted field keeps its stored value; send 0 to clear it. Locked after a booked run.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -11346,6 +12133,7 @@ export const tools: McpTool[] = [
               ytd_tax: { type: 'number' },
               ytd_net: { type: 'number' },
               vacation_paid_days_remaining: { type: 'number' },
+              vacation_days_taken_this_year: { type: 'number', description: 'Paid days already taken this vacation year under the previous system (0-40)' },
               vacation_saved_days_by_year: { type: 'object', description: 'Origin year -> days, e.g. {"2025": 5}; {} clears' },
               opening_semester_liability: { type: 'number', description: 'SEK on 2920 (report-only; booked via SIE)' },
               opening_semester_liability_avgifter: { type: 'number', description: 'SEK on 2940' },
@@ -11361,9 +12149,9 @@ export const tools: McpTool[] = [
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     async execute(args, companyId, userId, supabase, actor) {
       // Sparse merge, NOT full replace. OpeningBalancesBulkSchema carries a
-      // .default() on all eight non-key fields (and .partial() would not strip
+      // .default() on all nine non-key fields (and .partial() would not strip
       // them: Zod applies defaults through it), so parsing the caller's args
-      // straight into the 9-column upsert resets ytd_tax, ytd_net, vacation
+      // straight into the 10-column upsert resets ytd_tax, ytd_net, vacation
       // days, sparade dagar, the opening semesterlöneskuld and the karens
       // adjustment to 0 whenever an agent corrects a single figure. Same
       // defence as gnubok_update_employee: keep only the keys actually sent,
@@ -11391,7 +12179,8 @@ export const tools: McpTool[] = [
 
       const MERGEABLE_FIELDS = [
         'ytd_gross', 'ytd_tax', 'ytd_net',
-        'vacation_paid_days_remaining', 'vacation_saved_days_by_year',
+        'vacation_paid_days_remaining', 'vacation_days_taken_this_year',
+        'vacation_saved_days_by_year',
         'opening_semester_liability', 'opening_semester_liability_avgifter',
         'karens_periods_adjustment',
       ] as const
@@ -12138,6 +12927,10 @@ export const tools: McpTool[] = [
       idempotentHint: true,  // repeat calls produce equivalent archives, fresh URL
       openWorldHint: false,
     },
+    // Archive generation is the one genuinely long-running synchronous call
+    // in the catalog: task-capable clients get a durable handle instead of a
+    // multi-minute blocking response. Size estimates stay synchronous.
+    shouldRunAsTask: (args) => args.estimate_only !== true,
     async execute(args, companyId, userId, supabase) {
       const fiscalPeriodId = args.fiscal_period_id as string
       if (!fiscalPeriodId) throw new Error('fiscal_period_id is required')
@@ -12245,7 +13038,14 @@ export const tools: McpTool[] = [
   {
     name: 'gnubok_year_end_readiness',
     title: 'Year-End Readiness Check',
-    description: "Pre-flight before irreversible gnubok_run_year_end. Returns ready (bool) + ordered blockers (drafts, voucher gaps, sequence mismatches, unbalanced TB, FX revaluation) + optional closing-entry preview.",
+    // Budget: 280 chars (output-schema.test.ts). Spend it on the blockers an
+    // agent can act on BEFORE calling, in likelihood order. The four
+    // period-state kinds (period_not_found / _not_ended / _already_closed /
+    // closing_entry_exists) collapse into "period-state": nothing to pre-check
+    // there, the period either is closable or is not. Open items in foreign
+    // currency are warnings, never blockers, because executeYearEndClosing
+    // revalues them in step 2 (lib/core/bookkeeping/year-end-service.ts).
+    description: "Pre-flight for irreversible gnubok_run_year_end. Blockers: unbooked_transactions (most common), draft_entries, unexplained_voucher_gap, sequence_mismatch, trial_balance_unbalanced, opening_balance_continuity, next_period_ib_posted, period-state. FX = warning, never blocker.",
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -12296,25 +13096,18 @@ export const tools: McpTool[] = [
 
       const validation = await validateYearEndReadiness(supabase, companyId, userId, fiscalPeriodId)
 
-      // Reshape error strings into structured blockers so the agent (and any
-      // dashboard) can render and act on each one independently. The lib
-      // returns flat strings; we tag each with a `kind` heuristic for routing.
-      // validateYearEndReadiness emits Swedish messages (the bokslut wizard
-      // renders them verbatim); English alternates are kept as fallback so
-      // classification never regresses if an older message slips through.
-      const blockers = validation.errors.map((message) => {
-        let kind: string = 'other'
-        if (/draft journal entries|utkast måste bokföras/i.test(message)) kind = 'draft_entries'
-        else if (/voucher gap|verifikationsnummerglapp/i.test(message)) kind = 'unexplained_voucher_gap'
-        else if (/Sequence counter integrity|Nummerserien i serie/i.test(message)) kind = 'sequence_mismatch'
-        else if (/Trial balance is not balanced|Råbalansen balanserar inte/i.test(message)) kind = 'trial_balance_unbalanced'
-        else if (/already closed|redan stängd/i.test(message)) kind = 'period_already_closed'
-        else if (/has not yet ended|slutdatumet har inte passerat/i.test(message)) kind = 'period_not_ended'
-        else if (/closing entry already exists|Bokslutsverifikation finns redan/i.test(message)) kind = 'closing_entry_exists'
-        else if (/continuity check failed|IB\/UB-kontinuiteten/i.test(message)) kind = 'opening_balance_continuity'
-        else if (/Fiscal period not found|Räkenskapsperioden hittades inte/i.test(message)) kind = 'period_not_found'
-        return { kind, severity: 'high' as const, message }
-      })
+      // Reshape the lib's blockers into structured entries so the agent (and
+      // any dashboard) can render and act on each one independently. Routing
+      // keys off the stable YearEndBlockerCode via YEAR_END_BLOCKER_KIND, so a
+      // reworded Swedish message no longer silently reclassifies as 'other'.
+      // The `kind` strings are this tool's public contract: never rename one.
+      // A blocker with no mapped code falls back to the wording heuristic
+      // (which also catches legacy English messages), then to 'other'.
+      const blockers = validation.blockers.map(({ code, message }) => ({
+        kind: YEAR_END_BLOCKER_KIND[code] ?? classifyYearEndBlockerMessage(message),
+        severity: 'high' as const,
+        message,
+      }))
 
       let preview = null
       if (includePreview && validation.ready) {
@@ -12919,7 +13712,7 @@ export const tools: McpTool[] = [
   {
     name: 'gnubok_update_invoice',
     title: 'Update Draft Invoice',
-    description: 'Stage an edit to a DRAFT invoice: header fields and/or items (items = FULL REPLACE of all lines). Only editable drafts: no verifikat, not self-billed, not a credit note. Sent/paid invoices need gnubok_credit_invoice. Find invoice_id with gnubok_list_invoices.',
+    description: 'Stage an edit to a DRAFT invoice: header fields (incl. default_dimensions) and/or items (items = FULL REPLACE). Drafts only: no verifikat, not self-billed, not a credit note. Sent/paid invoices need gnubok_credit_invoice. Find invoice_id with gnubok_list_invoices.',
     outputSchema: STAGED_OPERATION_SCHEMA,
     inputSchema: {
       type: 'object',
@@ -13314,7 +14107,7 @@ export const tools: McpTool[] = [
   {
     name: 'gnubok_create_voucher',
     title: 'Create Manual Voucher (Verifikation)',
-    description: 'Stage a manual verifikation with arbitrary balanced lines: capitalization (1010), accruals, FX adjustments, rättelser outside categorize_transaction. Pass inbox_item_id to book a kvitto direct. HIGH risk.',
+    description: 'Stage a manual verifikation with arbitrary balanced lines: capitalization (1010), accruals, FX adjustments, rättelser outside categorize_transaction. Lines accept dimensions bags {sie_dim_no: code or name}. Pass inbox_item_id to book a kvitto direct. HIGH risk.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -13584,7 +14377,7 @@ export const tools: McpTool[] = [
   {
     name: 'gnubok_correct_entry',
     title: 'Correct Posted Entry (Rättelse)',
-    description: 'Stage a rättelse for a posted verifikation per BFL 5 kap 5§: storno + corrected entry in the original period (never in-place edit). Use for partial fixes like 2641 → 2614/2645. Account drives ruta. HIGH risk.',
+    description: 'Stage a rättelse for a posted verifikation per BFL 5 kap 5§: storno + corrected entry in the original period (never in-place edit). Use for partial fixes like 2641 → 2614/2645; lines accept dimensions bags. Account drives ruta. HIGH risk.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -13688,13 +14481,21 @@ export const tools: McpTool[] = [
           debit_amount: number | string
           credit_amount: number | string
           line_description: string | null
+          currency: string | null
+          amount_in_currency: number | string | null
+          exchange_rate: number | string | null
+          tax_code: string | null
+          dimensions: Record<string, string> | null
+          cost_center: string | null
+          project: string | null
         }> | null
       }
       const { data, error: origErr } = await supabase
         .from('journal_entries')
         .select(
           'id, status, entry_date, description, voucher_number, voucher_series, fiscal_period_id, ' +
-          'fiscal_periods!journal_entries_fiscal_period_id_fkey!inner(name, is_closed, locked_at), lines:journal_entry_lines(account_number, debit_amount, credit_amount, line_description)'
+          'fiscal_periods!journal_entries_fiscal_period_id_fkey!inner(name, is_closed, locked_at), ' +
+          'lines:journal_entry_lines(account_number, debit_amount, credit_amount, line_description, currency, amount_in_currency, exchange_rate, tax_code, dimensions, cost_center, project)'
         )
         .eq('id', entryId)
         .eq('company_id', companyId)
@@ -13742,6 +14543,14 @@ export const tools: McpTool[] = [
               debit_amount: Number(l.debit_amount),
               credit_amount: Number(l.credit_amount),
               line_description: l.line_description,
+              currency: l.currency,
+              amount_in_currency:
+                l.amount_in_currency != null ? Number(l.amount_in_currency) : null,
+              exchange_rate: l.exchange_rate != null ? Number(l.exchange_rate) : null,
+              tax_code: l.tax_code,
+              dimensions: l.dimensions,
+              cost_center: l.cost_center,
+              project: l.project,
             })),
           },
           correction: {
@@ -13753,7 +14562,13 @@ export const tools: McpTool[] = [
               debit_amount: l.debit_amount,
               credit_amount: l.credit_amount,
               line_description: l.line_description ?? null,
+              currency: l.currency ?? null,
+              amount_in_currency: l.amount_in_currency ?? null,
+              exchange_rate: l.exchange_rate ?? null,
+              tax_code: l.tax_code ?? null,
               dimensions: l.dimensions ?? null,
+              cost_center: l.cost_center ?? null,
+              project: l.project ?? null,
             })),
           },
           ...(dimensionResolutions.length > 0 ? { dimension_resolutions: dimensionResolutions } : {}),
@@ -14321,7 +15136,7 @@ export const tools: McpTool[] = [
   {
     name: 'gnubok_list_pending_operations',
     title: 'List Pending Operations',
-    description: 'List staged pending_operations. Filter by status (default pending), risk_level, or operation_type. Use to review the queue before calling gnubok_approve_pending_operation or gnubok_reject_pending_operation.',
+    description: 'List staged pending_operations. Filter by status (default pending), risk_level, or operation_type. Approve via gnubok_approve_pending_operation, discard via gnubok_reject_pending_operation. render_ui=true opens the approval widget.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -14331,11 +15146,19 @@ export const tools: McpTool[] = [
         operation_type: { type: 'string', description: 'Filter to a single operation_type (e.g. "create_invoice")' },
         limit: { type: 'number', minimum: 1, maximum: 200, description: 'Default 50' },
         offset: { type: 'number', minimum: 0, description: 'Default 0' },
+        render_ui: {
+          type: 'boolean',
+          description: 'Render the interactive approval widget (claude.ai / Desktop): approve/reject by click; the click supplies the high-risk BFL acknowledgment. Data returned either way. Default false.',
+        },
       },
       required: [],
     },
     outputSchema: paginatedSchema('operations'),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    // Renders the approval-queue widget only when the caller passes
+    // render_ui=true (the dispatcher emits result-level _meta in that case),
+    // keeping the tool data-only by default.
+    uiResourceUri: 'ui://pending-operations/app.html',
     async execute(args, companyId, _userId, supabase) {
       const status = (args.status as string) ?? 'pending'
       const limit = Math.min(200, Math.max(1, (args.limit as number) ?? 50))
@@ -14767,7 +15590,7 @@ export const tools: McpTool[] = [
   {
     name: 'gnubok_list_recurring_schedules',
     title: 'List Recurring Invoice Schedules',
-    description: "List the company's recurring invoice schedules: monthly templates that auto-create customer invoices on day_of_month (clamps to the last day in shorter months) at send_hour (a whole hour in Europe/Stockholm time). Shows status, auto_send and next_run_date.",
+    description: "List the company's recurring invoice schedules: auto-create customer invoices on day_of_month (clamps to the last day in shorter months) every interval_months months (any 1-12; presets 1/3/6/12) at send_hour, Europe/Stockholm. Shows status, auto_send and next_run_date.",
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -14778,6 +15601,7 @@ export const tools: McpTool[] = [
           description: 'Filter by schedule status',
         },
         limit: { type: 'number', description: 'Max results (default 50, max 100)' },
+        offset: { type: 'integer', minimum: 0, description: 'Number of results to skip for pagination (default 0)' },
       },
     },
     outputSchema: paginatedSchema('schedules', {
@@ -14789,6 +15613,7 @@ export const tools: McpTool[] = [
         customer_id: { type: 'string' },
         customer_name: { type: ['string', 'null'] },
         day_of_month: { type: 'number', description: '1-31; clamps to the last day in shorter months' },
+        interval_months: { type: 'number', description: 'Months between runs: any integer 1-12; 1 = monthly, 3 = quarterly, 6 = half-yearly, 12 = yearly' },
         send_hour: { type: 'number', description: 'Whole hour 0-23 in Europe/Stockholm time' },
         payment_terms_days: { type: 'number' },
         currency: { type: 'string' },
@@ -14799,6 +15624,10 @@ export const tools: McpTool[] = [
         last_run_warning: { type: ['string', 'null'] },
         generated_count: { type: 'number' },
         monthly_total_excl_vat: { type: 'number' },
+        default_dimensions: {
+          type: 'object',
+          description: 'Dims bag {sie_dim_no: code} copied onto every generated invoice',
+        },
         items: {
           type: 'array',
           items: {
@@ -14809,6 +15638,7 @@ export const tools: McpTool[] = [
               unit: { type: 'string' },
               unit_price: { type: 'number' },
               vat_rate: { type: ['number', 'null'], description: 'null = customer default at spawn time' },
+              dimensions: { type: 'object', description: 'Per-item dims bag; wins per key over default_dimensions' },
             },
           },
         },
@@ -14823,12 +15653,13 @@ export const tools: McpTool[] = [
     catalogVisibility: 'search',
     async execute(args, companyId, userId, supabase) {
       const limit = Math.min(Math.max(1, Number(args.limit) || 50), 100)
+      const offset = Math.max(0, Math.floor(Number(args.offset) || 0))
       const status = args.status as string | undefined
 
       let query = supabase
         .from('recurring_invoice_schedules')
         .select(
-          'id, name, status, customer_id, day_of_month, send_hour, payment_terms_days, currency, auto_send, next_run_date, last_run_at, last_invoice_id, last_run_warning, generated_count, customer:customers(name), items:recurring_invoice_schedule_items(description, quantity, unit, unit_price, vat_rate, sort_order)',
+          'id, name, status, customer_id, day_of_month, interval_months, send_hour, payment_terms_days, currency, auto_send, default_dimensions, next_run_date, last_run_at, last_invoice_id, last_run_warning, generated_count, customer:customers(name), items:recurring_invoice_schedule_items(description, quantity, unit, unit_price, vat_rate, dimensions, sort_order)',
           { count: 'exact' },
         )
         .eq('company_id', companyId)
@@ -14839,11 +15670,13 @@ export const tools: McpTool[] = [
 
       const { data, error, count } = await query
         .order('created_at', { ascending: false })
-        .limit(limit)
+        .order('id', { ascending: false })
+        .range(offset, offset + limit)
 
       if (error) throw new Error(`Database error: ${error.message}`)
 
-      const schedules = (data ?? []).map((row: Record<string, unknown>) => {
+      const rows = data ?? []
+      const schedules = rows.slice(0, limit).map((row: Record<string, unknown>) => {
         const items = ((row.items as Array<Record<string, unknown>>) ?? [])
           .slice()
           .sort((a, b) => Number(a.sort_order) - Number(b.sort_order))
@@ -14853,6 +15686,7 @@ export const tools: McpTool[] = [
             unit: it.unit,
             unit_price: it.unit_price,
             vat_rate: it.vat_rate ?? null,
+            dimensions: it.dimensions ?? {},
           }))
         const monthlyTotalExclVat =
           Math.round(items.reduce((sum, it) => sum + Number(it.quantity) * Number(it.unit_price), 0) * 100) / 100
@@ -14863,6 +15697,7 @@ export const tools: McpTool[] = [
           customer_id: row.customer_id,
           customer_name: (row.customer as Record<string, unknown> | null)?.name ?? null,
           day_of_month: row.day_of_month,
+          interval_months: row.interval_months,
           send_hour: row.send_hour,
           payment_terms_days: row.payment_terms_days,
           currency: row.currency,
@@ -14873,14 +15708,22 @@ export const tools: McpTool[] = [
           last_run_warning: row.last_run_warning ?? null,
           generated_count: row.generated_count,
           monthly_total_excl_vat: monthlyTotalExclVat,
+          default_dimensions: row.default_dimensions ?? {},
           items,
         }
       })
 
+      const hasMore = count == null
+        ? rows.length > limit
+        : offset + schedules.length < count
+      const total = count ?? offset + schedules.length + (hasMore ? 1 : 0)
+
       return {
         schedules,
         count: schedules.length,
-        total_count: count ?? schedules.length,
+        total_count: total,
+        has_more: hasMore,
+        ...(hasMore ? { next_offset: offset + schedules.length } : {}),
       }
     },
   },
@@ -14888,7 +15731,7 @@ export const tools: McpTool[] = [
   {
     name: 'gnubok_create_recurring_schedule',
     title: 'Create Recurring Invoice Schedule',
-    description: 'Stage a new recurring invoice schedule: a monthly template that creates a customer invoice on day_of_month (clamps to the last day in shorter months) at send_hour (a whole hour in Europe/Stockholm time). auto_send defaults false; true emails each invoice without new approval.',
+    description: 'Stage a new recurring invoice schedule: creates a customer invoice on day_of_month (clamps to the last day in shorter months) every interval_months months (default 1) at send_hour, Europe/Stockholm. auto_send defaults false; true emails each invoice without new approval.',
     outputSchema: STAGED_OPERATION_SCHEMA,
     inputSchema: {
       type: 'object',
@@ -14901,6 +15744,12 @@ export const tools: McpTool[] = [
           minimum: 1,
           maximum: 31,
           description: 'Day of month the invoice is created. 29-31 clamp to the last day in shorter months; the stored day is kept for longer months.',
+        },
+        interval_months: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 12,
+          description: 'Months between invoices: any integer 1-12. Default 1 (monthly); 3 = quarterly, 6 = half-yearly, 12 = yearly.',
         },
         send_hour: {
           type: 'integer',
@@ -14918,6 +15767,11 @@ export const tools: McpTool[] = [
           description: 'Default false: invoices are created as drafts for manual review. true emails every generated invoice to the customer with no further approval; requires the customer to have an email address.',
         },
         start_date: { type: 'string', description: 'YYYY-MM-DD first run date. Omit to run on the next occurrence of day_of_month.' },
+        default_dimensions: {
+          type: 'object',
+          additionalProperties: { type: 'string' },
+          description: 'Dims bag keyed by SIE dim no, value = code OR name, e.g. {"6":"P001"}. Copied onto every generated invoice. Unknown values rejected: never auto-created.',
+        },
         items: {
           type: 'array',
           minItems: 1,
@@ -14933,6 +15787,11 @@ export const tools: McpTool[] = [
                 type: ['number', 'null'],
                 enum: [0, 6, 12, 25, null],
                 description: 'Omit or null to use the customer default VAT rate at spawn time.',
+              },
+              dimensions: {
+                type: 'object',
+                additionalProperties: { type: 'string' },
+                description: 'Dims bag {sie_dim_no: kod eller namn}, e.g. {"6":"P001"}. Wins per key over default_dimensions.',
               },
             },
             required: ['description', 'quantity', 'unit_price'],
@@ -14951,11 +15810,33 @@ export const tools: McpTool[] = [
     },
     catalogVisibility: 'search',
     async execute(args, companyId, userId, supabase, actor) {
+      // Resolve-don't-select: parse the schedule-level default bag + each
+      // item's own bag, then resolve codes AND natural-language names against
+      // the registry in ONE pass (mirrors gnubok_create_invoice). The staged
+      // params carry only resolved codes; the cron copies them verbatim onto
+      // every generated invoice.
+      const rawItems = Array.isArray(args.items)
+        ? (args.items as Array<Record<string, unknown>>)
+        : []
+      const defaultDimensions = parseDimensionsArg(args.default_dimensions, 'default_dimensions')
+      const { bags: resolvedDimBags, resolutions: dimensionResolutions } = await resolveDimensionBags(
+        supabase,
+        companyId,
+        [defaultDimensions, ...rawItems.map((item, i) => parseDimensionsArg(item.dimensions, `items[${i}].dimensions`))],
+      )
+      const resolvedDefaultDimensions = resolvedDimBags[0]
+      const stagedItems = rawItems.map((item, i) => {
+        const { dimensions: _rawDimensions, ...rest } = item
+        const bag = resolvedDimBags[i + 1]
+        return bag && Object.keys(bag).length > 0 ? { ...rest, dimensions: bag } : rest
+      })
+
       const candidate: Record<string, unknown> = {}
       for (const key of [
         'customer_id',
         'name',
         'day_of_month',
+        'interval_months',
         'send_hour',
         'payment_terms_days',
         'currency',
@@ -14964,9 +15845,16 @@ export const tools: McpTool[] = [
         'notes',
         'auto_send',
         'start_date',
-        'items',
       ]) {
         if (args[key] !== undefined) candidate[key] = args[key]
+      }
+      if (args.items !== undefined) {
+        // Non-array garbage passes through verbatim so the schema error below
+        // names the real problem instead of a synthetic empty list.
+        candidate.items = Array.isArray(args.items) ? stagedItems : args.items
+      }
+      if (resolvedDefaultDimensions && Object.keys(resolvedDefaultDimensions).length > 0) {
+        candidate.default_dimensions = resolvedDefaultDimensions
       }
 
       const parsed = CreateRecurringScheduleParamsSchema.safeParse(candidate)
@@ -15000,6 +15888,7 @@ export const tools: McpTool[] = [
         customer_id: customer.id,
         customer_name: customer.name,
         day_of_month: params.day_of_month,
+        interval_months: params.interval_months,
         send_hour: params.send_hour,
         payment_terms_days: params.payment_terms_days,
         currency: params.currency,
@@ -15007,6 +15896,12 @@ export const tools: McpTool[] = [
         projected_first_run_date: computeInitialRunDate(new Date(), params.day_of_month, params.start_date),
         monthly_total_excl_vat: monthlyTotalExclVat,
         items: params.items,
+        ...(params.default_dimensions && Object.keys(params.default_dimensions).length > 0
+          ? { default_dimensions: params.default_dimensions }
+          : {}),
+        // Echoed for every non-exact dimension resolution (resolve-don't-
+        // select) so the agent can verify what a name attached to.
+        ...(dimensionResolutions.length > 0 ? { dimension_resolutions: dimensionResolutions } : {}),
       }
 
       return stagePendingOperation(supabase, companyId, userId, 'create_recurring_schedule',
@@ -15044,6 +15939,12 @@ export const tools: McpTool[] = [
           maximum: 31,
           description: '1-31; clamps to the last day in shorter months. Changing it rolls next_run_date to the next future occurrence.',
         },
+        interval_months: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 12,
+          description: 'Months between invoices: any integer 1-12; 1 = monthly, 3 = quarterly, 6 = half-yearly, 12 = yearly. Changing only interval_months leaves next_run_date untouched.',
+        },
         send_hour: { type: 'integer', minimum: 0, maximum: 23, description: 'Whole hour (0-23) in Europe/Stockholm time.' },
         payment_terms_days: { type: 'integer', minimum: 0, maximum: 90 },
         currency: { type: 'string', enum: ['SEK', 'EUR', 'USD', 'GBP', 'NOK', 'DKK'] },
@@ -15058,6 +15959,11 @@ export const tools: McpTool[] = [
           type: 'string',
           enum: ['active', 'paused'],
           description: 'paused stops generating invoices; active resumes. Reactivating from a stale date rolls next_run_date to the next future occurrence, never today.',
+        },
+        default_dimensions: {
+          type: 'object',
+          additionalProperties: { type: 'string' },
+          description: 'Dims bag {sie_dim_no: kod eller namn} copied onto every generated invoice. Replaces the whole bag; {} clears all tags. Omit to keep.',
         },
         items: {
           type: 'array',
@@ -15074,6 +15980,11 @@ export const tools: McpTool[] = [
                 type: ['number', 'null'],
                 enum: [0, 6, 12, 25, null],
                 description: 'Omit or null to use the customer default VAT rate at spawn time.',
+              },
+              dimensions: {
+                type: 'object',
+                additionalProperties: { type: 'string' },
+                description: 'Dims bag {sie_dim_no: kod eller namn}, e.g. {"6":"P001"}. Wins per key over default_dimensions.',
               },
             },
             required: ['description', 'quantity', 'unit_price'],
@@ -15092,11 +16003,30 @@ export const tools: McpTool[] = [
     },
     catalogVisibility: 'search',
     async execute(args, companyId, userId, supabase, actor) {
+      // Resolve-don't-select for both the replacement default bag and any
+      // per-item bags (mirrors gnubok_create_recurring_schedule). An explicit
+      // {} default_dimensions passes through as the clear-all-tags update.
+      const rawItems = Array.isArray(args.items)
+        ? (args.items as Array<Record<string, unknown>>)
+        : []
+      const defaultDimensions = parseDimensionsArg(args.default_dimensions, 'default_dimensions')
+      const { bags: resolvedDimBags, resolutions: dimensionResolutions } = await resolveDimensionBags(
+        supabase,
+        companyId,
+        [defaultDimensions, ...rawItems.map((item, i) => parseDimensionsArg(item.dimensions, `items[${i}].dimensions`))],
+      )
+      const stagedItems = rawItems.map((item, i) => {
+        const { dimensions: _rawDimensions, ...rest } = item
+        const bag = resolvedDimBags[i + 1]
+        return bag && Object.keys(bag).length > 0 ? { ...rest, dimensions: bag } : rest
+      })
+
       const changes: Record<string, unknown> = {}
       for (const key of [
         'customer_id',
         'name',
         'day_of_month',
+        'interval_months',
         'send_hour',
         'payment_terms_days',
         'currency',
@@ -15105,9 +16035,16 @@ export const tools: McpTool[] = [
         'notes',
         'auto_send',
         'status',
-        'items',
       ]) {
         if (args[key] !== undefined) changes[key] = args[key]
+      }
+      if (args.default_dimensions !== undefined) {
+        changes.default_dimensions = resolvedDimBags[0] ?? {}
+      }
+      if (args.items !== undefined) {
+        // Non-array garbage passes through verbatim so the schema error below
+        // names the real problem instead of a synthetic empty list.
+        changes.items = Array.isArray(args.items) ? stagedItems : args.items
       }
 
       const parsed = UpdateRecurringScheduleParamsSchema.safeParse({
@@ -15123,7 +16060,7 @@ export const tools: McpTool[] = [
       const { data: current, error } = await supabase
         .from('recurring_invoice_schedules')
         .select(
-          'id, name, status, customer_id, day_of_month, send_hour, payment_terms_days, currency, your_reference, our_reference, notes, auto_send, next_run_date, customer:customers(name, email), items:recurring_invoice_schedule_items(description, quantity, unit, unit_price, vat_rate, sort_order)',
+          'id, name, status, customer_id, day_of_month, interval_months, send_hour, payment_terms_days, currency, your_reference, our_reference, notes, auto_send, default_dimensions, next_run_date, customer:customers(name, email), items:recurring_invoice_schedule_items(description, quantity, unit, unit_price, vat_rate, dimensions, sort_order)',
         )
         .eq('id', parsed.data.schedule_id)
         .eq('company_id', companyId)
@@ -15165,6 +16102,7 @@ export const tools: McpTool[] = [
           unit: it.unit,
           unit_price: it.unit_price,
           vat_rate: it.vat_rate ?? null,
+          dimensions: it.dimensions ?? {},
         }))
 
       const currentPreview = {
@@ -15174,6 +16112,7 @@ export const tools: McpTool[] = [
         customer_id: current.customer_id,
         customer_name: (current.customer as { name?: string } | null)?.name ?? null,
         day_of_month: current.day_of_month,
+        interval_months: current.interval_months,
         send_hour: current.send_hour,
         payment_terms_days: current.payment_terms_days,
         currency: current.currency,
@@ -15181,6 +16120,7 @@ export const tools: McpTool[] = [
         our_reference: current.our_reference ?? null,
         notes: current.notes ?? null,
         auto_send: current.auto_send,
+        default_dimensions: current.default_dimensions ?? {},
         next_run_date: current.next_run_date,
         items: currentItems,
       }
@@ -15202,6 +16142,9 @@ export const tools: McpTool[] = [
             ...fieldChanges,
             ...(newItems ? { items: newItems } : {}),
           },
+          // Echoed for every non-exact dimension resolution (resolve-don't-
+          // select) so the agent can verify what a name attached to.
+          ...(dimensionResolutions.length > 0 ? { dimension_resolutions: dimensionResolutions } : {}),
         },
         actor,
         undefined,
@@ -15238,6 +16181,61 @@ const SERVER_INFO_BY_NAMESPACE = {
 } as const
 
 const PROTOCOL_VERSION = '2025-06-18'
+
+// ── Spec revision 2026-07-28 (stateless core) ────────────────
+// New-style clients skip the initialize handshake and instead carry their
+// protocol version and capabilities in _meta on every request. The handshake
+// path keeps serving 2025-06-18-and-earlier clients unchanged: their
+// responses stay byte-identical.
+const STATELESS_PROTOCOL_VERSION = '2026-07-28'
+const SUPPORTED_PROTOCOL_VERSIONS = [
+  STATELESS_PROTOCOL_VERSION,
+  '2025-06-18',
+  '2025-03-26',
+  '2024-11-05',
+]
+const META_PROTOCOL_VERSION = 'io.modelcontextprotocol/protocolVersion'
+const META_SERVER_INFO = 'io.modelcontextprotocol/serverInfo'
+// 2026-07-28 reserves -32020..-32099 for spec-defined errors.
+const JSONRPC_HEADER_MISMATCH = -32020
+const JSONRPC_UNSUPPORTED_PROTOCOL_VERSION = -32022
+// CacheableResult freshness hints. The tool/prompt catalog and widget HTML
+// change only on deploy; skills live in the DB and can change between
+// deploys; data resources are live ledger state and must never be cached.
+// Everything is served behind Authorization, so cacheScope stays private.
+const CACHE_STATIC = { ttlMs: 3_600_000, cacheScope: 'private' } as const
+const CACHE_SKILLS = { ttlMs: 300_000, cacheScope: 'private' } as const
+const CACHE_LIVE = { ttlMs: 0, cacheScope: 'private' } as const
+
+const SERVER_CAPABILITIES = {
+  tools: { listChanged: false },
+  resources: { listChanged: false },
+  prompts: { listChanged: false },
+  extensions: {
+    // MCP Apps (ratified extension): widgets are served as ui:// resources
+    // and referenced from tool _meta.ui.resourceUri (see widgets/).
+    'io.modelcontextprotocol/ui': {},
+    // MCP Tasks: durable handles for long-running tool calls (see tasks.ts).
+    [TASKS_EXTENSION_ID]: {},
+  },
+}
+
+/**
+ * Decode a standard-header value per the 2026-07-28 Value Encoding rules:
+ * values outside plain ASCII arrive as =?base64?<data>?= and MUST be decoded
+ * before comparing against the request body. Returns null for an absent
+ * header so callers can distinguish "not sent" from "sent empty".
+ */
+function decodeMcpHeaderValue(value: string | null): string | null {
+  if (value === null) return null
+  const match = /^=\?base64\?(.*)\?=$/.exec(value)
+  if (!match) return value
+  try {
+    return Buffer.from(match[1], 'base64').toString('utf8')
+  } catch {
+    return value
+  }
+}
 
 function jsonRpc(id: string | number | null, result: unknown): JsonRpcResponse {
   return { jsonrpc: '2.0', id, result }
@@ -15592,25 +16590,111 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
     )
   }
 
+  // ── Stateless core (spec 2026-07-28) ──
+  // New-style clients carry their protocol version in _meta on every request
+  // instead of an initialize handshake. Requests without the key come from
+  // handshake-era clients and keep byte-identical responses.
+  const requestMeta = (body.params?._meta ?? {}) as Record<string, unknown>
+  const metaVersion = requestMeta[META_PROTOCOL_VERSION]
+  if (typeof metaVersion === 'string' && !SUPPORTED_PROTOCOL_VERSIONS.includes(metaVersion)) {
+    return NextResponse.json(
+      jsonRpcError(
+        body.id ?? null,
+        JSONRPC_UNSUPPORTED_PROTOCOL_VERSION,
+        `Unsupported protocol version: "${metaVersion}"`,
+        { supported: SUPPORTED_PROTOCOL_VERSIONS }
+      ),
+      { status: 400 }
+    )
+  }
+  // Revisions are ISO dates, so string comparison orders them correctly.
+  const statelessClient =
+    typeof metaVersion === 'string' && metaVersion >= STATELESS_PROTOCOL_VERSION
+  // Tasks extension: only a client that declared it in THIS request's
+  // capabilities may ever receive a CreateTaskResult.
+  const taskCapable = statelessClient && isTaskCapableClient(requestMeta)
+
+  // Standard request headers (2026-07-28): when present they must agree with
+  // the JSON-RPC body. Absence stays accepted: this server supports
+  // handshake-era clients (the spec sanctions that leniency), and the stdio
+  // bridges do not send the headers.
+  const headerProtocolVersion = request.headers.get('mcp-protocol-version')
+  if (
+    headerProtocolVersion &&
+    typeof metaVersion === 'string' &&
+    headerProtocolVersion !== metaVersion
+  ) {
+    return NextResponse.json(
+      jsonRpcError(
+        body.id ?? null,
+        JSONRPC_HEADER_MISMATCH,
+        `Header mismatch: MCP-Protocol-Version "${headerProtocolVersion}" does not match _meta protocol version "${metaVersion}"`
+      ),
+      { status: 400 }
+    )
+  }
+  const headerMethod = request.headers.get('mcp-method')
+  if (headerMethod && headerMethod !== body.method) {
+    return NextResponse.json(
+      jsonRpcError(
+        body.id ?? null,
+        JSONRPC_HEADER_MISMATCH,
+        `Header mismatch: Mcp-Method "${headerMethod}" does not match body method "${body.method}"`
+      ),
+      { status: 400 }
+    )
+  }
+  // Mcp-Name mirrors params.name (tools/call, prompts/get) or params.uri
+  // (resources/read); non-ASCII values arrive base64-wrapped and are decoded
+  // before comparison.
+  const headerName = decodeMcpHeaderValue(request.headers.get('mcp-name'))
+  const bodyParamName = body.params?.name ?? body.params?.uri
+  if (headerName !== null && typeof bodyParamName === 'string' && headerName !== bodyParamName) {
+    return NextResponse.json(
+      jsonRpcError(
+        body.id ?? null,
+        JSONRPC_HEADER_MISMATCH,
+        `Header mismatch: Mcp-Name "${headerName}" does not match the request body name/uri "${bodyParamName}"`
+      ),
+      { status: 400 }
+    )
+  }
+
+  /**
+   * Decorate a result for stateless-core clients: required resultType,
+   * serverInfo identification, and CacheableResult freshness hints. A no-op
+   * for handshake-era clients so existing connections see unchanged payloads.
+   */
+  const decorate = (
+    result: Record<string, unknown>,
+    cache?: { ttlMs: number; cacheScope: 'public' | 'private' }
+  ): Record<string, unknown> => {
+    if (!statelessClient) return result
+    const decorated: Record<string, unknown> = { resultType: 'complete', ...result }
+    if (cache) {
+      decorated.ttlMs = cache.ttlMs
+      decorated.cacheScope = cache.cacheScope
+    }
+    decorated._meta = {
+      ...((result._meta as Record<string, unknown> | undefined) ?? {}),
+      [META_SERVER_INFO]: SERVER_INFO_BY_NAMESPACE[toolNamespace],
+    }
+    return decorated
+  }
+
   // ── Dispatch ──
   const { method, id, params } = body
 
   switch (method) {
+    case 'server/discover':
     case 'initialize': {
-      const SUPPORTED_VERSIONS = new Set(['2025-06-18', '2025-03-26', '2024-11-05'])
+      // Handshake-era set: a 2026-07-28 stateless client never sends
+      // initialize; one that does anyway negotiates down to 2025-06-18.
+      const HANDSHAKE_VERSIONS = new Set(['2025-06-18', '2025-03-26', '2024-11-05'])
       const clientVersion = (params as Record<string, unknown>)?.protocolVersion as string | undefined
       const negotiatedVersion =
-        clientVersion && SUPPORTED_VERSIONS.has(clientVersion) ? clientVersion : PROTOCOL_VERSION
-      return NextResponse.json(
-        jsonRpc(id ?? null, {
-          protocolVersion: negotiatedVersion,
-          capabilities: {
-            tools: { listChanged: false },
-            resources: { listChanged: false },
-            prompts: { listChanged: false },
-          },
-          serverInfo: SERVER_INFO_BY_NAMESPACE[toolNamespace],
-          instructions: projectToolReferencesInText([
+        clientVersion && HANDSHAKE_VERSIONS.has(clientVersion) ? clientVersion : PROTOCOL_VERSION
+      const instructions = projectToolReferencesInText([
             'Accounted: Swedish double-entry bookkeeping via conversation.',
             '',
             'Discovery:',
@@ -15628,7 +16712,7 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
             '• Suppliers: gnubok_list_suppliers (or gnubok_create_supplier) → gnubok_create_supplier_invoice_from_inbox → gnubok_approve_supplier_invoice. Refund via gnubok_credit_supplier_invoice.',
             '• VAT: gnubok_get_vat_report(period_type, year, period). Ruta49 = VAT to pay (positive) or refund (negative). Pass render_ui=true to open the momsdeklaration review widget (claude.ai / Desktop). gnubok_vat_close_check reports filing-readiness blockers.',
             '• Reporting: gnubok_get_trial_balance / _income_statement / _balance_sheet / _kpi_report / _ar_ledger / _supplier_ledger: all default to the most recent fiscal period. For account roll-ups use gnubok_get_general_ledger; for ad-hoc line queries (free-text, amount/date/source filters) use gnubok_query_journal.',
-            '• Interactive review UIs (claude.ai / Claude Desktop only): gnubok_get_vat_report(render_ui=true) renders the VAT widget and gnubok_receipt_matcher opens the receipt↔transaction matcher. Both also return structured data; other clients ignore the UI and use the data.',
+            '• Interactive review UIs (claude.ai / Claude Desktop only): gnubok_get_vat_report(render_ui=true) renders the VAT widget, gnubok_receipt_matcher opens the receipt↔transaction matcher, and gnubok_list_pending_operations(render_ui=true) opens the approval queue where the user approves/rejects with a click. All also return structured data; other clients ignore the UI and use the data.',
             '• Year-end: gnubok_lock_period → gnubok_run_year_end → gnubok_set_opening_balances → gnubok_close_period. Each stages for human approval; closing is irreversible per BFL.',
             '• Payroll: gnubok_create_salary_run → gnubok_calculate_salary_run → gnubok_book_salary_run → gnubok_generate_agi.',
             '• Reviewing & approving staged operations: gnubok_list_pending_operations shows the queue. When the user explicitly authorises a specific operation_id in chat, call gnubok_approve_pending_operation to commit. Use gnubok_reject_pending_operation to discard.',
@@ -15640,7 +16724,30 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
             toolNamespace === 'gnubok'
               ? 'Tool names carry the legacy gnubok_ prefix (a stable identifier kept across the rebrand); the server and app are "Accounted". Same product: the prefix is not a different system.'
               : 'Tool names use the accounted_ prefix. Legacy gnubok_ aliases remain accepted for existing integrations.',
-          ].join('\n'), toolNamespace, getCanonicalToolNames()),
+          ].join('\n'), toolNamespace, getCanonicalToolNames())
+      // 2026-07-28 MUST: server/discover advertises supported revisions,
+      // capabilities, and identity so stateless clients can select a version
+      // up front or use it as a compatibility probe. Always answers in the
+      // stateless result shape regardless of the request's _meta.
+      if (method === 'server/discover') {
+        return NextResponse.json(
+          jsonRpc(id ?? null, {
+            resultType: 'complete',
+            supportedVersions: SUPPORTED_PROTOCOL_VERSIONS,
+            capabilities: SERVER_CAPABILITIES,
+            instructions,
+            ttlMs: CACHE_STATIC.ttlMs,
+            cacheScope: CACHE_STATIC.cacheScope,
+            _meta: { [META_SERVER_INFO]: SERVER_INFO_BY_NAMESPACE[toolNamespace] },
+          })
+        )
+      }
+      return NextResponse.json(
+        jsonRpc(id ?? null, {
+          protocolVersion: negotiatedVersion,
+          capabilities: SERVER_CAPABILITIES,
+          serverInfo: SERVER_INFO_BY_NAMESPACE[toolNamespace],
+          instructions,
         })
       )
     }
@@ -15650,7 +16757,7 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
       return new Response(null, { status: 202 })
 
     case 'ping':
-      return NextResponse.json(jsonRpc(id ?? null, {}))
+      return NextResponse.json(jsonRpc(id ?? null, decorate({})))
 
     case 'tools/list': {
       const listStartedAt = Date.now()
@@ -15668,7 +16775,7 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
         companyId,
       })
       return NextResponse.json(
-        jsonRpc(id ?? null, {
+        jsonRpc(id ?? null, decorate({
           tools: allowedTools.map((t) => {
             // Merge derived staging metadata with any literal _meta (e.g. UI
             // widget hints). Literal _meta wins on key collision so explicit
@@ -15690,7 +16797,7 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
               toolNamespace
             )
           }),
-        })
+        }, CACHE_STATIC))
       )
     }
 
@@ -15758,10 +16865,10 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
         })
         const publicScopeError = projectMcpPayload(scopeError, toolNamespace)
         return NextResponse.json(
-          jsonRpc(id ?? null, {
+          jsonRpc(id ?? null, decorate({
             content: [{ type: 'text', text: JSON.stringify(publicScopeError, null, 2) }],
             isError: true,
-          })
+          }))
         )
       }
 
@@ -15802,10 +16909,10 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
           companyId,
         })
         return NextResponse.json(
-          jsonRpc(id ?? null, {
+          jsonRpc(id ?? null, decorate({
             content: [{ type: 'text', text: JSON.stringify(publicStructured, null, 2) }],
             isError: true,
-          })
+          }))
         )
       }
 
@@ -15832,10 +16939,10 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
           companyId: effectiveCompanyId,
         })
         return NextResponse.json(
-          jsonRpc(id ?? null, {
+          jsonRpc(id ?? null, decorate({
             content: [{ type: 'text', text: JSON.stringify(publicCapError, null, 2) }],
             isError: true,
-          })
+          }))
         )
       }
 
@@ -15873,10 +16980,10 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
             companyId: effectiveCompanyId,
           })
           return NextResponse.json(
-            jsonRpc(id ?? null, {
+            jsonRpc(id ?? null, decorate({
               content: [{ type: 'text', text: JSON.stringify(publicBlocked, null, 2) }],
               isError: true,
-            })
+            }))
           )
         }
       }
@@ -15885,6 +16992,90 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
       // run before execute() so we don't double-store on this call. Emits
       // mcp.next_hint_followed when the agent's behaviour matches the hint.
       checkAndEmitNextHintFollowed(sessionId, toolName, actor, userId, effectiveCompanyId)
+
+      // ── Tasks extension (io.modelcontextprotocol/tasks) ──
+      // Long-running tools return a durable handle immediately to a client
+      // that declared the extension; the work completes after the response
+      // (after() keeps the function alive) and the result lands in mcp_tasks
+      // for tasks/get polling. Runs after every auth/scope/capability guard
+      // so nothing is ever started for a call that would have been refused.
+      if (taskCapable && tool.shouldRunAsTask?.(toolArgs)) {
+        const task = await createMcpTask(supabase, {
+          companyId: effectiveCompanyId,
+          userId,
+          apiKeyId,
+          toolName,
+        })
+        const taskStartedAt = Date.now()
+        emitAfterResponse(async () => {
+          try {
+            const rawResult = await tool.execute(toolArgs, effectiveCompanyId, userId, supabase, actor)
+            const canonicalResult = addCompanyToTopLevelNext(rawResult, effectiveCompanyId)
+            const result = projectMcpPayload(canonicalResult, toolNamespace)
+            const stored: Record<string, unknown> = {
+              resultType: 'complete',
+              content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+            }
+            if (result !== null && result !== undefined) {
+              stored.structuredContent =
+                typeof result === 'object' && !Array.isArray(result) ? result : { value: result }
+            }
+            await resolveMcpTask(supabase, task.id, { status: 'completed', result: stored })
+            emitToolCallTelemetry({
+              tool: toolName,
+              requiredScope: requiredScope ?? null,
+              actor,
+              latencyMs: Date.now() - taskStartedAt,
+              success: true,
+              isError: false,
+              errorCode: null,
+              errorKind: null,
+              errorMessage: null,
+              requestId: id ?? null,
+              userId,
+              companyId: effectiveCompanyId,
+            })
+          } catch (err) {
+            // Tool failures complete the task with the standard isError
+            // envelope: exactly what the synchronous call would have
+            // returned. `failed` stays reserved for infrastructure errors.
+            const structured = toToolError(err, { toolName })
+            const publicStructured = projectMcpPayload(structured, toolNamespace)
+            await resolveMcpTask(supabase, task.id, {
+              status: 'completed',
+              result: {
+                resultType: 'complete',
+                content: [{ type: 'text', text: JSON.stringify(publicStructured, null, 2) }],
+                isError: true,
+              },
+              statusMessage: structured.error.message_sv,
+            }).catch((updateErr) => {
+              log.error('Failed to store MCP task failure result', { taskId: task.id, updateErr })
+            })
+            emitToolCallTelemetry({
+              tool: toolName,
+              requiredScope: requiredScope ?? null,
+              actor,
+              latencyMs: Date.now() - taskStartedAt,
+              success: false,
+              isError: true,
+              errorCode: structured.error.code,
+              errorKind: 'execution',
+              errorMessage: structured.error.message_sv,
+              requestId: id ?? null,
+              userId,
+              companyId: effectiveCompanyId,
+            })
+          }
+        })
+        return NextResponse.json(
+          jsonRpc(id ?? null, {
+            resultType: 'task',
+            task: taskToWire(task),
+            _meta: { [META_SERVER_INFO]: SERVER_INFO_BY_NAMESPACE[toolNamespace] },
+          })
+        )
+      }
 
       const callStartedAt = Date.now()
       try {
@@ -15943,7 +17134,7 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
           userId,
           companyId: effectiveCompanyId,
         })
-        return NextResponse.json(jsonRpc(id ?? null, response))
+        return NextResponse.json(jsonRpc(id ?? null, decorate(response)))
       } catch (err) {
         const latencyMs = Date.now() - callStartedAt
         const structured = toToolError(err, { toolName })
@@ -15966,10 +17157,10 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
           companyId: effectiveCompanyId,
         })
         return NextResponse.json(
-          jsonRpc(id ?? null, {
+          jsonRpc(id ?? null, decorate({
             content: [{ type: 'text', text: JSON.stringify(publicStructured, null, 2) }],
             isError: true,
-          })
+          }))
         )
       }
     }
@@ -15977,7 +17168,7 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
     case 'resources/list': {
       const allSkills = await loadAllSkills(supabase)
       return NextResponse.json(
-        jsonRpc(id ?? null, projectMcpPayload({
+        jsonRpc(id ?? null, decorate(projectMcpPayload({
           resources: [
             ...uiWidgets.map((w) => ({
               uri: w.uri,
@@ -15998,7 +17189,7 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
               mimeType: r.mimeType,
             })),
           ],
-        }, toolNamespace))
+        }, toolNamespace), CACHE_SKILLS))
       )
     }
 
@@ -16020,7 +17211,7 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
           companyId,
         })
         return NextResponse.json(
-          jsonRpc(id ?? null, {
+          jsonRpc(id ?? null, decorate({
             contents: [
               {
                 uri,
@@ -16032,7 +17223,7 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
                 ),
               },
             ],
-          })
+          }, CACHE_STATIC))
         )
       }
 
@@ -16055,7 +17246,7 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
             companyId,
           })
           return NextResponse.json(
-            jsonRpc(id ?? null, {
+            jsonRpc(id ?? null, decorate({
               contents: [
                 {
                   uri,
@@ -16067,7 +17258,7 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
                   ),
                 },
               ],
-            })
+            }, CACHE_SKILLS))
           )
         }
       }
@@ -16094,7 +17285,7 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
             companyId,
           })
           return NextResponse.json(
-            jsonRpc(id ?? null, {
+            jsonRpc(id ?? null, decorate({
               contents: [
                 {
                   uri,
@@ -16102,7 +17293,7 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
                   text: JSON.stringify(projectMcpPayload(result, toolNamespace), null, 2),
                 },
               ],
-            })
+            }, CACHE_LIVE))
           )
         } catch (err) {
           const message = err instanceof Error ? err.message : 'Resource read failed'
@@ -16149,12 +17340,12 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
 
     case 'prompts/list':
       return NextResponse.json(
-        jsonRpc(id ?? null, projectMcpPayload({
+        jsonRpc(id ?? null, decorate(projectMcpPayload({
           prompts: prompts.map((p) => ({
             name: p.name,
             description: p.description,
           })),
-        }, toolNamespace))
+        }, toolNamespace), CACHE_STATIC))
       )
 
     case 'prompts/get': {
@@ -16166,7 +17357,7 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
         )
       }
       return NextResponse.json(
-        jsonRpc(id ?? null, {
+        jsonRpc(id ?? null, decorate({
           description: prompt.description,
           messages: [
             {
@@ -16181,8 +17372,53 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
               },
             },
           ],
-        })
+        }))
       )
+    }
+
+    case 'tasks/get': {
+      const taskId = (params as Record<string, unknown>)?.taskId
+      if (typeof taskId !== 'string' || !taskId) {
+        return NextResponse.json(jsonRpcError(id ?? null, -32602, 'taskId is required'))
+      }
+      // Scoped to the creating user: an API key can only poll its own tasks.
+      const { data: taskRow } = await supabase
+        .from('mcp_tasks')
+        .select('*')
+        .eq('id', taskId)
+        .eq('user_id', userId)
+        .single()
+      if (!taskRow) {
+        return NextResponse.json(jsonRpcError(id ?? null, -32602, `Task not found: "${taskId}"`))
+      }
+      const row = taskRow as McpTaskRow
+      const wire: Record<string, unknown> = { resultType: 'complete', ...taskToWire(row) }
+      if (row.status === 'completed' && row.result) wire.result = row.result
+      if (row.status === 'failed' && row.error) wire.error = row.error
+      wire._meta = { [META_SERVER_INFO]: SERVER_INFO_BY_NAMESPACE[toolNamespace] }
+      return NextResponse.json(jsonRpc(id ?? null, wire))
+    }
+
+    case 'tasks/update':
+      // No input_required flows exist yet: acknowledge and ignore unknown or
+      // already-satisfied inputResponses, as the extension spec instructs.
+      return NextResponse.json(jsonRpc(id ?? null, { resultType: 'complete' }))
+
+    case 'tasks/cancel': {
+      const taskId = (params as Record<string, unknown>)?.taskId
+      if (typeof taskId !== 'string' || !taskId) {
+        return NextResponse.json(jsonRpcError(id ?? null, -32602, 'taskId is required'))
+      }
+      // Cooperative cancellation: flip a still-working row; an in-flight
+      // execution is not interrupted, and its late completion becomes a
+      // no-op against the now-terminal row.
+      await supabase
+        .from('mcp_tasks')
+        .update({ status: 'cancelled' })
+        .eq('id', taskId)
+        .eq('user_id', userId)
+        .eq('status', 'working')
+      return NextResponse.json(jsonRpc(id ?? null, { resultType: 'complete' }))
     }
 
     default:

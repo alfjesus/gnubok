@@ -7,7 +7,7 @@ import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { DataListEmpty, DataListLoading } from '@/components/ui/data-list'
 import { ContextPicker } from '@/components/common/ContextPicker'
-import { QUIET_LINK_CLASS, VTH_CLASS, VTD_CLASS } from '@/components/ui/dry-table'
+import { HOVER_REVEAL_CLASS, QUIET_LINK_CLASS, VTH_CLASS, VTD_CLASS } from '@/components/ui/dry-table'
 import {
   SlideOver,
   SlideOverContent,
@@ -330,8 +330,24 @@ function CategorizePreview({ data }: { data: Record<string, unknown> }) {
     )
   }
 
+  // Some operations carry their kontering under the generic `preview_lines`
+  // key instead (the shape every other staged type renders through). Read it
+  // before falling through to the legacy summary, which would otherwise show
+  // blank accounts for a preview that does describe the entry in full.
+  if (isKonteringLines(data.preview_lines)) {
+    return (
+      <div className="space-y-1 text-sm">
+        <p className="text-xs text-muted-foreground mb-1">Verifikat</p>
+        <PreviewKonteringTable lines={data.preview_lines} />
+      </div>
+    )
+  }
+
   // Legacy summary for operations staged before the preview carried full
   // lines: debit/credit accounts + gross amount + separate VAT rows.
+  const legacyAmount = typeof data.amount === 'number' && Number.isFinite(data.amount)
+    ? data.amount
+    : null
   return (
     <div className="space-y-3 text-sm">
       <div className="grid grid-cols-2 gap-x-4 gap-y-1">
@@ -341,7 +357,11 @@ function CategorizePreview({ data }: { data: Record<string, unknown> }) {
         <span className="font-mono">{String(data.credit_account ?? '')}</span>
         <span className="text-muted-foreground">Belopp</span>
         <span className="font-mono tabular-nums">
-          {formatCurrency(data.amount as number, (data.currency as string) || 'SEK')}
+          {/* A preview with no usable amount used to render "NaN kr": show the
+              gap as a gap instead of a number that isn't one. */}
+          {legacyAmount === null
+            ? '-'
+            : formatCurrency(legacyAmount, (data.currency as string) || 'SEK')}
         </span>
       </div>
       {vatLines.length > 0 && (
@@ -834,19 +854,32 @@ export default function PendingOperationsPage() {
     setSelectedIds(new Set())
   }, [activeTab, sourceFilter, conversationFilter])
 
-  async function handleCommit() {
-    if (!selectedOp) return
+  // Shared by the direct-commit pill (low/medium risk) and the high-risk
+  // confirmation dialog. The Granskning row already states source, title and
+  // risk and offers Detaljer, so for low/medium the pill IS the deliberate
+  // approval; only high risk keeps the dialog, whose warning sentence carries
+  // information the row does not.
+  async function commitOp(op: PendingOperation) {
     setIsCommitting(true)
     try {
-      const res = await fetch(`/api/pending-operations/${selectedOp.id}/commit`, { method: 'POST' })
+      const res = await fetch(`/api/pending-operations/${op.id}/commit`, { method: 'POST' })
       const json = await res.json().catch(() => ({}))
       // getErrorMessage handles both `{ error: string }` and the structured
       // `{ error: { code, message } }` envelope (the latter would otherwise
       // toast "[object Object]") and never surfaces raw English.
       if (!res.ok) throw new Error(getErrorMessage(json, { statusCode: res.status }))
-      toast({ title: 'Godkänd', description: selectedOp.title })
+      toast({ title: 'Godkänd', description: op.title })
       setShowCommitDialog(false)
       setSelectedOp(null)
+      // Drop the committed op from the bulk selection: the row leaves the
+      // pending list on refresh, but a stale id would keep inflating the
+      // bulk bar and ride along into bulk-commit.
+      setSelectedIds((prev) => {
+        if (!prev.has(op.id)) return prev
+        const next = new Set(prev)
+        next.delete(op.id)
+        return next
+      })
       fetchOperations()
     } catch (err) {
       toast({
@@ -856,6 +889,11 @@ export default function PendingOperationsPage() {
       })
     }
     setIsCommitting(false)
+  }
+
+  async function handleCommit() {
+    if (!selectedOp) return
+    await commitOp(selectedOp)
   }
 
   async function handleBulkCommit(ids: string[]) {
@@ -1364,10 +1402,8 @@ export default function PendingOperationsPage() {
                         onCheckedChange={() => toggleSelected(op.id)}
                         aria-label={t('select_operation_aria')}
                         className={cn(
-                          'transition-opacity duration-150',
-                          isSelected
-                            ? 'opacity-100'
-                            : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100',
+                          'duration-150',
+                          isSelected ? 'opacity-100' : HOVER_REVEAL_CLASS,
                         )}
                       />
                     )}
@@ -1403,8 +1439,17 @@ export default function PendingOperationsPage() {
                         onClick={(e) => {
                           e.stopPropagation()
                           if (periodLocked) return
-                          setSelectedOp(op)
-                          setShowCommitDialog(true)
+                          if (op.risk_level === 'high') {
+                            // High risk keeps the confirmation dialog: its
+                            // warning sentence carries real information.
+                            setSelectedOp(op)
+                            setShowCommitDialog(true)
+                          } else {
+                            // Low/medium: the pill on the review row is the
+                            // approval; a second Godkann in a dialog restated
+                            // what the row already shows.
+                            void commitOp(op)
+                          }
                         }}
                       >
                         <Check className="h-3.5 w-3.5" />
@@ -1529,8 +1574,15 @@ export default function PendingOperationsPage() {
                       disabled={detailPeriodLocked || isCommitting}
                       title={detailPeriodLocked ? 'Perioden är låst' : undefined}
                       onClick={() => {
-                        setSelectedOp(detailOp)
-                        setShowCommitDialog(true)
+                        // Same risk gate as the review-row pill: the detail
+                        // panel already shows the full preview, so low/medium
+                        // commit directly; only high risk keeps the dialog.
+                        if (detailOp.risk_level === 'high') {
+                          setSelectedOp(detailOp)
+                          setShowCommitDialog(true)
+                        } else {
+                          void commitOp(detailOp)
+                        }
                       }}
                     >
                       {t('approve')}

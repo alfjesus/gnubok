@@ -8,9 +8,10 @@ import type { StoredAccount } from '@/extensions/general/enable-banking/types'
 import { eventBus } from '@/lib/events/bus'
 import {
   upsertFromPsd2,
-  allocatePsd2LedgerAccount,
+  resolvePsd2LedgerAccount,
   defaultLedgerForCurrency,
 } from '@/lib/cash-accounts/service'
+import { fanOutSessionRenewal } from '@/extensions/general/enable-banking/lib/session-sharing'
 import { renderFinalizeShell, renderFinalizeRedirect } from './finalize-page'
 
 // This route emits bank_connection.consent_granted / .cash_account_mirror_failed
@@ -34,6 +35,12 @@ interface PendingConnection {
   company_id: string
   bank_name: string | null
   status: string
+  /**
+   * The session being replaced, captured before the update overwrites it, so a
+   * renewal can be carried to sibling companies sharing it (see
+   * lib/session-sharing.ts). Null on a first-time connect.
+   */
+  session_id: string | null
 }
 
 // Shown in the settings banner when the session exchange/finalize fails.
@@ -173,7 +180,7 @@ export async function GET(request: Request) {
   // state stays a plain redirect.
   const { data: pendingConnection, error: findError } = await supabase
     .from('bank_connections')
-    .select('id, user_id, company_id, bank_name, status')
+    .select('id, user_id, company_id, bank_name, status, session_id')
     .eq('oauth_state', state)
     .in('status', ['pending', 'expired', 'error'])
     .single()
@@ -339,12 +346,39 @@ async function finalizeConnection(
     throw new Error(`Failed to update connection: ${updateError.message}`)
   }
 
+  // A renewed consent belongs to every company that shared the old session,
+  // not just the one whose button was pressed. Without this the siblings keep
+  // pointing at the session the bank has just replaced and die on their next
+  // sync, which is the original one-session-per-PSU problem wearing a
+  // different hat. Non-fatal: this connection is already renewed and correct.
+  if (pendingConnection.session_id && pendingConnection.session_id !== session_id) {
+    try {
+      await fanOutSessionRenewal(supabase, {
+        oldSessionId: pendingConnection.session_id,
+        newSessionId: session_id,
+        consentExpires: consentExpiresAt ?? null,
+        excludeConnectionId: pendingConnection.id,
+        // Several ASPSPs mint new account uids on re-authorization, so the
+        // siblings need their stored uids re-pointed by IBAN too. Carrying the
+        // session id alone would leave them calling dead uids.
+        sessionAccounts: accountsMetadata,
+      })
+    } catch (renewalError) {
+      console.error('[enable-banking] Failed to carry renewed session to siblings', {
+        connectionId: pendingConnection.id,
+        message: renewalError instanceof Error ? renewalError.message : String(renewalError),
+      })
+    }
+  }
+
   // Mirror each PSD2 account into cash_accounts so routing decisions read
-  // from the canonical entity table. Accounts already mirrored (reconnect)
-  // keep their ledger_account — re-deriving it here would clobber the
-  // user's remaps. New accounts each get a free BAS class-19 slot: a bank
-  // returning N same-currency accounts must not collide on the UNIQUE
-  // (company_id, ledger_account) constraint by all defaulting to 1930.
+  // from the canonical entity table. Accounts already mirrored under the same
+  // (connection, uid) keep their ledger_account — re-deriving it here would
+  // clobber the user's remaps. Everything else goes through
+  // resolvePsd2LedgerAccount, which matches on IBAN before allocating: a
+  // re-authorization that mints new account uids, and a fresh connect that
+  // mints a whole new connection row, both have to land back on the mapping
+  // the user already chose instead of overflowing into the next free slots.
   const { data: mirroredRows } = await supabase
     .from('cash_accounts')
     .select('external_uid, ledger_account')
@@ -360,13 +394,28 @@ async function finalizeConnection(
 
   for (const account of accountsMetadata) {
     let targetLedger = existingLedgerByUid.get(account.uid)
+    let reuseCashAccountId: string | null = null
     if (!targetLedger) {
-      targetLedger =
-        (await allocatePsd2LedgerAccount(supabase, updatedConnection.company_id, updatedConnection.user_id, {
+      const resolved = await resolvePsd2LedgerAccount(
+        supabase,
+        updatedConnection.company_id,
+        updatedConnection.user_id,
+        {
+          iban: account.iban,
           currency: account.currency,
           accountName: account.name,
           exclude: assignedLedgers,
-        })) ?? defaultLedgerForCurrency(account.currency)
+        },
+      )
+      targetLedger = resolved?.ledgerAccount ?? defaultLedgerForCurrency(account.currency)
+      reuseCashAccountId = resolved?.reuseCashAccountId ?? null
+      if (resolved?.source === 'iban') {
+        console.log('[enable-banking] Reused existing ledger mapping for known IBAN', {
+          connectionId: updatedConnection.id,
+          uid: account.uid,
+          ledgerAccount: targetLedger,
+        })
+      }
     }
     assignedLedgers.add(targetLedger)
     if (account.ledger_account !== targetLedger) {
@@ -382,6 +431,7 @@ async function finalizeConnection(
         iban: account.iban ?? null,
         name: account.name ?? null,
         enabled: account.enabled ?? true,
+        reuse_cash_account_id: reuseCashAccountId,
       })
     } catch (cashErr) {
       const reason = cashErr instanceof Error ? cashErr.message : String(cashErr)

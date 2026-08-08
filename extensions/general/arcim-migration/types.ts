@@ -32,7 +32,7 @@ export type { CustomerType as ArcimCustomerType } from '@/lib/providers/dto'
 
 // ── Supported providers ─────────────────────────────────────────────
 
-export type ArcimProvider = 'fortnox' | 'visma' | 'briox' | 'bokio' | 'bjornlunden'
+export type ArcimProvider = 'fortnox' | 'visma' | 'briox' | 'bokio' | 'bjornlunden' | 'wint'
 
 // `sieViaApi`: the provider serves its general ledger as SIE over the API, so
 // the wizard imports bookkeeping automatically: no manual SIE upload needed.
@@ -44,6 +44,10 @@ export const ARCIM_PROVIDERS: { id: ArcimProvider; name: string; authType: 'oaut
   { id: 'bokio', name: 'Bokio', authType: 'token', sieViaApi: false },
   { id: 'bjornlunden', name: 'Björn Lundén', authType: 'token', sieViaApi: true },
   { id: 'briox', name: 'Briox', authType: 'token', sieViaApi: true },
+  // WINT's "token" is the user's WINT login exchanged once for a JWT pair
+  // (WINT has no API keys or OAuth). Gated behind WINT_MIGRATION_ENABLED in
+  // index.ts until verified against a live account.
+  { id: 'wint', name: 'WINT', authType: 'token', sieViaApi: true },
 ]
 
 // ── Migration state ─────────────────────────────────────────────────
@@ -74,10 +78,10 @@ export interface SkipReasons {
  */
 export interface MigrationResults {
   companyInfo?: { imported: boolean }
-  customers?: { total: number; imported: number; skipped: number; skipReasons?: SkipReasons }
-  suppliers?: { total: number; imported: number; skipped: number; skipReasons?: SkipReasons }
-  salesInvoices?: { total: number; imported: number; skipped: number; skipReasons?: SkipReasons; fxUnresolved?: number }
-  supplierInvoices?: { total: number; imported: number; skipped: number; skipReasons?: SkipReasons; fxUnresolved?: number }
+  customers?: { total: number; imported: number; updated?: number; skipped: number; skipReasons?: SkipReasons; errorSample?: string }
+  suppliers?: { total: number; imported: number; skipped: number; skipReasons?: SkipReasons; errorSample?: string }
+  salesInvoices?: { total: number; imported: number; skipped: number; skipReasons?: SkipReasons; fxUnresolved?: number; errorSample?: string }
+  supplierInvoices?: { total: number; imported: number; skipped: number; skipReasons?: SkipReasons; fxUnresolved?: number; errorSample?: string }
   /**
    * Auto-reconciliation of imported supplier invoices to the GL payment
    * vouchers that the separate SIE import already posted. `autoLinked` invoices

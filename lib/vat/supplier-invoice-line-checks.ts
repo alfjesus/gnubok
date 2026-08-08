@@ -2,6 +2,7 @@
 // Kept free of React so the rules can be unit-tested and reused.
 
 import { roundOre } from '@/lib/money'
+import { normalizeVatRateToFraction } from './vat-rate-unit'
 
 // Only 25/12/6/0 % are legal Swedish VAT rates (ML 2023:200). The supplier
 // invoice form stores rates as decimal fractions (0.25 = 25 %); this list is
@@ -17,6 +18,12 @@ export function isLegalVatRate(rate: number): boolean {
   return LEGAL_VAT_RATES.includes(rate)
 }
 
+// normalizeVatRateToFraction lives in the import-free leaf module
+// vat-rate-unit.ts so extension entry graphs can use it without pulling in
+// this file's lib/money dependency; re-exported here so existing callers
+// keep their import path.
+export { normalizeVatRateToFraction }
+
 /**
  * Normalize a VAT rate that may arrive percent-shaped (25, 12, 6: the AI
  * extraction contract and stale staged pending_operations params) to the
@@ -28,11 +35,9 @@ export function isLegalVatRate(rate: number): boolean {
  * to a supplier invoice.
  */
 export function normalizeVatRateToDecimal(rate: unknown): number {
-  const n = Number(rate)
-  if (!Number.isFinite(n)) return 0
   // roundOre is 2-decimal rounding: exactly the snap a decimal fraction of an
   // integer percent needs (25 / 100 must land on the legal-set double).
-  const decimal = roundOre(n > 1 ? n / 100 : n)
+  const decimal = roundOre(normalizeVatRateToFraction(rate))
   return isLegalVatRate(decimal) ? decimal : 0
 }
 
@@ -67,6 +72,46 @@ export function findReverseChargeAccountWarningRows(
     if (account && (account.startsWith('1') || account.startsWith('6'))) {
       rows.push(index)
     }
+  })
+  return rows
+}
+
+/** Supplier types whose invoices normally carry no Swedish VAT because the
+ *  buyer self-assesses it (omvand skattskyldighet, ML 6 kap). */
+const FOREIGN_SUPPLIER_TYPES: readonly string[] = ['eu_business', 'non_eu_business']
+
+/**
+ * Indices of 0 %-VAT lines on a FOREIGN supplier invoice where omvand
+ * skattskyldighet is switched off (issue #1042).
+ *
+ * A foreign supplier charging no Swedish VAT is normally a reverse charge
+ * purchase: the buyer books both the utgaende and the ingaende moms itself.
+ * With the switch off, createSupplierInvoiceRegistrationEntry emits neither
+ * the 26x4 output leg nor the 44xx/45xx basis lines, so ruta 20-24, 30-32 and
+ * 48 all stay empty and the momsdeklaration takes the shape Skatteverket
+ * rejects (a ruta 30 amount with no matching ruta 20 basis). The net moms att
+ * betala is usually unchanged for a fully deductible purchase, which is
+ * exactly why this goes unnoticed.
+ *
+ * Advisory only, never blocking, and deliberately silent for
+ * swedish_business: a Swedish 0 % invoice (bankavgift, forsakring, hyra) is a
+ * genuine exemption that belongs in no box at all, and nagging about it would
+ * be pure noise. It is also silent when reverse charge is already on, and for
+ * a foreign supplier that legitimately invoiced 0 % without reverse charge
+ * (a non-EU goods purchase cleared at customs, or an EU seller charging its
+ * own local VAT), which is why the copy asks rather than asserts: pushing
+ * such a user into ticking the switch would manufacture a new wrong verifikat.
+ */
+export function findUnflaggedForeignZeroVatRows(
+  items: ReadonlyArray<{ vat_rate: number }>,
+  reverseCharge: boolean,
+  supplierType: string | undefined | null,
+): number[] {
+  if (reverseCharge) return []
+  if (!supplierType || !FOREIGN_SUPPLIER_TYPES.includes(supplierType)) return []
+  const rows: number[] = []
+  items.forEach((item, index) => {
+    if (item.vat_rate === 0) rows.push(index)
   })
   return rows
 }

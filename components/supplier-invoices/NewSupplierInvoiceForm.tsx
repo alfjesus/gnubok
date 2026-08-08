@@ -20,6 +20,7 @@ import { ConfirmationDialog } from '@/components/ui/confirmation-dialog'
 import { SupplierInvoiceReviewContent } from '@/components/suppliers/SupplierInvoiceReviewContent'
 import AccountCombobox from '@/components/bookkeeping/AccountCombobox'
 import { getAccountDescription } from '@/lib/bookkeeping/account-descriptions'
+import { formatCounterpartyName } from '@/lib/bookkeeping/counterparty-templates'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
 import { cn, formatCurrency } from '@/lib/utils'
 import { getDisplayTotal } from '@/lib/invoices/rounding'
@@ -35,6 +36,7 @@ import {
   LEGAL_VAT_RATES,
   findIllegalVatRateRow,
   findReverseChargeAccountWarningRows,
+  findUnflaggedForeignZeroVatRows,
 } from '@/lib/vat/supplier-invoice-line-checks'
 import { ArrowLeft, Plus, Trash2, ChevronDown, Loader2, Lock, AlertCircle, AlertTriangle, MessageCircle, Link2, CalendarClock, Tags, Paperclip } from 'lucide-react'
 import type { Supplier, BASAccount, VatTreatment, EntityType, InvoiceExtractionResult, FiscalPeriod } from '@/types'
@@ -456,6 +458,18 @@ export default function NewSupplierInvoiceForm({
     ? findReverseChargeAccountWarningRows(watchedItems ?? [])
     : []
 
+  // Advisory nudge (#1042): a foreign supplier charging no Swedish VAT is
+  // normally omvand skattskyldighet. With the switch off no 26x4 leg and no
+  // 44xx/45xx basis is booked, so ruta 20-24, 30-32 and 48 stay empty. Silent
+  // for Swedish suppliers, where 0 % is a genuine exemption. Never blocks:
+  // a non-EU goods purchase cleared at customs is legitimately 0 % without
+  // reverse charge, and forcing the switch there would book a wrong verifikat.
+  const foreignZeroVatRows = findUnflaggedForeignZeroVatRows(
+    watchedItems ?? [],
+    watchedReverseCharge,
+    suppliers.find((s) => s.id === watchedSupplierId)?.supplier_type,
+  )
+
   useEffect(() => {
     fetchSuppliers()
     fetchAccounts()
@@ -597,10 +611,67 @@ export default function NewSupplierInvoiceForm({
 
   // Auto-fill due date and defaults when supplier is selected: but never
   // overwrite a value the AI already filled in for us.
+  const [templateAccountNote, setTemplateAccountNote] = useState<{ account: string; counterparty: string } | null>(null)
+  // Rows planted by the counterparty-history prefill, so a supplier SWITCH can
+  // un-plant them: without this, supplier A's history account survives into
+  // supplier B's invoice and silently blocks B's own default_expense_account
+  // (the fill branches only touch empty rows).
+  const plantedRef = useRef<{ account: string; rows: number[] } | null>(null)
+  // Automatic fill is requested, not applied inline: handleAccountChange
+  // needs the loaded BAS chart to apply the konto's default moms, and the
+  // requests originate in closures (the supplier effect and its async
+  // template fetch) that may hold a stale empty `accounts`. The applying
+  // effect below re-runs on both the request tick and the chart load with
+  // fresh closures, so whichever arrives last triggers the fill. Filling
+  // early would leave a VAT-free konto on the 25% row default, the exact
+  // mis-booking the fill exists to prevent.
+  const pendingAccountFillRef = useRef<{ account: string; plant: boolean; counterparty?: string } | null>(null)
+  const [accountFillTick, setAccountFillTick] = useState(0)
+
+  function requestAccountFill(account: string, plant: boolean, counterparty?: string) {
+    pendingAccountFillRef.current = { account, plant, counterparty }
+    setAccountFillTick((t) => t + 1)
+  }
+
+  useEffect(() => {
+    if (accounts.length === 0 || !pendingAccountFillRef.current) return
+    const { account, plant, counterparty } = pendingAccountFillRef.current
+    pendingAccountFillRef.current = null
+    const items = getValues('items')
+    const appliedRows: number[] = []
+    items.forEach((row, i) => {
+      if (!row.account_number) {
+        // Same path as a manual pick: konto default moms rides along.
+        handleAccountChange(i, account)
+        appliedRows.push(i)
+      }
+    })
+    if (appliedRows.length > 0 && plant && counterparty) {
+      plantedRef.current = { account, rows: appliedRows }
+      setTemplateAccountNote({ account, counterparty })
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accounts, accountFillTick])
+
   useEffect(() => {
     if (!watchedSupplierId) return
     const supplier = suppliers.find((s) => s.id === watchedSupplierId)
     if (!supplier) return
+    setTemplateAccountNote(null)
+    pendingAccountFillRef.current = null
+    if (plantedRef.current) {
+      const { account, rows } = plantedRef.current
+      const planted = getValues('items')
+      rows.forEach((i) => {
+        if (planted[i]?.account_number === account) {
+          // Clear only the account; the rate is left for the next fill or
+          // manual pick to settle (handleAccountChange reapplies konto
+          // defaults), so an AI-extracted rate is never clobbered here.
+          setValue(`items.${i}.account_number`, '')
+        }
+      })
+      plantedRef.current = null
+    }
 
     const invoiceDate = watch('invoice_date')
     const currentDue = watch('due_date')
@@ -612,12 +683,9 @@ export default function NewSupplierInvoiceForm({
     if (supplier.default_expense_account && fields.length > 0) {
       // Fill every row the user hasn't assigned yet: an empty account is the
       // only signal needed (rows start empty by design, no seeded default).
-      const items = getValues('items')
-      items.forEach((row, i) => {
-        if (!row.account_number) {
-          setValue(`items.${i}.account_number`, supplier.default_expense_account!)
-        }
-      })
+      // Routed through the fill request so it waits for the BAS chart and the
+      // konto's default moms comes along exactly like a manual pick.
+      requestAccountFill(supplier.default_expense_account, false)
     }
     if (supplier.default_currency && watch('currency') === 'SEK') {
       setValue('currency', supplier.default_currency)
@@ -625,6 +693,36 @@ export default function NewSupplierInvoiceForm({
     if (supplier.supplier_type === 'eu_business') {
       setValue('reverse_charge', true)
     }
+
+    // No supplier default: fall back to the company's own booking history for
+    // this counterparty (the same tiered matcher the booking flows use). Fills
+    // empty rows only, never a generic seed, and only from expense-shaped
+    // templates (P&L cost on debit, settlement on credit; the 4-8 gate keeps
+    // private/balance-sheet templates like 2013 or 1630 out). Best-effort: on
+    // any miss the rows simply stay blank, exactly as before.
+    if (!supplier.default_expense_account && fields.length > 0 && supplier.name?.trim()) {
+      let cancelled = false
+      ;(async () => {
+        try {
+          const res = await fetch(
+            `/api/settings/counterparty-templates?counterparty=${encodeURIComponent(supplier.name.trim())}`
+          )
+          if (!res.ok) return
+          const json = await res.json()
+          if (cancelled) return
+          const match = json?.data
+          const debit: string | undefined = match?.template?.debit_account
+          const credit: string | undefined = match?.template?.credit_account
+          if (!match || (match.confidence ?? 0) < 0.5) return
+          if (!debit || !/^[4-8]/.test(debit) || !credit || !credit.startsWith('19')) return
+          requestAccountFill(debit, true, match.template.counterparty_name)
+        } catch {
+          // Prefill is best-effort; the rows stay blank.
+        }
+      })()
+      return () => { cancelled = true }
+    }
+    return undefined
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [watchedSupplierId, suppliers])
 
@@ -1539,7 +1637,7 @@ export default function NewSupplierInvoiceForm({
         {/* Section 1: Faktura */}
         <Card>
           <CardHeader>
-            <CardTitle className="text-lg">{t('section_invoice')}</CardTitle>
+            <CardTitle className="text-base">{t('section_invoice')}</CardTitle>
           </CardHeader>
           <CardContent className="space-y-4">
             {/* Eget utlägg-toggle. När den är på bokas verifikatet direkt mot
@@ -1705,7 +1803,7 @@ export default function NewSupplierInvoiceForm({
         {/* Section 2: Kontering */}
         <Card>
           <CardHeader className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <CardTitle className="text-lg">{t('section_accounting')}</CardTitle>
+            <CardTitle className="text-base">{t('section_accounting')}</CardTitle>
             <Button
               type="button"
               variant="outline"
@@ -1720,6 +1818,16 @@ export default function NewSupplierInvoiceForm({
             </Button>
           </CardHeader>
           <CardContent>
+            {templateAccountNote &&
+              (watchedItems ?? []).some((r) => r.account_number === templateAccountNote.account) && (
+                <p className="mb-4 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                  <span aria-hidden className="inline-block h-1.5 w-1.5 rounded-full bg-success" />
+                  {t('account_from_history', {
+                    account: templateAccountNote.account,
+                    counterparty: formatCounterpartyName(templateAccountNote.counterparty),
+                  })}
+                </p>
+              )}
             {/* Valuta & moms: kept inline with the line items because they
                 drive how each row is interpreted. Hidden defaults (SEK +
                 normal moms) collapse to nothing so most users don't see this. */}
@@ -1800,6 +1908,24 @@ export default function NewSupplierInvoiceForm({
                   {t('rc_account_warning', {
                     count: rcAccountWarningRows.length,
                     rows: rcAccountWarningRows.map((i) => i + 1).join(', '),
+                  })}
+                </p>
+              </div>
+            )}
+
+            {/* Non-blocking omvand-skattskyldighet hint for foreign suppliers
+                invoiced at 0 % VAT (#1042). Mutually exclusive with the banner
+                above: that one needs the switch on, this one needs it off. */}
+            {foreignZeroVatRows.length > 0 && (
+              <div
+                role="status"
+                className="mb-4 flex items-start gap-2 rounded-lg border border-warning/30 bg-warning/10 p-3"
+              >
+                <AlertTriangle className="h-4 w-4 text-warning-foreground mt-0.5 shrink-0" />
+                <p className="text-sm text-warning-foreground">
+                  {t('foreign_zero_vat_warning', {
+                    count: foreignZeroVatRows.length,
+                    rows: foreignZeroVatRows.map((i) => i + 1).join(', '),
                   })}
                 </p>
               </div>
@@ -2156,7 +2282,7 @@ export default function NewSupplierInvoiceForm({
             onClick={() => setAdvancedOpen(!advancedOpen)}
           >
             <div className="flex items-center justify-between">
-              <CardTitle className="text-lg">{t('section_other')}</CardTitle>
+              <CardTitle className="text-base">{t('section_other')}</CardTitle>
               <ChevronDown className={`h-4 w-4 text-muted-foreground transition-transform ${advancedOpen ? 'rotate-180' : ''}`} />
             </div>
           </CardHeader>

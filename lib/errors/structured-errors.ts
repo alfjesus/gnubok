@@ -153,6 +153,21 @@ const BOOKKEEPING: Record<string, StructuredErrorEntry> = {
       resource: 'Accounted://chart-of-accounts',
     },
   },
+  // Distinct from a plain duplicate: the account number is taken by a row the
+  // company deactivated. Creating it again can never succeed (the unique
+  // constraint counts inactive rows), so the only way forward is reactivation.
+  // Callers key on this code to offer that instead of a dead-end 409.
+  ACCOUNT_EXISTS_INACTIVE: {
+    httpStatus: 409,
+    message_sv: 'Kontot finns redan i din kontoplan men är inaktiverat.',
+    message_en:
+      'The account number already exists in this company chart of accounts but is deactivated.',
+    remediation: {
+      description:
+        'Reactivate the existing account instead of creating it: POST /api/bookkeeping/accounts/activate with { account_numbers: [number] }.',
+      resource: 'Accounted://chart-of-accounts',
+    },
+  },
   JOURNAL_ENTRY_NOT_BALANCED: {
     httpStatus: 400,
     message_sv: 'Verifikationen balanserar inte.',
@@ -654,6 +669,20 @@ const MATCH_SI: Record<string, StructuredErrorEntry> = {
     message_en:
       'The cash method cannot handle a partial foreign-currency payment. Pay the invoice in full, switch to accrual, or book the payment manually.',
   },
+  INVOICE_PAID_CASH_PARTIAL_UNSUPPORTED: {
+    httpStatus: 400,
+    message_sv:
+      'Kontantmetoden kan inte bokföra delbetalningar av en obokförd faktura automatiskt: hela fakturan bokförs vid betalning. Ta emot hela beloppet i en betalning, byt till faktureringsmetoden eller bokför betalningen manuellt som verifikation.',
+    message_en:
+      'The cash method cannot auto-book partial payments of an unbooked invoice: the generated entry always books the full invoice. Receive the full amount in one payment, switch to the accrual method, or book the payment manually as a journal entry.',
+  },
+  SI_CASH_PARTIAL_UNSUPPORTED: {
+    httpStatus: 400,
+    message_sv:
+      'Kontantmetoden kan inte bokföra delbetalningar av en obokförd leverantörsfaktura automatiskt: hela fakturan bokförs vid betalning. Betala hela beloppet i en betalning eller bokför betalningen manuellt som verifikation.',
+    message_en:
+      'The cash method cannot auto-book partial payments of an unbooked supplier invoice: the generated entry always books the full invoice. Pay the full amount in one payment or book the payment manually as a journal entry.',
+  },
   MATCH_SI_AMOUNT_EXCEEDS_REMAINING: {
     httpStatus: 400,
     message_sv:
@@ -1110,6 +1139,13 @@ const INVOICE: Record<string, StructuredErrorEntry> = {
     message_sv: 'Fakturanumret tilldelades men fakturan kunde inte läsas tillbaka. Ladda om sidan och kontrollera fakturan.',
     message_en: 'The invoice number was assigned but the invoice could not be re-read. Reload the page and verify the invoice.',
   },
+  INVOICE_RECURRING_UPDATE_PARTIAL: {
+    httpStatus: 500,
+    message_sv:
+      'Ändringen av det återkommande schemat kunde inte slutföras och schemat kan ha hamnat i ett halvsparat läge. Öppna schemat och kontrollera både fält och rader innan du sparar igen.',
+    message_en:
+      'The recurring schedule update failed and the compensating rollback did not fully apply: the schedule may be left in a partial state (header fields and items out of sync). Inspect the schedule fields and items before retrying.',
+  },
   // Quotes / Offerter
   QUOTE_NOT_FOUND: {
     httpStatus: 404,
@@ -1167,6 +1203,22 @@ const SUPPLIER_INVOICE: Record<string, StructuredErrorEntry> = {
       'Bara obetalda leverantörsfakturor kan redigeras. Betalda, krediterade och återförda fakturor rättas genom kreditfaktura eller storno.',
     message_en:
       'Only unsettled supplier invoices can be edited. Paid, credited and reversed invoices are corrected with a credit note or a storno.',
+  },
+  SI_EDIT_VERIFIKAT_LOCKED: {
+    httpStatus: 400,
+    message_sv:
+      'Fakturadatum och fakturanummer står på det bokförda verifikatet och kan inte ändras här. ' +
+      'Rätta verifikatet (rättelse i öppen period, annars storno + ny bokföring) eller kreditera fakturan. ' +
+      'Förfallodatum, betalningsreferens och anteckningar går fortfarande att ändra.',
+    message_en:
+      'Invoice date and invoice number are part of the posted verifikat and cannot be changed here. ' +
+      'Correct the entry instead (inline rättelse in an open period, otherwise storno + re-book), or credit the invoice. ' +
+      'due_date, payment_reference and notes remain editable.',
+    remediation: {
+      description:
+        'Correct the registration verifikat through a sanctioned rättelse path, or credit the supplier invoice and register a corrected one.',
+      tool: 'gnubok_correct_entry',
+    },
   },
   SI_APPROVE_UPDATE_FAILED: {
     httpStatus: 500,
@@ -1775,6 +1827,17 @@ const PROVIDER_MIGRATION: Record<string, StructuredErrorEntry> = {
     message_en:
       'The provider rejected the credentials. Check that the account ID and application token are correct and try again.',
   },
+  PROVIDER_COMPANY_MISMATCH: {
+    // 422, same reasoning as PROVIDER_TOKEN_INVALID: the credentials are valid,
+    // but they open a DIFFERENT legal entity than the one being imported into.
+    // Importing anyway mixes another company's ledger into this one, which is
+    // both a bookkeeping and a data-protection problem: refuse at the boundary.
+    httpStatus: 422,
+    message_sv:
+      'Uppgifterna gäller ett annat företag än det du importerar till. Kontrollera att du valt rätt företag hos leverantören och försök igen.',
+    message_en:
+      'These credentials belong to a different company than the one you are importing into. Check that you picked the right company at the provider and try again.',
+  },
   PROVIDER_PREVIEW_FAILED: {
     httpStatus: 500,
     message_sv: 'Förhandsgranskningen från leverantören misslyckades.',
@@ -1926,6 +1989,22 @@ const CUSTOMER: Record<string, StructuredErrorEntry> = {
     httpStatus: 409,
     message_sv: 'Kunden har fakturor och kan inte tas bort.',
     message_en: 'Customer cannot be deleted while invoices reference it.',
+  },
+  CUSTOMER_NO_PERSONAL_NUMBER: {
+    httpStatus: 404,
+    message_sv: 'Kunden har inget sparat personnummer.',
+    message_en: 'No personal number is stored for this customer.',
+  },
+  // The stored ciphertext could not be decrypted (written under a different
+  // PERSONNUMMER_ENCRYPTION_KEY, or corrupted). Deliberately not an
+  // INTERNAL_ERROR: it is not transient, retrying never helps, and the user
+  // can fix it in one step by typing the personnummer in again.
+  CUSTOMER_PERSONAL_NUMBER_UNREADABLE: {
+    httpStatus: 422,
+    message_sv:
+      'Det sparade personnumret kan inte läsas. Skriv in det igen för att ersätta det.',
+    message_en:
+      'The stored personal number cannot be read. Enter it again to replace it.',
   },
 }
 
@@ -3050,12 +3129,64 @@ const BOLAGSVERKET: Record<string, StructuredErrorEntry> = {
 }
 
 const ASSETS: Record<string, StructuredErrorEntry> = {
+  ASSET_NOT_FOUND: {
+    httpStatus: 404,
+    message_sv: 'Tillgången kunde inte hittas.',
+    message_en: 'Asset not found.',
+  },
+  ASSET_ALREADY_DISPOSED: {
+    httpStatus: 409,
+    message_sv: 'Tillgången är redan avyttrad.',
+    message_en: 'The asset has already been disposed.',
+  },
+  ASSET_DISPOSAL_BLOCKED: {
+    httpStatus: 409,
+    message_sv:
+      'Avyttringen kan inte bokföras eftersom avskrivningar redan finns för samma eller en senare period. Återför den felaktiga avskrivningen med storno först.',
+    message_en:
+      'The disposal cannot be posted because depreciation already exists for the same or a later period. Reverse the incorrect depreciation first.',
+  },
+  ASSET_JAMKNING_DATA_REQUIRED: {
+    httpStatus: 422,
+    message_sv:
+      'Ange ursprunglig ingående moms och ursprunglig avdragsprocent för att bedöma justering enligt ML 15 kap.',
+    message_en:
+      'Enter the original input VAT and original deduction percentage to assess adjustment under ML chapter 15.',
+  },
+  ASSET_ADJUSTMENT_DOCUMENT_REQUIRED: {
+    httpStatus: 422,
+    message_sv:
+      'Bekräfta att en justeringshandling upprättas när justeringsskyldigheten överförs.',
+    message_en:
+      'Confirm that an adjustment document is prepared when the adjustment obligation is transferred.',
+  },
+  ASSET_BUSINESS_TRANSFER_CONFIRMATION_REQUIRED: {
+    httpStatus: 422,
+    message_sv:
+      'Bekräfta att överlåtelsen omfattar en hel verksamhet eller självständig verksamhetsgren och uppfyller villkoren i ML 5 kap. 38 §.',
+    message_en:
+      'Confirm that the transfer covers an entire business or independent branch and meets the conditions in ML chapter 5, section 38.',
+  },
   ASSET_CORRECTION_BLOCKED: {
     httpStatus: 409,
     message_sv:
       'Anskaffningsdatum, anskaffningsvärde och kategori kan inte ändras efter att tillgången avyttrats eller avskrivningar bokförts. Återför (storno) först, eller använd avyttringsflödet.',
     message_en:
       'Acquisition date, cost and category cannot be changed once the asset has been disposed or depreciation has been posted. Reverse (storno) first, or use the disposal flow.',
+  },
+  // Generic on purpose: the flag covers accounts excluded from K2 for several
+  // different reasons (egenupparbetade immateriella, uppskjuten skatt,
+  // verkligt värde, säkringsredovisning, ...), so the static entry states only
+  // what the BAS chart says. The asset routes override it with an
+  // account-specific message from lib/bokslut/assets/k2-account-guard.ts,
+  // which cites BFNAR 2016:10 punkt 10.4 only when the intangible group is
+  // what actually triggered the gate.
+  K2_EXCLUDED_ACCOUNT: {
+    httpStatus: 422,
+    message_sv:
+      'Kontot är markerat Ej K2 i BAS-kontoplanen och förutsätter K3. Välj ett konto som är tillåtet enligt K2.',
+    message_en:
+      'The account is marked Ej K2 in the BAS chart of accounts and presumes the K3 framework. Pick an account that K2 permits.',
   },
 }
 

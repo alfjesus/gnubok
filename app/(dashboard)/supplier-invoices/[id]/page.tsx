@@ -122,16 +122,35 @@ export default function SupplierInvoiceDetailPage() {
 
   async function fetchInvoice() {
     setIsLoading(true)
-    const res = await fetch(`/api/supplier-invoices/${params.id}`)
-    const { data, error } = await res.json()
-    if (error) {
-      toast({ title: t('load_failed_title'), description: error, variant: 'destructive' })
-    } else {
-      setInvoice(data)
-      setPayAmount(String(data.remaining_amount))
-      setPaymentDate(new Date().toISOString().split('T')[0])
+    // try/finally: a dropped connection or a non-JSON error page makes
+    // res.json() throw, and this runs from an effect, so the rejection is
+    // unhandled and isLoading would stay true: a spinner that never resolves.
+    try {
+      const res = await fetch(`/api/supplier-invoices/${params.id}`)
+      const body = await res.json().catch(() => null)
+      // See the identical fix in suppliers/[id]: `body.error` is the canonical
+      // envelope object, and rendering an object as a toast description throws
+      // out of the root layout into global-error.
+      if (!res.ok || body?.error || !body?.data) {
+        toast({
+          title: t('load_failed_title'),
+          description: getErrorMessage(body, { statusCode: res.status, context: 'supplier_invoice' }),
+          variant: 'destructive',
+        })
+      } else {
+        setInvoice(body.data)
+        setPayAmount(String(body.data.remaining_amount))
+        setPaymentDate(new Date().toISOString().split('T')[0])
+      }
+    } catch (err) {
+      toast({
+        title: t('load_failed_title'),
+        description: getErrorMessage(err, { context: 'supplier_invoice' }),
+        variant: 'destructive',
+      })
+    } finally {
+      setIsLoading(false)
     }
-    setIsLoading(false)
   }
 
   useEffect(() => {
@@ -588,7 +607,7 @@ export default function SupplierInvoiceDetailPage() {
       <div className="grid gap-4 md:grid-cols-2">
         <Card>
           <CardHeader>
-            <CardTitle className="text-lg">{t('invoice_info_title')}</CardTitle>
+            <CardTitle className="text-base">{t('invoice_info_title')}</CardTitle>
           </CardHeader>
           <CardContent className="space-y-2 text-sm">
             <div className="flex justify-between">
@@ -629,7 +648,7 @@ export default function SupplierInvoiceDetailPage() {
 
         <Card>
           <CardHeader>
-            <CardTitle className="text-lg">{t('amounts_title')}</CardTitle>
+            <CardTitle className="text-base">{t('amounts_title')}</CardTitle>
           </CardHeader>
           <CardContent className="space-y-2 text-sm">
             <div className="flex justify-between">
@@ -666,7 +685,7 @@ export default function SupplierInvoiceDetailPage() {
       {invoice.supplier && (
         <Card>
           <CardHeader>
-            <CardTitle className="text-lg">{t('supplier_section_title')}</CardTitle>
+            <CardTitle className="text-base">{t('supplier_section_title')}</CardTitle>
           </CardHeader>
           <CardContent className="text-sm">
             <Link href={`/suppliers/${invoice.supplier.id}`} className="text-primary hover:underline font-medium">
@@ -683,7 +702,7 @@ export default function SupplierInvoiceDetailPage() {
       {/* Line items */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-lg">{t('rows_title')}</CardTitle>
+          <CardTitle className="text-base">{t('rows_title')}</CardTitle>
         </CardHeader>
         <CardContent>
           {/* Desktop table */}
@@ -766,7 +785,7 @@ export default function SupplierInvoiceDetailPage() {
       {payments.length > 0 && (
         <Card>
           <CardHeader>
-            <CardTitle className="text-lg">{t('payment_history_title')}</CardTitle>
+            <CardTitle className="text-base">{t('payment_history_title')}</CardTitle>
           </CardHeader>
           <CardContent>
             {/* Desktop table */}
@@ -824,7 +843,7 @@ export default function SupplierInvoiceDetailPage() {
       {invoice.document_id && (
         <Card>
           <CardHeader>
-            <CardTitle className="text-lg">{t('document_title')}</CardTitle>
+            <CardTitle className="text-base">{t('document_title')}</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -844,7 +863,7 @@ export default function SupplierInvoiceDetailPage() {
       {/* Journal entries (sambandskrav) */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-lg">{t('vouchers_title')}</CardTitle>
+          <CardTitle className="text-base">{t('vouchers_title')}</CardTitle>
         </CardHeader>
         <CardContent className="space-y-2 text-sm">
           {invoice.registration_journal_entry_id ? (
@@ -895,7 +914,7 @@ export default function SupplierInvoiceDetailPage() {
       {invoice.notes && (
         <Card>
           <CardHeader>
-            <CardTitle className="text-lg">{t('notes_title')}</CardTitle>
+            <CardTitle className="text-base">{t('notes_title')}</CardTitle>
           </CardHeader>
           <CardContent>
             <p className="text-sm text-muted-foreground">{invoice.notes}</p>

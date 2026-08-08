@@ -256,14 +256,28 @@ export default function RecurringInvoicesPage() {
                         {t('send_time', {
                           time: `${String(s.send_hour ?? 8).padStart(2, '0')}:00`,
                         })}
+                        {/* Monthly is the norm; only a deviating cadence is
+                            worth a label (chips-mark-exceptions convention). */}
+                        {(s.interval_months ?? 1) > 1 && (
+                          <>
+                            {' · '}
+                            {s.interval_months === 3
+                              ? t('interval_quarterly')
+                              : s.interval_months === 6
+                                ? t('interval_semiannual')
+                                : s.interval_months === 12
+                                  ? t('interval_yearly')
+                                  : t('interval_every_n', { n: s.interval_months })}
+                          </>
+                        )}
                       </span>
                     </TableCell>
                     <TableCell className="tabular-nums">{formatDate(s.next_run_date)}</TableCell>
                     <TableCell>
                       {s.status === 'active' ? (
-                        <Badge variant="success">{t('status_active')}</Badge>
+                        <span className="text-xs text-muted-foreground">{t('status_active')}</span>
                       ) : (
-                        <Badge variant="secondary">{t('status_paused')}</Badge>
+                        <Badge variant="outline" className="font-normal">{t('status_paused')}</Badge>
                       )}
                     </TableCell>
                     <TableCell className="tabular-nums text-right">

@@ -12,8 +12,12 @@ import {
   countVerifikatMissingDocument,
   listSuggestedMatches,
 } from '../categories'
+import {
+  MATCHABLE_INVOICE_STATUSES,
+  MATCHABLE_SUPPLIER_INVOICE_STATUSES,
+} from '@/lib/invoices/matchable-statuses'
 
-const { supabase: mockSupabase, enqueue, reset } = createQueuedMockSupabase()
+const { supabase: mockSupabase, enqueue, reset, findCall, findCalls } = createQueuedMockSupabase()
 const supabase = mockSupabase as unknown as SupabaseClient
 const COMPANY = 'company-1'
 
@@ -105,7 +109,6 @@ describe('countVerifikatMissingDocument', () => {
 
 describe('simple head counts', () => {
   it.each([
-    ['countSuggestedMatches', countSuggestedMatches, 'transactions'],
     ['countSupplierInvoicesAwaitingApproval', countSupplierInvoicesAwaitingApproval, 'supplier_invoices'],
     ['countOverdueInvoices', countOverdueInvoices, 'invoices'],
     ['countDeadlinesNeedingAction', countDeadlinesNeedingAction, 'deadlines'],
@@ -114,6 +117,76 @@ describe('simple head counts', () => {
     enqueue({ count: 3 })
     await expect(fn(supabase, COMPANY)).resolves.toBe(3)
     expect(mockSupabase.from).toHaveBeenCalledWith(table)
+  })
+})
+
+// Issue #1259: the badge delegates to listSuggestedMatches so it can never
+// claim a number the list refuses to render. A raw head count over the hint
+// columns counted pointers at invoices settled by a different transaction.
+describe('countSuggestedMatches', () => {
+  it('counts only hints whose candidate is still matchable', async () => {
+    enqueue({
+      data: [
+        {
+          id: 'tx-1',
+          date: '2026-06-01',
+          description: 'ICA',
+          amount: 423,
+          currency: 'SEK',
+          potential_invoice_id: 'inv-1',
+          potential_supplier_invoice_id: null,
+        },
+        {
+          id: 'tx-2',
+          date: '2026-05-30',
+          description: 'TELIA',
+          amount: -549,
+          currency: 'SEK',
+          potential_invoice_id: null,
+          potential_supplier_invoice_id: 'sinv-paid',
+        },
+      ],
+    })
+    // inv-1 is still open; sinv-paid was settled by another transaction, so the
+    // status/remaining filters exclude it server-side.
+    enqueue({
+      data: [
+        { id: 'inv-1', invoice_number: 'F-1', total: 423, customer: { name: 'Kund AB' } },
+      ],
+    })
+    enqueue({ data: [] })
+
+    await expect(countSuggestedMatches(supabase, COMPANY)).resolves.toBe(1)
+    expect(mockSupabase.from).toHaveBeenCalledWith('transactions')
+  })
+
+  it('returns 0 when the only hint points at an invoice settled elsewhere', async () => {
+    enqueue({
+      data: [
+        {
+          id: 'tx-1',
+          date: '2026-06-01',
+          description: 'MONTHLY FEE',
+          amount: -549,
+          currency: 'SEK',
+          potential_invoice_id: null,
+          potential_supplier_invoice_id: 'sinv-paid',
+        },
+      ],
+    })
+    enqueue({ data: [] })
+    await expect(countSuggestedMatches(supabase, COMPANY)).resolves.toBe(0)
+  })
+
+  it('soft-fails to 0 on query error', async () => {
+    enqueue({ error: { message: 'boom' } })
+    await expect(countSuggestedMatches(supabase, COMPANY)).resolves.toBe(0)
+  })
+
+  it('clamps the scan so the badge cannot walk an unbounded hint set', async () => {
+    enqueue({ data: [] })
+    await countSuggestedMatches(supabase, COMPANY)
+    expect(findCall('transactions', 'limit')).toEqual([200])
   })
 })
 
@@ -207,5 +280,136 @@ describe('listSuggestedMatches', () => {
   it('returns [] on transaction query error', async () => {
     enqueue({ error: { message: 'boom' } })
     await expect(listSuggestedMatches(supabase, COMPANY)).resolves.toEqual([])
+  })
+
+  // Regression: the hint columns are written once and never revisited, so an
+  // invoice paid off by a DIFFERENT transaction leaves a stale pointer. The
+  // candidate lookup must revalidate instead of trusting it, or the worklist
+  // renders a one-click confirm row whose endpoint can only answer
+  // ALREADY_PAID.
+  it('revalidates hinted candidates against the matchable statuses', async () => {
+    enqueue({
+      data: [
+        {
+          id: 'tx-1',
+          date: '2026-06-01',
+          description: 'X',
+          amount: 100,
+          currency: 'SEK',
+          potential_invoice_id: 'inv-1',
+          potential_supplier_invoice_id: null,
+        },
+        {
+          id: 'tx-2',
+          date: '2026-06-02',
+          description: 'Y',
+          amount: -100,
+          currency: 'SEK',
+          potential_invoice_id: null,
+          potential_supplier_invoice_id: 'sinv-1',
+        },
+      ],
+    })
+    enqueue({ data: [] })
+    enqueue({ data: [] })
+
+    await listSuggestedMatches(supabase, COMPANY)
+
+    // Both revalidation conditions, not just the id filter: findCall returns
+    // only the FIRST .in() per table, which is the id one, so the status
+    // filter needs findCalls to be covered at all.
+    expect(findCalls('invoices', 'in')).toEqual([
+      ['id', ['inv-1']],
+      ['status', [...MATCHABLE_INVOICE_STATUSES]],
+    ])
+    expect(findCall('invoices', 'gt')).toEqual(['remaining_amount', 0])
+    expect(findCalls('supplier_invoices', 'in')).toEqual([
+      ['id', ['sinv-1']],
+      ['status', [...MATCHABLE_SUPPLIER_INVOICE_STATUSES]],
+    ])
+    expect(findCall('supplier_invoices', 'gt')).toEqual(['remaining_amount', 0])
+  })
+
+  it('drops a hint whose invoice has since been settled elsewhere', async () => {
+    enqueue({
+      data: [
+        {
+          id: 'tx-1',
+          date: '2026-06-01',
+          description: 'MONTHLY FEE',
+          amount: -549,
+          currency: 'SEK',
+          potential_invoice_id: null,
+          potential_supplier_invoice_id: 'sinv-paid',
+        },
+      ],
+    })
+    enqueue({ data: [] })
+    // The status/remaining filters exclude the settled invoice server-side, so
+    // the lookup comes back empty and the row must not be offered.
+    enqueue({ data: [] })
+
+    await expect(listSuggestedMatches(supabase, COMPANY)).resolves.toEqual([])
+  })
+
+  // The badge scans up to 200 hints (SUGGESTED_MATCH_SCAN_CAP), past the 150
+  // ids per .in() that countInboxDocuments already chunks for: PostgREST puts
+  // them in the GET query string, and a 414 would come back as a silent 0.
+  it('chunks the candidate id list at 150 ids per lookup', async () => {
+    const txRows = Array.from({ length: 151 }, (_, i) => ({
+      id: `tx-${i}`,
+      date: '2026-06-01',
+      description: 'X',
+      amount: 100,
+      currency: 'SEK',
+      potential_invoice_id: `inv-${i}`,
+      potential_supplier_invoice_id: null,
+    }))
+    enqueue({ data: txRows })
+    enqueue({ data: [] }) // chunk 1
+    enqueue({ data: [] }) // chunk 2
+
+    await listSuggestedMatches(supabase, COMPANY, 200)
+
+    const idFilters = findCalls('invoices', 'in').filter(([col]) => col === 'id')
+    expect(idFilters).toHaveLength(2)
+    expect((idFilters[0][1] as string[]).length).toBe(150)
+    expect((idFilters[1][1] as string[]).length).toBe(1)
+  })
+
+  // Previously the candidate results were consumed without checking .error, so
+  // a 414 / 500 / RLS change yielded empty maps, an empty list and a zero badge
+  // with nothing logged.
+  it('returns [] and logs with companyId when a candidate lookup fails', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    enqueue({
+      data: [
+        {
+          id: 'tx-1',
+          date: '2026-06-01',
+          description: 'X',
+          amount: 100,
+          currency: 'SEK',
+          potential_invoice_id: 'inv-1',
+          potential_supplier_invoice_id: null,
+        },
+      ],
+    })
+    enqueue({ error: { message: 'boom' } })
+
+    await expect(listSuggestedMatches(supabase, COMPANY)).resolves.toEqual([])
+    expect(consoleError).toHaveBeenCalled()
+    const logged = consoleError.mock.calls.map((c) => String(c[0])).join('\n')
+    expect(logged).toContain('candidate lookup failed')
+    expect(logged).toContain(COMPANY)
+    consoleError.mockRestore()
+  })
+
+  it('logs the tenant with the transaction query failure too', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    enqueue({ error: { message: 'boom' } })
+    await expect(listSuggestedMatches(supabase, COMPANY)).resolves.toEqual([])
+    expect(String(consoleError.mock.calls[0]?.[0])).toContain(COMPANY)
+    consoleError.mockRestore()
   })
 })

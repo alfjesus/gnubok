@@ -6,6 +6,7 @@
 
 import React, { useState, useEffect, useCallback } from 'react'
 import Link from 'next/link'
+import { useTranslations } from 'next-intl'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -15,9 +16,12 @@ import { AlertCircle, Check, ChevronDown, ChevronRight, ExternalLink, FileCode, 
 import { Skeleton } from '@/components/ui/skeleton'
 import { EmptyState } from '@/components/ui/empty-state'
 import { FyPicker } from '@/components/common/FyPicker'
+import { mostRecentEndedVatPeriod } from '@/lib/vat/period-defaults'
 import { ContextPicker } from '@/components/common/ContextPicker'
 import { cn, formatDate } from '@/lib/utils'
+import { getErrorMessage } from '@/lib/errors/get-error-message'
 import { roundOre } from '@/lib/money'
+import { formatLatestVouchers } from '@/lib/reports/latest-vouchers-format'
 import { formatVoucher } from '@/lib/bookkeeping/voucher-series-resolver'
 import { AccountNumber } from '@/components/ui/account-number'
 import { ReportExportMenu } from '@/components/reports/ReportExportMenu'
@@ -112,7 +116,10 @@ export function TrialBalanceView({ periodId, onNavigateToAccount }: { periodId: 
       .then((res) => res.json())
       .then((result) => {
         if (result.error) {
-          setError(result.error)
+          // `result.error` is the canonical envelope OBJECT; assigning it to a
+          // string state and rendering it bare threw "Objects are not valid as
+          // a React child" and blanked the report page.
+          setError(getErrorMessage(result))
         } else {
           setData(result.data)
         }
@@ -432,7 +439,10 @@ export function IncomeStatementView({ periodId, dateRange, dimensionFilter = nul
       .then((res) => res.json())
       .then((result) => {
         if (result.error) {
-          setError(result.error)
+          // `result.error` is the canonical envelope OBJECT; assigning it to a
+          // string state and rendering it bare threw "Objects are not valid as
+          // a React child" and blanked the report page.
+          setError(getErrorMessage(result))
         } else {
           setData(result.data)
         }
@@ -509,7 +519,7 @@ export function IncomeStatementView({ periodId, dateRange, dimensionFilter = nul
       {/* Revenue */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-lg">Rörelseintäkter</CardTitle>
+          <CardTitle className="text-base">Rörelseintäkter</CardTitle>
         </CardHeader>
         <CardContent>
           <ReportSectionTable sections={data.revenue_sections} onNavigateToAccount={onNavigateToAccount} />
@@ -523,7 +533,7 @@ export function IncomeStatementView({ periodId, dateRange, dimensionFilter = nul
       {/* Expenses */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-lg">Rörelsekostnader</CardTitle>
+          <CardTitle className="text-base">Rörelsekostnader</CardTitle>
         </CardHeader>
         <CardContent>
           <ReportSectionTable sections={data.expense_sections} negate onNavigateToAccount={onNavigateToAccount} />
@@ -550,7 +560,7 @@ export function IncomeStatementView({ periodId, dateRange, dimensionFilter = nul
       {data.financial_sections.length > 0 && (
         <Card>
           <CardHeader>
-            <CardTitle className="text-lg">Finansiella poster</CardTitle>
+            <CardTitle className="text-base">Finansiella poster</CardTitle>
           </CardHeader>
           <CardContent>
             <ReportSectionTable sections={data.financial_sections} onNavigateToAccount={onNavigateToAccount} />
@@ -590,7 +600,10 @@ export function BalanceSheetView({ periodId, dateRange, onNavigateToAccount }: {
       .then((res) => res.json())
       .then((result) => {
         if (result.error) {
-          setError(result.error)
+          // `result.error` is the canonical envelope OBJECT; assigning it to a
+          // string state and rendering it bare threw "Objects are not valid as
+          // a React child" and blanked the report page.
+          setError(getErrorMessage(result))
         } else {
           setData(result.data)
         }
@@ -647,7 +660,7 @@ export function BalanceSheetView({ periodId, dateRange, onNavigateToAccount }: {
       {/* Assets */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-lg">Tillgångar</CardTitle>
+          <CardTitle className="text-base">Tillgångar</CardTitle>
         </CardHeader>
         <CardContent>
           <ReportSectionTable sections={data.asset_sections} onNavigateToAccount={onNavigateToAccount} />
@@ -661,7 +674,7 @@ export function BalanceSheetView({ periodId, dateRange, onNavigateToAccount }: {
       {/* Equity and liabilities */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-lg">Eget kapital och skulder</CardTitle>
+          <CardTitle className="text-base">Eget kapital och skulder</CardTitle>
         </CardHeader>
         <CardContent>
           <ReportSectionTable sections={data.equity_liability_sections} onNavigateToAccount={onNavigateToAccount} />
@@ -704,10 +717,12 @@ export function BalanceSheetView({ periodId, dateRange, onNavigateToAccount }: {
 }
 
 export function ResultatrapportView({ periodId, dateRange, dimensionFilter = null, onNavigateToAccount }: { periodId: string; dateRange: DateRangeValue; dimensionFilter?: DimensionFilterValue | null; onNavigateToAccount: (account: string) => void }) {
+  const t = useTranslations('reports')
   const [data, setData] = useState<ResultatrapportReport | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const reportQs = reportQuery(periodId, dateRange, dimensionFilter)
+  const latestVouchers = formatLatestVouchers(data?.latest_vouchers)
 
   useEffect(() => {
     setLoading(true)
@@ -716,7 +731,10 @@ export function ResultatrapportView({ periodId, dateRange, dimensionFilter = nul
       .then((res) => res.json())
       .then((result) => {
         if (result.error) {
-          setError(result.error)
+          // `result.error` is the canonical envelope OBJECT; assigning it to a
+          // string state and rendering it bare threw "Objects are not valid as
+          // a React child" and blanked the report page.
+          setError(getErrorMessage(result))
         } else {
           setData(result.data)
         }
@@ -772,6 +790,11 @@ export function ResultatrapportView({ periodId, dateRange, dimensionFilter = nul
           { format: 'xlsx', href: `/api/reports/resultatrapport/xlsx?${reportQs}` },
         ]}
       />
+      {latestVouchers && (
+        <p className="text-sm text-muted-foreground">
+          {t('latest_posted_vouchers')}: {latestVouchers}
+        </p>
+      )}
 
       <Card>
         <CardContent className="p-0">
@@ -854,10 +877,12 @@ export function ResultatrapportView({ periodId, dateRange, dimensionFilter = nul
 }
 
 export function BalansrapportView({ periodId, dateRange, onNavigateToAccount }: { periodId: string; dateRange: DateRangeValue; onNavigateToAccount: (account: string) => void }) {
+  const t = useTranslations('reports')
   const [data, setData] = useState<BalansrapportReport | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const reportQs = reportQuery(periodId, dateRange)
+  const latestVouchers = formatLatestVouchers(data?.latest_vouchers)
 
   useEffect(() => {
     setLoading(true)
@@ -866,7 +891,10 @@ export function BalansrapportView({ periodId, dateRange, onNavigateToAccount }: 
       .then((res) => res.json())
       .then((result) => {
         if (result.error) {
-          setError(result.error)
+          // `result.error` is the canonical envelope OBJECT; assigning it to a
+          // string state and rendering it bare threw "Objects are not valid as
+          // a React child" and blanked the report page.
+          setError(getErrorMessage(result))
         } else {
           setData(result.data)
         }
@@ -917,6 +945,11 @@ export function BalansrapportView({ periodId, dateRange, onNavigateToAccount }: 
           { format: 'xlsx', href: `/api/reports/balansrapport/xlsx?${reportQs}` },
         ]}
       />
+      {latestVouchers && (
+        <p className="text-sm text-muted-foreground">
+          {t('latest_posted_vouchers')}: {latestVouchers}
+        </p>
+      )}
 
       <Card>
         <CardContent className="p-0">
@@ -1457,6 +1490,77 @@ const MONTH_NAMES = [
 ]
 const QUARTER_SPANS = ['jan-mar', 'apr-jun', 'jul-sep', 'okt-dec']
 
+// Inline momsperiod setup for the "registered but no period picked" state.
+// Writes through the same PUT /api/settings validation as the tax settings
+// form (SFL 26 kap coherence rules included), so this is a shortcut, not a
+// second write path. Until a period exists the deadline engine generates NO
+// VAT deadlines at all, silently, which is why this state answers inline
+// instead of bouncing to settings.
+function MomsPeriodInlineSetup({
+  onSaved,
+}: {
+  onSaved: (value: 'monthly' | 'quarterly' | 'yearly') => Promise<void> | void
+}) {
+  const [saving, setSaving] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  const choose = async (value: 'monthly' | 'quarterly' | 'yearly') => {
+    if (saving) return
+    setSaving(value)
+    setError(null)
+    try {
+      const res = await fetch('/api/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ moms_period: value }),
+      })
+      if (!res.ok) {
+        const json = await res.json().catch(() => ({}))
+        setError(getErrorMessage(json, { statusCode: res.status }))
+        return
+      }
+      await onSaved(value)
+    } catch (err) {
+      setError(getErrorMessage(err))
+    } finally {
+      setSaving(null)
+    }
+  }
+
+  const options: { value: 'monthly' | 'quarterly' | 'yearly'; label: string }[] = [
+    { value: 'quarterly', label: 'Varje kvartal' },
+    { value: 'monthly', label: 'Varje månad' },
+    { value: 'yearly', label: 'Helår' },
+  ]
+
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap justify-center gap-2">
+        {options.map((opt) => (
+          <Button
+            key={opt.value}
+            variant="outline"
+            size="sm"
+            // The clicked button stays enabled (aria-busy) so keyboard focus
+            // survives the save; the `if (saving) return` guard in choose()
+            // prevents a double submit.
+            disabled={saving !== null && saving !== opt.value}
+            aria-busy={saving === opt.value}
+            onClick={() => choose(opt.value)}
+          >
+            {saving === opt.value ? 'Sparar …' : opt.label}
+          </Button>
+        ))}
+      </div>
+      {error && (
+        <p role="status" className="text-sm text-destructive">
+          {error}
+        </p>
+      )}
+    </div>
+  )
+}
+
 export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
   const currentYear = new Date().getFullYear()
   const currentMonth = new Date().getMonth() + 1
@@ -1504,16 +1608,25 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
   // switch re-applies the new company's setting. `useCompanySettings` only
   // refetches when the active company changes, so this never clobbers a
   // manual selection mid-session.
-  const { settings, isLoading: settingsLoading } = useCompanySettings()
+  const { settings, isLoading: settingsLoading, refetch: refetchSettings } = useCompanySettings()
   const [appliedCompany, setAppliedCompany] = useState<string | null>(null)
   const companyKey = settingsLoading ? null : (settings?.company_id ?? 'none')
   if (companyKey !== null && appliedCompany !== companyKey) {
     setAppliedCompany(companyKey)
     const configured = settings?.moms_period ?? 'quarterly'
     setPeriodType(configured)
-    setPeriod(
-      configured === 'monthly' ? currentMonth : configured === 'quarterly' ? currentQuarter : 1,
-    )
+    if (configured === 'monthly' || configured === 'quarterly') {
+      // Default to the period whose declaration is actually open: the current
+      // one can never be filed, so seeding it forced a step-back click on
+      // every filing visit (and a year-boundary trap in January).
+      const ended = mostRecentEndedVatPeriod(configured, new Date(), {
+        over40m: settings?.vat_taxable_base_over_40m === true,
+      })
+      setYear(ended.year)
+      setPeriod(ended.period)
+    } else {
+      setPeriod(1)
+    }
   }
 
   // Settings row present and the company answered "not VAT-registered" —
@@ -1523,12 +1636,21 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
   // requires it, but companies created outside that flow can miss it).
   const momsPeriodMissing = settings?.vat_registered === true && !settings.moms_period
 
-  // Switching periodicity resets the period to "now" in the new unit. Done in
-  // the change handler (not an effect) so the auto-fetch below never sees an
-  // inconsistent periodType/period pair.
+  // Switching periodicity resets the period to the most recently ended one in
+  // the new unit (same default as first load: the current period can never be
+  // filed). Done in the change handler (not an effect) so the auto-fetch below
+  // never sees an inconsistent periodType/period pair.
   const handlePeriodTypeChange = (value: VatPeriodType) => {
     setPeriodType(value)
-    setPeriod(value === 'monthly' ? currentMonth : value === 'quarterly' ? currentQuarter : 1)
+    if (value === 'monthly' || value === 'quarterly') {
+      const ended = mostRecentEndedVatPeriod(value, new Date(), {
+        over40m: settings?.vat_taxable_base_over_40m === true,
+      })
+      setYear(ended.year)
+      setPeriod(ended.period)
+    } else {
+      setPeriod(1)
+    }
   }
 
   // Annual VAT (helårsmoms) is reported per räkenskapsår, not per calendar year.
@@ -1732,18 +1854,55 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
 
   // Registered but no redovisningsperiod picked: block instead of guessing.
   // A declaration rendered (and submittable via panelen) for the wrong
-  // period type is a compliance hazard, not a convenience.
+  // period type is a compliance hazard, not a convenience. But the answer is
+  // collected HERE, inline: until it exists the deadline engine generates no
+  // VAT deadlines at all (silently), so bouncing the user to settings left a
+  // compliance hole open longer than it needed to be. When vat_number is ALSO
+  // missing, the inline save would 400 on the vat_number coherence rule in
+  // PUT /api/settings (momsregistrerad requires a registreringsnummer), so
+  // that (rarer) state keeps the settings bounce, which has both fields.
   if (momsPeriodMissing) {
+    if (!settings?.vat_number) {
+      return (
+        <div className="space-y-8">
+          {bareHeader}
+          <EmptyState
+            icon={Percent}
+            title="Redovisningsperiod för moms saknas"
+            description="Företaget är momsregistrerat men momsregistreringsnummer och redovisningsperiod (månad, kvartal eller helår) saknas. Ange dem i skatteinställningarna så visas deklarationen för rätt period."
+            actionLabel="Öppna skatteinställningar"
+            actionHref="/settings/tax"
+          />
+        </div>
+      )
+    }
     return (
       <div className="space-y-8">
         {bareHeader}
         <EmptyState
           icon={Percent}
-          title="Redovisningsperiod för moms saknas"
-          description="Företaget är momsregistrerat men ingen redovisningsperiod (månad, kvartal eller helår) är vald. Ange den i skatteinställningarna så visas deklarationen för rätt period."
-          actionLabel="Öppna skatteinställningar"
-          actionHref="/settings/tax"
-        />
+          title="Välj redovisningsperiod för moms"
+          description="Företaget är momsregistrerat men ingen redovisningsperiod är vald, så deklarationen och momsdeadlines kan inte visas. Perioden står i registreringsbeslutet från Skatteverket."
+        >
+          <div className="space-y-3">
+            <MomsPeriodInlineSetup
+              onSaved={async (value) => {
+                await refetchSettings()
+                // The first-settle seeding above only runs once per company,
+                // so re-apply the fresh periodicity (and its most-recent-
+                // ended default period) by hand.
+                handlePeriodTypeChange(value)
+              }}
+            />
+            <p className="text-xs text-muted-foreground">
+              Du kan alltid ändra den i{' '}
+              <Link href="/settings/tax" className="underline underline-offset-2 hover:text-foreground">
+                skatteinställningarna
+              </Link>
+              .
+            </p>
+          </div>
+        </EmptyState>
       </div>
     )
   }
@@ -1819,6 +1978,7 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
                 }}
                 includeAllOption={false}
                 hideFuturePeriods
+                preferLatestEnded
               />
             ) : (
               <ContextPicker
@@ -2340,7 +2500,9 @@ export function SupplierLedgerView({ periodId }: { periodId: string }) {
       const res = await fetch(`/api/reports/supplier-ledger?period_id=${periodId}&as_of_date=${asOfDate}`)
       const result = await res.json()
       if (result.error) {
-        setError(result.error)
+        // Envelope object, not a string: see the note on the other report
+        // fetches. Rendering it bare blanks the page.
+        setError(getErrorMessage(result))
       } else {
         setData(result.data)
       }
@@ -2617,7 +2779,9 @@ export function GeneralLedgerView({ periodId, initialAccountFilter, dimensionFil
       const res = await fetch(`/api/reports/general-ledger?${params}`)
       const result = await res.json()
       if (result.error) {
-        setError(result.error)
+        // Envelope object, not a string: see the note on the other report
+        // fetches. Rendering it bare blanks the page.
+        setError(getErrorMessage(result))
       } else {
         setData(result.data)
       }
@@ -2822,7 +2986,9 @@ export function JournalRegisterView({ periodId }: { periodId: string }) {
       const res = await fetch(`/api/reports/journal-register?period_id=${periodId}`)
       const result = await res.json()
       if (result.error) {
-        setError(result.error)
+        // Envelope object, not a string: see the note on the other report
+        // fetches. Rendering it bare blanks the page.
+        setError(getErrorMessage(result))
       } else {
         setData(result.data)
       }
@@ -3122,7 +3288,9 @@ export function ARLedgerView({ periodId }: { periodId: string }) {
       const res = await fetch(`/api/reports/ar-ledger?period_id=${periodId}&as_of_date=${asOfDate}`)
       const result = await res.json()
       if (result.error) {
-        setError(result.error)
+        // Envelope object, not a string: see the note on the other report
+        // fetches. Rendering it bare blanks the page.
+        setError(getErrorMessage(result))
       } else {
         setData(result.data)
       }

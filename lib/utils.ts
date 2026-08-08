@@ -35,12 +35,18 @@ const INVALID_DATE_PLACEHOLDER = '-'
  */
 export function formatCurrency(
   amount: number,
-  currency: string = 'SEK',
+  currency?: string | null,
   options?: { minimumFractionDigits?: number; maximumFractionDigits?: number },
 ): string {
+  // A `= 'SEK'` default only covers undefined. `transactions.currency` is a
+  // nullable column whose NULL is legacy for the 'SEK' default (see migration
+  // 20260726100000), yet the Transaction type declares it required, so a NULL
+  // reached Intl unguarded: `currency: null` throws RangeError and a single
+  // legacy row blanked the whole transactions list into the error boundary.
+  const code = currency || 'SEK'
   return new Intl.NumberFormat('sv-SE', {
     style: 'currency',
-    currency,
+    currency: code,
     minimumFractionDigits: options?.minimumFractionDigits ?? 0,
     maximumFractionDigits: options?.maximumFractionDigits ?? 2,
   }).format(amount)
@@ -66,15 +72,15 @@ export function formatDate(date: Date | string): string {
  *
  * The shape check (4-digit year) is what stops the native <input type="date">
  * 6-digit-year corruption ('202403-02-05'); the parse + range check also
- * rejects impossible dates (2024-13-40) and absurd years. Exported as the ONE
- * authoritative date rule shared by the client form and the server-side
+ * rejects impossible dates (2024-13-40) and absurd years. The ONE authoritative
+ * date rule shared by the client form and the server-side
  * CreateTransactionSchema, so the two validation layers can never drift.
+ *
+ * Implementation lives in `lib/invariants/iso-date.ts` alongside the other
+ * shared format contracts; re-exported here because this is where callers have
+ * always imported it from.
  */
-export function isSaneDateString(s: string): boolean {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false
-  const d = parseISO(s)
-  return isValid(d) && d.getFullYear() >= 1900 && d.getFullYear() <= 2100
-}
+export { isSaneDateString } from '@/lib/invariants/iso-date'
 
 /**
  * Date + time for audit / metadata displays: `2026-05-11 14:30`. ISO-ordered

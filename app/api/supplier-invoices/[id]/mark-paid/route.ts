@@ -6,9 +6,12 @@ import {
   createSupplierInvoiceCashEntry,
 } from '@/lib/bookkeeping/supplier-invoice-entries'
 import { createJournalEntry, findFiscalPeriod } from '@/lib/bookkeeping/engine'
+import { cashPartialBlockReason } from '@/lib/bookkeeping/booking-mode'
 import { cancelOrphanedPaymentEntry } from '@/lib/bookkeeping/cancel-orphaned-entry'
 import { isBookkeepingError } from '@/lib/bookkeeping/errors'
-import { linkToJournalEntry } from '@/lib/core/documents/document-service'
+import { anchorSupplierInvoiceDocument } from '@/lib/core/documents/supplier-invoice-underlag'
+import { clearSettledInvoiceSuggestions } from '@/lib/invoices/clear-settled-invoice-suggestions'
+import { paidAtFromDate } from '@/lib/invoices/paid-at'
 import { validateBody } from '@/lib/api/validate'
 import { MarkSupplierInvoicePaidSchema } from '@/lib/api/schemas'
 import { withRouteContext } from '@/lib/api/with-route-context'
@@ -65,7 +68,6 @@ export const POST = withRouteContext(
 
     const paymentDate = body.payment_date || new Date().toISOString().split('T')[0]
     const paymentAmount = body.amount || invoice.remaining_amount
-    const now = new Date().toISOString()
 
     if (body.force) {
       opLog.warn('duplicate-payment guard bypassed', {
@@ -229,6 +231,28 @@ export const POST = withRouteContext(
     const siAlreadyBooked = !!(invoice as { registration_journal_entry_id?: string | null }).registration_journal_entry_id
     const useCashEntry = !siAlreadyBooked && accountingMethod === 'cash'
 
+    // createSupplierInvoiceCashEntry books the FULL invoice (all items + VAT)
+    // and takes no payment amount: reject partials and part-paid completions
+    // for never-booked kontantmetoden invoices instead of over-booking the
+    // expense against a smaller bank movement. Custom lines are not exempt:
+    // the dialog pre-fills the same full-invoice shape.
+    const cashBlock = cashPartialBlockReason({
+      invoiceAlreadyBooked: siAlreadyBooked,
+      accountingMethod,
+      priorPaidAmount: (invoice as { paid_amount?: number | null }).paid_amount,
+      paysRemainingInFull: paymentAmount >= invoice.remaining_amount - 0.005,
+    })
+    if (cashBlock) {
+      return errorResponseFromCode('SI_CASH_PARTIAL_UNSUPPORTED', opLog, {
+        requestId,
+        details: {
+          reason: cashBlock,
+          payment_amount: paymentAmount,
+          remaining_amount: invoice.remaining_amount,
+        },
+      })
+    }
+
     let journalEntryId: string | null = null
 
     try {
@@ -309,6 +333,7 @@ export const POST = withRouteContext(
     const newPaidAmount = Math.round((invoice.paid_amount + paymentAmount) * 100) / 100
     const isFullyPaid = newRemaining <= 0
     const newStatus = isFullyPaid ? 'paid' : 'partially_paid'
+    const paidAt = isFullyPaid ? paidAtFromDate(paymentDate) : null
 
     const { data: updateResult, error: updateError } = await supabase
       .from('supplier_invoices')
@@ -316,7 +341,7 @@ export const POST = withRouteContext(
         status: newStatus,
         remaining_amount: Math.max(0, newRemaining),
         paid_amount: newPaidAmount,
-        paid_at: isFullyPaid ? now : null,
+        paid_at: paidAt,
         payment_journal_entry_id: journalEntryId,
       })
       .eq('id', id)
@@ -396,31 +421,34 @@ export const POST = withRouteContext(
       })
     }
 
+    // Fully settled: retire every transaction's suggestion pointer at this
+    // invoice (issue #1259). No exceptTransactionId: this flow is not driven by
+    // a bank transaction, so any pointer at it is now dead.
+    if (isFullyPaid) {
+      await clearSettledInvoiceSuggestions(supabase, companyId!, 'supplier_invoice', id)
+    }
+
     // Under kontantmetoden the cash payment entry is the ONLY booking of the
     // affärshändelse, so its underlag (the document from the inbox) must hang on
     // THIS verifikat per BFL 5 kap 6 §. Under faktureringsmetoden the document
-    // is already linked to the registration verifikat at receipt: re-linking
-    // here would move it off that primary booking, so we attach only for the
-    // cash entry. Non-fatal: the payment is already committed and immutable, so
-    // a link failure is logged and the invoice stays usable (mirrors the
-    // registration-time linking in commitCreateSupplierInvoiceFromInbox).
-    const invoiceDocumentId = (invoice as { document_id?: string | null }).document_id
-    if (useCashEntry && invoiceDocumentId && journalEntryId) {
-      try {
-        await linkToJournalEntry(supabase, companyId!, invoiceDocumentId, journalEntryId)
-      } catch (linkErr) {
-        opLog.warn('failed to link supplier invoice document to cash payment JE', {
-          documentId: invoiceDocumentId,
-          journalEntryId,
-          error: linkErr instanceof Error ? getUserErrorMessage(linkErr) : getUserErrorMessage(linkErr),
-        })
-      }
-    }
+    // is normally already linked to the registration verifikat at receipt, in
+    // which case anchorSupplierInvoiceDocument is a no-op (it never moves an
+    // anchored document). It only steps in when the document is floating, e.g.
+    // attached after registration or orphaned by a deleted rättelse: without an
+    // anchor every missing-underlag surface warns on a verifikat that plainly
+    // shows the invoice. Non-fatal by construction: the payment is already
+    // committed and immutable, so the helper logs and returns null on failure.
+    await anchorSupplierInvoiceDocument(supabase, companyId!, id)
 
     try {
       await eventBus.emit({
         type: 'supplier_invoice.paid',
-        payload: { supplierInvoice: invoice as SupplierInvoice, paymentAmount, companyId: companyId!, userId: user.id },
+        payload: {
+          supplierInvoice: { ...invoice, paid_at: paidAt ?? invoice.paid_at } as SupplierInvoice,
+          paymentAmount,
+          companyId: companyId!,
+          userId: user.id,
+        },
       })
     } catch (err) {
       opLog.warn('supplier_invoice.paid event emission failed', err as Error)

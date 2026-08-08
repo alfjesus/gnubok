@@ -136,6 +136,7 @@ function makeFlexibleSupabase(
 const COMPANY_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 const SUPPLIER_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
 const SI_ID = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+const JE_ID = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
 const USER_ID = 'user-1'
 
 function makeRequest(url: string, init?: RequestInit): Request {
@@ -1051,6 +1052,85 @@ describe('PATCH /api/v1/companies/:companyId/supplier-invoices/:id', () => {
     expect(body.error.code).toBe('SI_NOT_DRAFT')
   })
 
+  // #1230: the shared guard has to hold on the API-key path too, not just in
+  // the dashboard route: invoice_date is the posted entry's entry_date and
+  // supplier_invoice_number is in its description.
+  it('refuses to move invoice_date on an SI that already has a registration verifikat', async () => {
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        supplier_invoices: {
+          data: { ...SAMPLE_SI, registration_journal_entry_id: JE_ID },
+          error: null,
+        },
+        idempotency_keys: { data: null, error: null },
+      }),
+    )
+    const res = await updateSI(
+      makeRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/supplier-invoices/${SI_ID}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ invoice_date: '2026-06-01' }),
+      }),
+      detailParams(COMPANY_ID, SI_ID),
+    )
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error.code).toBe('SI_EDIT_VERIFIKAT_LOCKED')
+    expect(body.error.details.fields).toEqual(['invoice_date'])
+  })
+
+  it('still patches due_date on a booked SI, and accepts unchanged verifikat fields', async () => {
+    const booked = { ...SAMPLE_SI, registration_journal_entry_id: JE_ID }
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        supplier_invoices: { data: { ...booked, due_date: '2026-07-31' }, error: null },
+        idempotency_keys: { data: null, error: null },
+      }),
+    )
+    const res = await updateSI(
+      makeRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/supplier-invoices/${SI_ID}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          due_date: '2026-07-31',
+          invoice_date: SAMPLE_SI.invoice_date,
+          supplier_invoice_number: SAMPLE_SI.supplier_invoice_number,
+        }),
+      }),
+      detailParams(COMPANY_ID, SI_ID),
+    )
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.data.due_date).toBe('2026-07-31')
+  })
+
+  it('reports the lock, not a generic race, when a registration entry lands mid-flight', async () => {
+    // Queue: pre-flight read (unbooked) -> pinned update matches nothing ->
+    // re-read shows the entry that landed in between.
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        supplier_invoices: [
+          { data: SAMPLE_SI, error: null },
+          { data: null, error: null },
+          { data: { ...SAMPLE_SI, registration_journal_entry_id: JE_ID }, error: null },
+        ],
+        idempotency_keys: { data: null, error: null },
+      }),
+    )
+    const res = await updateSI(
+      makeRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/supplier-invoices/${SI_ID}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ invoice_date: '2026-06-01' }),
+      }),
+      detailParams(COMPANY_ID, SI_ID),
+    )
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error.code).toBe('SI_EDIT_VERIFIKAT_LOCKED')
+    expect(body.error.details.reason).toBe('race')
+  })
+
   it('rejects unknown body keys (V4.5 strict schema)', async () => {
     mockServiceClient.mockReturnValue(
       makeFlexibleSupabase({
@@ -1406,7 +1486,7 @@ describe('POST /api/v1/companies/:companyId/supplier-invoices/:id/credit', () =>
         line_total: 1000,
         account_number: '5410',
         vat_code: null,
-        vat_rate: 0.25,
+        vat_rate: 25,
         vat_amount: 250,
       },
     ],
@@ -1422,6 +1502,7 @@ describe('POST /api/v1/companies/:companyId/supplier-invoices/:id/credit', () =>
       credited_invoice_id: SI_ID,
     }
     let siReadCount = 0
+    let insertedItems: Array<{ vat_rate: number }> = []
     mockServiceClient.mockReturnValue({
       from: (table: string) => {
         return new Proxy({}, {
@@ -1448,7 +1529,12 @@ describe('POST /api/v1/companies/:companyId/supplier-invoices/:id/credit', () =>
                 }
               }
             }
-            return () => new Proxy({}, this!)
+            return (...args: unknown[]) => {
+              if (table === 'supplier_invoice_items' && prop === 'insert') {
+                insertedItems = args[0] as Array<{ vat_rate: number }>
+              }
+              return new Proxy({}, this!)
+            }
           },
         })
       },
@@ -1464,6 +1550,9 @@ describe('POST /api/v1/companies/:companyId/supplier-invoices/:id/credit', () =>
 
     expect(res.status).toBe(200)
     expect(mockedCredit).toHaveBeenCalledTimes(1)
+    expect(insertedItems[0]?.vat_rate).toBe(0.25)
+    expect(mockedCredit.mock.calls[0]?.[4]).toBe(registeredSI.items)
+    expect((mockedCredit.mock.calls[0]?.[4] as typeof registeredSI.items)[0]?.vat_rate).toBe(25)
     const body = await res.json()
     expect(body.data.credit_note_id).toBe(creditNoteRow.id)
     expect(body.data.original_id).toBe(SI_ID)

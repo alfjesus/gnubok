@@ -11,4 +11,6 @@ export const ENABLED_EXTENSION_IDS: ReadonlySet<string> = new Set([
   'invoice-inbox',
   'document-extraction',
   'stripe',
+  'whatsapp-inbox',
+  'woocommerce',
 ])

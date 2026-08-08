@@ -16,7 +16,10 @@
  *   - ob sums the OB entry's lines with NO status filter (mirrors
  *     getOpeningBalances) but is company-guarded;
  *   - monthly is posted-only, classes 3-8, 8999 excluded, class 8 split
- *     per line by the sign of credit - debit;
+ *     per line by the sign of credit - debit, and (since migration
+ *     20260730090000) it shares tb_ex_year_end's entry set so the
+ *     resultatavslut cannot chart the whole year's revenue as negative
+ *     income in the fiscal-year-end month;
  *   - SECURITY INVOKER: a non-member gets empty sections under RLS.
  */
 import { describe, it, expect } from 'vitest'
@@ -75,35 +78,49 @@ async function insertJournalEntry(params: {
   lines: Array<{ account: string; debit: number; credit: number }>
 }): Promise<string> {
   const id = randomUUID()
+  const status = params.status ?? 'posted'
+  const client = await getPool().connect()
   // Insert directly, bypassing commit_journal_entry's voucher sequencing:
   // fine for a read-side RPC that only aggregates line/account references.
-  await getPool().query(
-    `INSERT INTO public.journal_entries
-       (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
-        entry_date, description, source_type, status, reverses_id, correction_of_id)
-     VALUES ($1, $2, $3, $4, $5, 'A', $6, 'KPI RPC test', $7, $8, $9, $10)`,
-    [
-      id,
-      params.userId,
-      params.companyId,
-      params.fiscalPeriodId,
-      params.voucherNumber,
-      params.entryDate ?? '2026-03-15',
-      params.sourceType ?? 'manual',
-      params.status ?? 'posted',
-      params.reversesId ?? null,
-      params.correctionOfId ?? null,
-    ],
-  )
-  for (const line of params.lines) {
-    await getPool().query(
-      `INSERT INTO public.journal_entry_lines
-         (journal_entry_id, account_number, debit_amount, credit_amount)
-       VALUES ($1, $2, $3, $4)`,
-      [id, line.account, line.debit, line.credit],
+  try {
+    await client.query('BEGIN')
+    await client.query(
+      `INSERT INTO public.journal_entries
+         (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
+          entry_date, description, source_type, status, reverses_id, correction_of_id)
+       VALUES ($1, $2, $3, $4, $5, 'A', $6, 'KPI RPC test', $7, $8, $9, $10)`,
+      [
+        id,
+        params.userId,
+        params.companyId,
+        params.fiscalPeriodId,
+        params.voucherNumber,
+        params.entryDate ?? '2026-03-15',
+        params.sourceType ?? 'manual',
+        status,
+        params.reversesId ?? null,
+        params.correctionOfId ?? null,
+      ],
     )
+    for (const line of params.lines) {
+      await client.query(
+        `INSERT INTO public.journal_entry_lines
+           (journal_entry_id, account_number, debit_amount, credit_amount)
+         VALUES ($1, $2, $3, $4)`,
+        [id, line.account, line.debit, line.credit],
+      )
+    }
+    if (status === 'posted') {
+      await client.query('SET CONSTRAINTS check_balance_on_posted_insert IMMEDIATE')
+    }
+    await client.query('COMMIT')
+    return id
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
   }
-  return id
 }
 
 async function seedCompany() {
@@ -162,6 +179,8 @@ async function seedFullScenario() {
     lines: [
       { account: '8310', debit: 0, credit: 200 },
       { account: '8410', debit: 500, credit: 0 },
+      // Balance outside classes 3-8 so the monthly assertions stay focused.
+      { account: '2999', debit: 0, credit: 300 },
     ],
   })
 
@@ -262,7 +281,11 @@ describe('get_kpi_report_aggregates RPC', () => {
     await insertJournalEntry({
       ...ctx, voucherNumber: 2, sourceType: 'storno', entryDate: '2026-04-02',
       reversesId: plainReversed,
-      lines: [{ account: '5010', debit: 0, credit: 100 }],
+      lines: [
+        { account: '5010', debit: 0, credit: 100 },
+        // Keep the posted storno balanced without changing the asserted P&L account.
+        { account: '2999', debit: 100, credit: 0 },
+      ],
     })
 
     const payload = await callRpc(ctx.companyId, ctx.fiscalPeriodId)
@@ -308,12 +331,18 @@ describe('get_kpi_report_aggregates RPC', () => {
     expect(monthOf(payload, 2026, 2)).toMatchObject({ income: 0, expenses: 3000 })
     // March: 8310 credit 200 -> income; 8410 debit 500 -> expenses.
     expect(monthOf(payload, 2026, 3)).toMatchObject({ income: 200, expenses: 500 })
-    // December: year_end entries are NOT excluded from monthly. 8910 debit
-    // 1000 -> expenses; posted storno's 8999 credit excluded by account; the
-    // correction's 6200 debit 250 -> expenses. Total 1250.
-    expect(monthOf(payload, 2026, 12)).toMatchObject({ income: 0, expenses: 1250 })
-    // No phantom months.
-    expect(payload.monthly.map((m) => m.month).sort((a, b) => a - b)).toEqual([1, 2, 3, 12])
+    // December: year_end entries ARE excluded from monthly as of migration
+    // 20260730090000. Previously this month reported expenses 1250 (8910 debit
+    // 1000 from the posted year_end entry plus the correction's 6200 debit
+    // 250). Including them meant the resultatavslut charted the whole year's
+    // revenue as NEGATIVE income in the fiscal-year-end month: measured on
+    // production as 28 companies, worst case -10 347 459,81 kr in one month.
+    // This fixture's December holds ONLY year-end-chain entries, so the month
+    // disappears from the chart entirely, which is the correct operational
+    // view: a month whose only activity is bokslut has no operating result.
+    expect(monthOf(payload, 2026, 12)).toBeUndefined()
+    // No phantom months, and no bokslut-only months.
+    expect(payload.monthly.map((m) => m.month).sort((a, b) => a - b)).toEqual([1, 2, 3])
   })
 
   it('scopes to the requested company and returns empty sections for an empty one', async () => {

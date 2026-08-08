@@ -1,11 +1,13 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { generateTrialBalance } from './trial-balance'
 import { findUntransferredResults, buildImbalanceDiagnosis } from './imbalance-diagnosis'
+import { getLatestPostedVouchers } from './latest-vouchers'
 import type {
   BalanceImbalanceDiagnosis,
   BalansrapportReport,
   BalansrapportRow,
   BalansrapportGroup,
+  LatestVoucherPerSeries,
 } from '@/types'
 
 const CLASS_LABELS: Record<number, string> = {
@@ -47,6 +49,8 @@ export async function generateBalansrapport(
   const effectiveToDate = options?.toDate ?? period.period_end
 
   const trialBalance = await generateTrialBalance(supabase, companyId, fiscalPeriodId, {
+    // Class 1-2 only, and 2099 must carry årets resultat.
+    closingEntry: 'include',
     fromDate: options?.fromDate,
     toDate: options?.toDate,
   })
@@ -115,6 +119,19 @@ export async function generateBalansrapport(
     }
   }
 
+  // Reconciliation aid for the header: which vouchers are actually in here.
+  // The balansrapport accumulates from the fiscal year start, so the window has
+  // no lower bound beyond fiscal_period_id even when the user narrows fromDate.
+  // Best-effort: a header nicety never breaks the report.
+  let latestVouchers: LatestVoucherPerSeries[] = []
+  try {
+    latestVouchers = await getLatestPostedVouchers(supabase, companyId, fiscalPeriodId, {
+      toDate: effectiveToDate,
+    })
+  } catch {
+    // Best-effort header line only.
+  }
+
   return {
     groups,
     total_assets_ub: totalAssetsUb,
@@ -123,6 +140,7 @@ export async function generateBalansrapport(
     is_balanced: trialBalance.isBalanced,
     period: { start: effectiveFromDate, end: effectiveToDate },
     ...(imbalanceDiagnosis ? { imbalance_diagnosis: imbalanceDiagnosis } : {}),
+    ...(latestVouchers.length > 0 ? { latest_vouchers: latestVouchers } : {}),
   }
 }
 

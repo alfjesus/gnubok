@@ -8,7 +8,7 @@ import {
   makeSupplier,
 } from '@/tests/helpers'
 
-const { supabase: mockSupabase, enqueue, reset } = createQueuedMockSupabase()
+const { supabase: mockSupabase, enqueue, reset, findCalls } = createQueuedMockSupabase()
 vi.mock('@/lib/supabase/server', () => ({
   createClient: () => Promise.resolve(mockSupabase),
 }))
@@ -35,18 +35,19 @@ vi.mock('@/lib/bookkeeping/supplier-invoice-entries', () => ({
     mockCreateSupplierInvoiceCashEntry(...args),
 }))
 
-vi.mock('@/lib/core/documents/document-service', async () => {
-  const actual = await vi.importActual<typeof import('@/lib/core/documents/document-service')>(
-    '@/lib/core/documents/document-service'
-  )
-  return {
-    ...actual,
-    linkToJournalEntry: vi.fn(),
-  }
-})
+vi.mock('@/lib/core/documents/supplier-invoice-underlag', () => ({
+  anchorSupplierInvoiceDocument: vi.fn().mockResolvedValue(null),
+}))
+
+// Mocked so it consumes no slot in the queued Supabase mock: the helper's own
+// query shape is pinned by lib/invoices/__tests__/clear-settled-invoice-suggestions.test.ts.
+vi.mock('@/lib/invoices/clear-settled-invoice-suggestions', () => ({
+  clearSettledInvoiceSuggestions: vi.fn().mockResolvedValue(undefined),
+}))
 
 import { eventBus } from '@/lib/events'
-import { linkToJournalEntry } from '@/lib/core/documents/document-service'
+import { anchorSupplierInvoiceDocument } from '@/lib/core/documents/supplier-invoice-underlag'
+import { clearSettledInvoiceSuggestions } from '@/lib/invoices/clear-settled-invoice-suggestions'
 
 import { POST } from '../route'
 
@@ -134,9 +135,12 @@ describe('POST /api/supplier-invoices/[id]/mark-paid', () => {
     // Record payment
     enqueue({ data: null, error: null })
 
+    const paidHandler = vi.fn()
+    eventBus.on('supplier_invoice.paid', paidHandler)
+
     const request = createMockRequest('/api/supplier-invoices/si-1/mark-paid', {
       method: 'POST',
-      body: {},
+      body: { payment_date: '2026-05-12' },
     })
     const response = await POST(request, createMockRouteParams({ id: 'si-1' }))
     const { status, body } = await parseJsonResponse<{
@@ -154,6 +158,23 @@ describe('POST /api/supplier-invoices/[id]/mark-paid', () => {
     expect(body.remaining_amount).toBe(0)
     expect(body.journal_entry_id).toBe('je-1')
     expect(mockCreateSupplierInvoicePaymentEntry).toHaveBeenCalled()
+    const invoiceUpdate = findCalls('supplier_invoices', 'update').at(-1)?.[0]
+    expect(invoiceUpdate).toMatchObject({ paid_at: '2026-05-12T12:00:00Z' })
+    expect(paidHandler).toHaveBeenCalledWith(
+      expect.objectContaining({
+        supplierInvoice: expect.objectContaining({ paid_at: '2026-05-12T12:00:00Z' }),
+      }),
+    )
+    // Issue #1259: full settlement retires every transaction's suggestion
+    // pointer at this invoice. No exceptTransactionId: mark-paid is not driven
+    // by a bank transaction.
+    expect(vi.mocked(clearSettledInvoiceSuggestions)).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(clearSettledInvoiceSuggestions)).toHaveBeenCalledWith(
+      mockSupabase,
+      'company-1',
+      'supplier_invoice',
+      'si-1',
+    )
   })
 
   it('marks as partially paid', async () => {
@@ -194,6 +215,9 @@ describe('POST /api/supplier-invoices/[id]/mark-paid', () => {
     expect(body.status).toBe('partially_paid')
     expect(body.paid_amount).toBe(5000)
     expect(body.remaining_amount).toBe(5000)
+    // Issue #1259: a partially paid invoice is still matchable, so its sibling
+    // suggestions must survive.
+    expect(vi.mocked(clearSettledInvoiceSuggestions)).not.toHaveBeenCalled()
   })
 
   it('uses cash method journal entry when configured', async () => {
@@ -252,7 +276,68 @@ describe('POST /api/supplier-invoices/[id]/mark-paid', () => {
     expect(mockCreateSupplierInvoicePaymentEntry).not.toHaveBeenCalled()
   })
 
-  it('cash method: links the inbox document to the cash payment verifikat (BFL 5 kap 6 §)', async () => {
+  it('rejects a cash-method partial payment on a never-booked supplier invoice', async () => {
+    // createSupplierInvoiceCashEntry books the FULL invoice (all items + VAT)
+    // and takes no payment amount, so a partial would over-book the expense.
+    const supplier = makeSupplier()
+    const invoice = makeSupplierInvoice({
+      id: 'si-1',
+      status: 'approved',
+      total: 10000,
+      remaining_amount: 10000,
+      paid_amount: 0,
+      supplier,
+      items: [],
+    })
+
+    enqueue({ data: invoice, error: null })
+    // Duplicate-payment guard is skipped on partials, so the next query is
+    // the settings fetch.
+    enqueue({ data: { accounting_method: 'cash' }, error: null })
+
+    const request = createMockRequest('/api/supplier-invoices/si-1/mark-paid', {
+      method: 'POST',
+      body: { amount: 4000 },
+    })
+    const response = await POST(request, createMockRouteParams({ id: 'si-1' }))
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(response)
+
+    expect(status).toBe(400)
+    expect(body.error.code).toBe('SI_CASH_PARTIAL_UNSUPPORTED')
+    expect(mockCreateSupplierInvoiceCashEntry).not.toHaveBeenCalled()
+    expect(mockCreateSupplierInvoicePaymentEntry).not.toHaveBeenCalled()
+  })
+
+  it('rejects completing a previously part-paid never-booked cash supplier invoice', async () => {
+    const supplier = makeSupplier()
+    const invoice = makeSupplierInvoice({
+      id: 'si-1',
+      status: 'partially_paid',
+      total: 10000,
+      remaining_amount: 6000,
+      paid_amount: 4000,
+      supplier,
+      items: [],
+    })
+
+    enqueue({ data: invoice, error: null })
+    // Full-remaining payment: duplicate-payment guard runs (no candidates).
+    enqueue({ data: [], error: null })
+    enqueue({ data: { accounting_method: 'cash' }, error: null })
+
+    const request = createMockRequest('/api/supplier-invoices/si-1/mark-paid', {
+      method: 'POST',
+      body: {},
+    })
+    const response = await POST(request, createMockRouteParams({ id: 'si-1' }))
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(response)
+
+    expect(status).toBe(400)
+    expect(body.error.code).toBe('SI_CASH_PARTIAL_UNSUPPORTED')
+    expect(mockCreateSupplierInvoiceCashEntry).not.toHaveBeenCalled()
+  })
+
+  it('cash method: anchors the invoice document to a posted verifikat (BFL 5 kap 6 §)', async () => {
     const supplier = makeSupplier()
     const invoice = makeSupplierInvoice({
       id: 'si-1',
@@ -286,16 +371,17 @@ describe('POST /api/supplier-invoices/[id]/mark-paid', () => {
 
     expect(status).toBe(200)
     expect(body.journal_entry_id).toBe('je-cash')
-    // The cash entry is the ONLY booking, so its underlag must hang on it.
-    expect(linkToJournalEntry).toHaveBeenCalledWith(
+    // The cash entry is the ONLY booking, so its underlag must hang on a
+    // posted verifikat of this invoice. Which one it picks (and that it never
+    // moves an already-anchored doc) is pinned in the helper's own tests.
+    expect(anchorSupplierInvoiceDocument).toHaveBeenCalledWith(
       expect.anything(),
       'company-1',
-      'doc-1',
-      'je-cash',
+      'si-1',
     )
   })
 
-  it('accrual method: does NOT re-link the document at payment (stays on the registration verifikat)', async () => {
+  it('accrual method: still delegates the anchor check (a no-op once the doc sits on the registration verifikat)', async () => {
     const supplier = makeSupplier()
     const invoice = makeSupplierInvoice({
       id: 'si-1',
@@ -329,9 +415,15 @@ describe('POST /api/supplier-invoices/[id]/mark-paid', () => {
     const { status } = await parseJsonResponse(response)
 
     expect(status).toBe(200)
-    // The document already lives on the registration verifikat: re-linking
-    // here would move it off the primary booking.
-    expect(linkToJournalEntry).not.toHaveBeenCalled()
+    // The document already lives on the registration verifikat, so the helper
+    // leaves it there: it only ever anchors a FLOATING doc, which is the case
+    // this route previously skipped entirely (leaving the payment verifikat
+    // warning "Underlag saknas" with no way out).
+    expect(anchorSupplierInvoiceDocument).toHaveBeenCalledWith(
+      expect.anything(),
+      'company-1',
+      'si-1',
+    )
   })
 
   it('returns 500 when journal entry creation fails (blocking: GL must succeed for payment)', async () => {

@@ -29,8 +29,8 @@ import SkattekontoInboxCard from '@/components/transactions/SkattekontoInboxCard
 import type { BookedDuplicateCandidate } from '@/lib/transactions/booking-duplicate-detection'
 
 import { DialogLoadingSkeleton } from '@/components/ui/dialog-loading-skeleton'
-import { getDefaultAccountForCategory, getDefaultVatTreatmentForCategory } from '@/lib/bookkeeping/category-mapping'
 import { getTemplateById, type BookingTemplate } from '@/lib/bookkeeping/booking-templates'
+import { resolveQuickReviewDefaults, type ReviewTemplate } from '@/lib/transactions/quick-review-defaults'
 import { isCounterpartyTemplateId, extractCounterpartyId } from '@/lib/bookkeeping/counterparty-templates'
 import { isLibraryTemplateId } from '@/lib/bookkeeping/template-library'
 import type {
@@ -43,6 +43,10 @@ import type {
   StoredSkattekontoTransaction,
 } from '@/types/skatteverket'
 import { findBankSkvCounterparts } from '@/lib/skatteverket/bank-counterpart'
+import {
+  MATCHABLE_INVOICE_STATUSES,
+  MATCHABLE_SUPPLIER_INVOICE_STATUSES,
+} from '@/lib/invoices/matchable-statuses'
 import { useCompany } from '@/contexts/CompanyContext'
 import { useRealtimeSupabase } from '@/lib/hooks/use-realtime-supabase'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
@@ -155,12 +159,27 @@ async function fetchPotentialMatches(
     .filter((t) => t.potential_supplier_invoice_id)
     .map((t) => t.potential_supplier_invoice_id)
 
+  // The hint columns are never revisited once written, so an invoice settled
+  // by a different transaction leaves a stale pointer behind. Revalidate here:
+  // an unmatchable candidate must not reach the row or the match dialog, which
+  // would otherwise compare the transaction against a 0 kr remaining balance
+  // and call it a partial payment.
   const [invoiceResult, supplierInvoiceResult] = await Promise.all([
     potentialInvoiceIds.length > 0
-      ? supabase.from('invoices').select('*, customer:customers(*)').in('id', potentialInvoiceIds)
+      ? supabase
+          .from('invoices')
+          .select('*, customer:customers(*)')
+          .in('id', potentialInvoiceIds)
+          .in('status', [...MATCHABLE_INVOICE_STATUSES])
+          .gt('remaining_amount', 0)
       : Promise.resolve({ data: null, error: null }),
     potentialSupplierInvoiceIds.length > 0
-      ? supabase.from('supplier_invoices').select('*, supplier:suppliers(*)').in('id', potentialSupplierInvoiceIds)
+      ? supabase
+          .from('supplier_invoices')
+          .select('*, supplier:suppliers(*)')
+          .in('id', potentialSupplierInvoiceIds)
+          .in('status', [...MATCHABLE_SUPPLIER_INVOICE_STATUSES])
+          .gt('remaining_amount', 0)
       : Promise.resolve({ data: null, error: null }),
   ])
 
@@ -183,9 +202,13 @@ interface QuickReviewState {
   transaction: TransactionWithInvoice
   category: TransactionCategory
   label: string
-  template: BookingTemplate | null
+  // ReviewTemplate, not BookingTemplate: a learned counterparty template has
+  // no catalog entry, so most BookingTemplate fields are genuinely absent.
+  template: ReviewTemplate | null
   templateId: string | undefined
   linePattern: LinePatternEntry[] | null
+  // Learned counterparty bag; prefills the review dialog's dimension picker.
+  defaultDimensions?: Record<string, string> | null
 }
 
 export default function TransactionsPage() {
@@ -891,8 +914,106 @@ export default function TransactionsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [transactions.length])
 
-  const handleCategorize: CategorizeHandler = async (id, isBusiness, category, vatTreatment, accountOverride, templateId, inboxItemId) => {
-    return runCategorize({ id, isBusiness, category, vatTreatment, accountOverride, templateId, inboxItemId, confirmNoMatch: false })
+  const handleCategorize: CategorizeHandler = async (id, isBusiness, category, vatTreatment, accountOverride, templateId, inboxItemId, dimensions) => {
+    return runCategorize({ id, isBusiness, category, vatTreatment, accountOverride, templateId, inboxItemId, dimensions, confirmNoMatch: false })
+  }
+
+  /**
+   * The shared tail of a successful booking: exit animation, unbooked-count
+   * decrement, the outcome toast with its Ångra action, and the state patch
+   * that lands the row in its booked shape.
+   *
+   * Both booking paths run this. The counterparty-template path used to do
+   * only `setExitingIds().add(id)`, so a successful booking gave no
+   * confirmation, no undo and no count decrement, and the id was never removed
+   * from exitingIds again: an undo would have restored the row's data while
+   * leaving it filtered out of the inbox.
+   */
+  function finishBooking(args: {
+    id: string
+    isBusiness: boolean
+    category?: TransactionCategory
+    journalEntryId?: string | null
+    journalEntryCreated?: boolean
+    journalEntryError?: string | null
+  }) {
+    const { id, isBusiness, category, journalEntryId, journalEntryCreated, journalEntryError } = args
+    // A completed Ångra must win over the delayed patch below. The undo has
+    // already storno-reversed the verifikat server-side, so re-applying the
+    // booked shape afterwards would show a journal_entry_id that no longer
+    // represents a live entry.
+    let undone = false
+
+    setExitingIds((prev) => new Set(prev).add(id))
+    setTotalUncategorizedCount((prev) => Math.max(0, (prev ?? 1) - 1))
+
+    if (journalEntryCreated) {
+      toast({
+        title: 'Bokförd',
+        action: (
+          <ToastAction altText="Ångra kategorisering" onClick={async () => {
+            try {
+              const undoRes = await fetch(`/api/transactions/${id}/uncategorize`, { method: 'POST' })
+              if (undoRes.ok) {
+                undone = true
+                setTransactions((prev) =>
+                  prev.map((t) =>
+                    t.id === id
+                      ? { ...t, is_business: null, category: null as unknown as TransactionCategory, journal_entry_id: null }
+                      : t
+                  )
+                )
+                setTotalUncategorizedCount((prev) => (prev ?? 0) + 1)
+                toast({ title: t('undone_title'), description: t('undone_description') })
+              } else {
+                const errData = await undoRes.json()
+                toast({
+                  title: 'Kunde inte ångra',
+                  description: getErrorMessage(errData, { context: 'transaction', statusCode: undoRes.status }),
+                  variant: 'destructive',
+                })
+              }
+            } catch {
+              toast({ title: t('undo_failed_title'), description: t('undo_failed_description'), variant: 'destructive' })
+            }
+          }}>
+            Ångra
+          </ToastAction>
+        ),
+      })
+    } else if (journalEntryError) {
+      toast({ title: 'Delvis bokförd', description: `Verifikation kunde inte skapas: ${journalEntryError}`, variant: 'destructive' })
+    } else {
+      toast({ title: t('partially_booked_title'), description: t('partially_booked_description') })
+    }
+
+    // Update transaction in state after a brief delay for animation. Clearing
+    // the id from exitingIds is what makes an Ångra later put the row back in
+    // the inbox instead of leaving it invisible.
+    setTimeout(() => {
+      if (!undone) {
+        setTransactions((prev) =>
+          prev.map((tx) =>
+            tx.id === id
+              ? {
+                  ...tx,
+                  is_business: isBusiness,
+                  ...(category ? { category } : {}),
+                  ...(journalEntryId ? { journal_entry_id: journalEntryId } : {}),
+                }
+              : tx
+          )
+        )
+      }
+      setExitingIds((prev) => {
+        const next = new Set(prev)
+        next.delete(id)
+        return next
+      })
+      // Only this row's spinner: the shared helper must not clear another
+      // transaction's in-flight state.
+      setProcessingId((prev) => (prev === id ? null : prev))
+    }, 350)
   }
 
   async function runCategorize(args: {
@@ -903,6 +1024,7 @@ export default function TransactionsPage() {
     accountOverride?: string
     templateId?: string
     inboxItemId?: string
+    dimensions?: Record<string, string>
     confirmNoMatch: boolean
     // Set after the user confirms the booking-time duplicate warning. force
     // bypasses the guard; the bypass is bound to the reviewed candidate's
@@ -911,7 +1033,7 @@ export default function TransactionsPage() {
     force?: boolean
     expectedDuplicateJournalEntryId?: string
   }): Promise<string | null> {
-    const { id, isBusiness, category, vatTreatment, accountOverride, templateId, inboxItemId, confirmNoMatch, force, expectedDuplicateJournalEntryId } = args
+    const { id, isBusiness, category, vatTreatment, accountOverride, templateId, inboxItemId, dimensions, confirmNoMatch, force, expectedDuplicateJournalEntryId } = args
     try {
       setProcessingId(id)
       const response = await fetch(`/api/transactions/${id}/categorize`, {
@@ -924,6 +1046,7 @@ export default function TransactionsPage() {
           account_override: accountOverride,
           template_id: templateId,
           inbox_item_id: inboxItemId,
+          ...(dimensions && Object.keys(dimensions).length > 0 ? { dimensions } : {}),
           ...(confirmNoMatch ? { confirm_no_match: true } : {}),
           ...(force && expectedDuplicateJournalEntryId
             ? { force: true, expected_duplicate_journal_entry_id: expectedDuplicateJournalEntryId }
@@ -1126,66 +1249,14 @@ export default function TransactionsPage() {
         return null
       }
 
-      // Mark as exiting for animation, then update state
-      setExitingIds((prev) => new Set(prev).add(id))
-      setTotalUncategorizedCount((prev) => Math.max(0, (prev ?? 1) - 1))
-
-      if (result.journal_entry_created) {
-        toast({
-          title: 'Bokförd',
-          action: (
-            <ToastAction altText="Ångra kategorisering" onClick={async () => {
-              try {
-                const undoRes = await fetch(`/api/transactions/${id}/uncategorize`, { method: 'POST' })
-                if (undoRes.ok) {
-                  setTransactions((prev) =>
-                    prev.map((t) =>
-                      t.id === id
-                        ? { ...t, is_business: null, category: null as unknown as TransactionCategory, journal_entry_id: null }
-                        : t
-                    )
-                  )
-                  setTotalUncategorizedCount((prev) => (prev ?? 0) + 1)
-                  toast({ title: t('undone_title'), description: t('undone_description') })
-                } else {
-                  const errData = await undoRes.json()
-                  toast({
-                    title: 'Kunde inte ångra',
-                    description: getErrorMessage(errData, { context: 'transaction', statusCode: undoRes.status }),
-                    variant: 'destructive',
-                  })
-                }
-              } catch {
-                toast({ title: t('undo_failed_title'), description: t('undo_failed_description'), variant: 'destructive' })
-              }
-            }}>
-              Ångra
-            </ToastAction>
-          ),
-        })
-      } else if (result.journal_entry_error) {
-        toast({ title: 'Delvis bokförd', description: `Verifikation kunde inte skapas: ${result.journal_entry_error}`, variant: 'destructive' })
-      } else {
-        toast({ title: t('partially_booked_title'), description: t('partially_booked_description') })
-      }
-
-      // Update transaction in state after a brief delay for animation
-      setExitingIds((prev) => new Set(prev).add(id))
-      setTimeout(() => {
-        setTransactions((prev) =>
-          prev.map((t) =>
-            t.id === id
-              ? { ...t, is_business: isBusiness, category: result.category, journal_entry_id: result.journal_entry_id }
-              : t
-          )
-        )
-        setExitingIds((prev) => {
-          const next = new Set(prev)
-          next.delete(id)
-          return next
-        })
-        setProcessingId(null)
-      }, 350)
+      finishBooking({
+        id,
+        isBusiness,
+        category: result.category,
+        journalEntryId: result.journal_entry_id,
+        journalEntryCreated: result.journal_entry_created,
+        journalEntryError: result.journal_entry_error,
+      })
 
       return result.journal_entry_id || null
     } catch {
@@ -1876,6 +1947,10 @@ export default function TransactionsPage() {
     matched?: boolean,
   ) {
     setExitingIds((prev) => new Set(prev).add(transactionId))
+    // The row leaves the unbooked inbox either way (booked, or linked to an
+    // existing voucher), so the header count has to follow: every other path
+    // that removes a row decrements, this one did not.
+    setTotalUncategorizedCount((prev) => Math.max(0, (prev ?? 1) - 1))
     setTimeout(() => {
       setTransactions((prev) =>
         prev.map((t) =>
@@ -2135,14 +2210,35 @@ export default function TransactionsPage() {
   function handleOpenTemplateReview(transaction: TransactionWithInvoice, templateId: string) {
     if (isCounterpartyTemplateId(templateId)) {
       const cpSuggestion = templateSuggestions[transaction.id]?.find(ts => ts.template_id === templateId)
-      if (!cpSuggestion) return
+      if (!cpSuggestion) {
+        // The suggestion list went stale under the open modal (refetch, or the
+        // template was deleted in another tab). Say so instead of swallowing
+        // the click.
+        toast({
+          title: t('counterparty_suggestion_gone_title'),
+          description: t('counterparty_suggestion_gone_description'),
+          variant: 'destructive',
+        })
+        return
+      }
       setQuickReview({
         transaction,
         category: transaction.amount < 0 ? 'expense_other' : 'income_services',
         label: cpSuggestion.name_sv,
-        template: { id: templateId, name_sv: cpSuggestion.name_sv } as BookingTemplate,
+        // Carry the learned accounts and VAT: they are what the server books
+        // (buildMappingResultFromCounterpartyTemplate) and what the dialog
+        // previews. A counterparty template has no catalog entry, so the rest
+        // of BookingTemplate genuinely does not exist here.
+        template: {
+          id: templateId,
+          name_sv: cpSuggestion.name_sv,
+          debit_account: cpSuggestion.debit_account,
+          credit_account: cpSuggestion.credit_account,
+          vat_treatment: cpSuggestion.vat_treatment ?? null,
+        },
         templateId: undefined,
         linePattern: cpSuggestion.line_pattern ?? null,
+        defaultDimensions: cpSuggestion.default_dimensions ?? null,
       })
       setQuickReviewOpen(true)
       return
@@ -2194,16 +2290,21 @@ export default function TransactionsPage() {
     category: TransactionCategory,
     vatTreatment: VatTreatment | undefined,
     accountOverride: string | undefined,
-    templateId?: string
+    templateId?: string,
+    dimensions?: Record<string, string>
   ): Promise<string | null> {
     let journalEntryId: string | null
     if (!templateId && quickReview?.template?.id && isCounterpartyTemplateId(quickReview.template.id)) {
       const cpTemplateId = extractCounterpartyId(quickReview.template.id)
-      const cpCategorize = async (): Promise<{ ok: boolean; journalEntryId: string | null; result: { error?: { code?: string; account_numbers?: string[]; details?: { account_numbers?: string[] } }; journal_entry_id?: string | null }; status: number }> => {
+      const cpCategorize = async (): Promise<{ ok: boolean; journalEntryId: string | null; result: { error?: { code?: string; account_numbers?: string[]; details?: { account_numbers?: string[] } }; journal_entry_id?: string | null; journal_entry_created?: boolean; journal_entry_error?: string | null; category?: TransactionCategory }; status: number }> => {
         const r = await fetch(`/api/transactions/${id}/categorize`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ is_business: true, counterparty_template_id: cpTemplateId }),
+          body: JSON.stringify({
+            is_business: true,
+            counterparty_template_id: cpTemplateId,
+            ...(dimensions && Object.keys(dimensions).length > 0 ? { dimensions } : {}),
+          }),
         })
         const b = await r.json()
         return { ok: r.ok, status: r.status, result: b, journalEntryId: b?.journal_entry_id || null }
@@ -2252,15 +2353,14 @@ export default function TransactionsPage() {
                   // update conditionally writes the journal_entry_id when it's
                   // actually present.
                   if (retry.ok) {
-                    setExitingIds((prev) => new Set(prev).add(id))
-                    setTransactions((prev) =>
-                      prev.map((t) =>
-                        t.id === id
-                          ? { ...t, is_business: true, ...(retry.journalEntryId ? { journal_entry_id: retry.journalEntryId } : {}) }
-                          : t
-                      )
-                    )
-                    toast({ title: 'Bokförd' })
+                    finishBooking({
+                      id,
+                      isBusiness: true,
+                      category: retry.result?.category,
+                      journalEntryId: retry.journalEntryId,
+                      journalEntryCreated: retry.result?.journal_entry_created,
+                      journalEntryError: retry.result?.journal_entry_error,
+                    })
                   } else {
                     toast({ title: 'Kategorisering misslyckades', description: getErrorMessage(retry.result, { context: 'transaction', statusCode: retry.status }), variant: 'destructive' })
                   }
@@ -2281,10 +2381,17 @@ export default function TransactionsPage() {
         setQuickReview(null)
         return null
       }
-      setExitingIds((prev) => new Set(prev).add(id))
+      finishBooking({
+        id,
+        isBusiness: true,
+        category: result?.category,
+        journalEntryId: cpJeId,
+        journalEntryCreated: result?.journal_entry_created,
+        journalEntryError: result?.journal_entry_error,
+      })
       journalEntryId = cpJeId
     } else {
-      journalEntryId = await handleCategorize(id, true, category, vatTreatment, accountOverride, templateId)
+      journalEntryId = await handleCategorize(id, true, category, vatTreatment, accountOverride, templateId, undefined, dimensions)
     }
     // Always close: whether the server created a verifikation, returned a
     // structured 4xx (ACCOUNTS_NOT_IN_CHART, INVALID_MAPPING, …), or hit a
@@ -2294,6 +2401,15 @@ export default function TransactionsPage() {
     setQuickReview(null)
     return journalEntryId
   }
+
+  // Library and counterparty templates (no templateId) seed the review form
+  // from their own accounts; everything else falls back to the category
+  // defaults. Never undefined: see resolveQuickReviewDefaults.
+  const quickReviewDefaults = resolveQuickReviewDefaults(
+    quickReview?.template,
+    quickReview?.templateId,
+    quickReview?.category,
+  )
 
   return (
     <div className="space-y-8">
@@ -2757,23 +2873,13 @@ export default function TransactionsPage() {
           transaction={quickReview?.transaction ?? null}
           category={quickReview?.category ?? null}
           categoryLabel={quickReview?.label ?? ''}
-          defaultAccount={
-            // For library templates (no templateId but a template object), use the
-            // template's debit account as the default; otherwise fall back to the
-            // category's default account.
-            !quickReview?.templateId && quickReview?.template
-              ? quickReview.template.debit_account
-              : quickReview?.category ? getDefaultAccountForCategory(quickReview.category) : ''
-          }
-          defaultVat={
-            !quickReview?.templateId && quickReview?.template
-              ? (quickReview.template.vat_treatment ?? 'none')
-              : quickReview?.category ? (getDefaultVatTreatmentForCategory(quickReview.category) ?? 'none') : 'none'
-          }
+          defaultAccount={quickReviewDefaults.account}
+          defaultVat={quickReviewDefaults.vat}
           entityType={entityType as EntityType}
           template={quickReview?.template ?? null}
           templateId={quickReview?.templateId}
           counterpartyLinePattern={quickReview?.linePattern ?? null}
+          counterpartyDefaultDimensions={quickReview?.defaultDimensions ?? null}
           onConfirm={handleQuickReviewConfirm}
           onChangeTemplate={handleChangeTemplate}
         />

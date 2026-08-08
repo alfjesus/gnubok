@@ -14,6 +14,7 @@ import {
   resolveConsent,
   fetchCompanyInfoDirect,
   ProviderTokenInvalidError,
+  ProviderCompanyMismatchError,
   ConsentNotFoundError,
 } from './lib/provider-client'
 import { providerSupportsSie, fetchProviderSieFiles, getAllowedFiscalYears } from './lib/sie-fetcher'
@@ -67,6 +68,45 @@ function translateOAuthError(error: string, description: string | null): string 
 }
 
 /**
+ * Resolve the OAuth callback URL for a provider. Single source of truth for
+ * BOTH legs of the flow: the redirect_uri sent in the authorization request
+ * and the redirect_uri sent in the token exchange must be byte-identical, or
+ * the provider rejects the code exchange (RFC 6749 §4.1.3). The two legs used
+ * to resolve this independently: authorize honored the FORTNOX_REDIRECT_URI /
+ * VISMA_REDIRECT_URI override while the exchange hardcoded the
+ * NEXT_PUBLIC_APP_URL fallback, so any override differing from the fallback
+ * (dev ngrok URI, or an env var left on the old app domain after a domain
+ * cutover) silently broke every OAuth connect at the exchange step.
+ *
+ * The override exists so dev environments can route through a single
+ * registered URI instead of registering every ngrok URL on the OAuth client.
+ */
+/**
+ * WINT ships dark until the connection is verified against a live WINT
+ * account (its API is spec-derived, not sandbox-verified) and the relationship
+ * question is settled. Flipping WINT_MIGRATION_ENABLED=true is the launch
+ * switch; the rest of the provider is fully wired.
+ */
+function enabledProviders(): typeof ARCIM_PROVIDERS {
+  if (process.env.WINT_MIGRATION_ENABLED === 'true') return ARCIM_PROVIDERS
+  return ARCIM_PROVIDERS.filter(p => p.id !== 'wint')
+}
+
+function resolveArcimCallbackUrl(provider: ArcimProvider | ProviderName): string {
+  const providerRedirectEnv =
+    provider === 'visma'
+      ? process.env.VISMA_REDIRECT_URI
+      : provider === 'fortnox'
+        ? process.env.FORTNOX_REDIRECT_URI
+        : undefined
+  if (providerRedirectEnv && providerRedirectEnv.trim().length > 0) {
+    return providerRedirectEnv
+  }
+  const appUrl = process.env.NEXT_PUBLIC_APP_URL || ''
+  return `${appUrl}/api/extensions/ext/arcim-migration/callback`
+}
+
+/**
  * Build a provider OAuth authorization URL bound to an EXISTING consent id.
  * Used by both first-time connect and reconnect (token revival): the callback
  * runs exchangeAuthToken(consentId, …) which upserts the fresh tokens keyed by
@@ -79,21 +119,7 @@ async function buildArcimOAuthUrl(consentId: string, provider: ArcimProvider): P
   // is that row's opaque random primary key, nothing more.
   const otc = await generateOtc(consentId)
 
-  // Prefer a provider-specific redirect override (e.g. VISMA_REDIRECT_URI) when
-  // set: lets dev environments route through a single registered URI rather
-  // than registering every ngrok URL on the OAuth client. Falls back to
-  // NEXT_PUBLIC_APP_URL + the canonical callback path.
-  const appUrl = process.env.NEXT_PUBLIC_APP_URL || ''
-  const providerRedirectEnv =
-    provider === 'visma'
-      ? process.env.VISMA_REDIRECT_URI
-      : provider === 'fortnox'
-        ? process.env.FORTNOX_REDIRECT_URI
-        : undefined
-  const callbackUrl =
-    providerRedirectEnv && providerRedirectEnv.trim().length > 0
-      ? providerRedirectEnv
-      : `${appUrl}/api/extensions/ext/arcim-migration/callback`
+  const callbackUrl = resolveArcimCallbackUrl(provider)
 
   // The state is the one-time code itself: an unguessable pointer to the row
   // above. It deliberately encodes NOTHING. The previous base64url JSON payload
@@ -125,7 +151,7 @@ export const arcimMigrationExtension: Extension = {
       method: 'GET',
       path: '/providers',
       handler: async () => {
-        return NextResponse.json({ providers: ARCIM_PROVIDERS })
+        return NextResponse.json({ providers: enabledProviders() })
       },
     },
 
@@ -219,7 +245,7 @@ export const arcimMigrationExtension: Extension = {
           })
         }
 
-        const providerInfo = ARCIM_PROVIDERS.find(p => p.id === provider)
+        const providerInfo = enabledProviders().find(p => p.id === provider)
         if (!providerInfo) {
           return errorResponseFromCode('PROVIDER_INVALID', moduleLog, {
             details: { provider },
@@ -392,8 +418,10 @@ export const arcimMigrationExtension: Extension = {
         }
 
         // Briox needs the account ID (the /token clientid param) alongside
-        // the application token; Bokio/BL need their company GUID.
-        if ((provider === 'bokio' || provider === 'bjornlunden' || provider === 'briox') && !providerCompanyId) {
+        // the application token; Bokio/BL need their company GUID. WINT
+        // reuses the field for the login mail (paired with the password in
+        // apiToken; both are exchanged for tokens and never stored).
+        if ((provider === 'bokio' || provider === 'bjornlunden' || provider === 'briox' || provider === 'wint') && !providerCompanyId) {
           return errorResponseFromCode('PROVIDER_COMPANY_ID_REQUIRED', moduleLog, {
             details: { provider },
           })
@@ -421,6 +449,18 @@ export const arcimMigrationExtension: Extension = {
           if (error instanceof ProviderTokenInvalidError) {
             return errorResponseFromCode('PROVIDER_TOKEN_INVALID', moduleLog, {
               details: { provider, reason: error.message },
+            })
+          }
+          // Valid credentials, wrong company: name both org numbers so the user
+          // can see at a glance which company the token actually opened.
+          if (error instanceof ProviderCompanyMismatchError) {
+            return errorResponseFromCode('PROVIDER_COMPANY_MISMATCH', moduleLog, {
+              details: {
+                provider,
+                expectedOrgNumber: error.expectedOrgNumber,
+                actualOrgNumber: error.actualOrgNumber,
+                actualCompanyName: error.actualCompanyName,
+              },
             })
           }
           return errorResponseFromCode('PROVIDER_TOKEN_SUBMIT_FAILED', moduleLog, {
@@ -459,14 +499,20 @@ export const arcimMigrationExtension: Extension = {
             .replace(/</g, '&lt;')
             .replace(/>/g, '&gt;')
 
+          // The popup deliberately stays open on error: the postMessage is
+          // dropped whenever the popup's origin differs from the opener's
+          // (browser targetOrigin/origin checks), and closing anyway turns any
+          // such config drift into an invisible failure the user can only
+          // describe as "nothing happens". Leaving the reason on screen keeps
+          // every error diagnosable; the wizard also shows it when the message
+          // does arrive.
           const html = `<!DOCTYPE html><html><body><script>
             if (window.opener) {
               window.opener.postMessage({ type: 'arcim-oauth-error', reason: ${jsLiteral(reason)} }, ${jsLiteral(appUrl)});
-              window.close();
             } else {
               window.location.href = ${jsLiteral(fallbackUrl.toString())};
             }
-          </script><p>Anslutningen misslyckades: ${escapedReason}</p></body></html>`
+          </script><p>Anslutningen misslyckades: ${escapedReason}</p><p>Du kan stänga detta fönster.</p></body></html>`
 
           return new Response(html, {
             status: 200,
@@ -518,7 +564,9 @@ export const arcimMigrationExtension: Extension = {
 
           const { consentId, provider } = resolvedState
 
-          const redirectUri = `${appUrl}/api/extensions/ext/arcim-migration/callback`
+          // Must match the redirect_uri the authorization request was built
+          // with, so both come from resolveArcimCallbackUrl.
+          const redirectUri = resolveArcimCallbackUrl(provider)
 
           // Exchange OAuth code directly with the provider
           await exchangeAuthToken(consentId, provider, code, redirectUri)

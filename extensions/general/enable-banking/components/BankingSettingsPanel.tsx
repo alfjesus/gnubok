@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import Link from 'next/link'
 import { useSearchParams } from 'next/navigation'
 import { Button } from '@/components/ui/button'
@@ -12,12 +12,28 @@ import { notifyBankSyncUpdated } from '@/lib/transactions/bank-sync-signal'
 import { useCompany, useCapability } from '@/contexts/CompanyContext'
 import { CAPABILITY } from '@/lib/entitlements/keys'
 import { UpgradeNote } from '@/components/billing/UpgradeNote'
-import { SettingsGroup, SettingsRow, SettingsSeg } from '@/components/settings/SettingsRows'
+import {
+  SettingsGroup,
+  SettingsRow,
+  SettingsRowEnd,
+  SettingsRowNote,
+  SettingsSeg,
+} from '@/components/settings/SettingsRows'
 import { BankSelector, type Bank } from './BankSelector'
 import { BankConnectionStatus } from './BankConnectionStatus'
 import { AccountPickerDialog } from './AccountPickerDialog'
 import type { BankConnection } from '@/types'
 import type { StoredAccount } from '../types'
+
+/** One "reuse an existing connection" offer, as returned by /reusable-sessions. */
+interface ReusableSessionOffer {
+  connection_id: string
+  company_id: string
+  company_name: string | null
+  bank_name: string | null
+  consent_expires: string | null
+  available_account_count: number
+}
 
 /**
  * Self-contained banking settings panel for the enable-banking extension.
@@ -25,7 +41,9 @@ import type { StoredAccount } from '../types'
  */
 export default function BankingSettingsPanel() {
   const { toast } = useToast()
-  const supabase = createClient()
+  // Stable across renders so effects can list it as a dependency without
+  // re-firing on every parent render (same reason as AccountPickerDialog).
+  const supabase = useMemo(() => createClient(), [])
   // The OAuth callback lands here with ?select_accounts=<id> once a bank is
   // successfully connected. Read via useSearchParams (SSR/hydration-safe) so
   // the first-load spinner can say "bank connected, fetching accounts"
@@ -35,7 +53,7 @@ export default function BankingSettingsPanel() {
   const arrivedFromBankCallback = !!searchParams?.get('select_accounts')
 
   const { dialogProps, confirm } = useDestructiveConfirm()
-  const { company } = useCompany()
+  const { company, companies } = useCompany()
   const hasBankSync = useCapability(CAPABILITY.bank_sync)
 
   const [bankConnections, setBankConnections] = useState<BankConnection[]>([])
@@ -50,6 +68,22 @@ export default function BankingSettingsPanel() {
   const [showCsvFallback, setShowCsvFallback] = useState(false)
   const [psuType, setPsuType] = useState<'personal' | 'business'>('business')
   const [pickerConnectionId, setPickerConnectionId] = useState<string | null>(null)
+  // Live connections the same user holds at the same banks in OTHER companies.
+  // Several ASPSPs allow only one active AIS session per PSU, so authorizing
+  // company B silently kills company A's connection. RLS scopes SELECT to
+  // user_company_ids(), so this read stays within the user's own companies.
+  // Live sessions in the user's OTHER companies that still have unclaimed
+  // accounts. Reusing one connects this company without a second BankID and
+  // without revoking the first, which is what kills feeds at one-session banks.
+  const [reusableSessions, setReusableSessions] = useState<ReusableSessionOffer[]>([])
+  const [attachingConnectionId, setAttachingConnectionId] = useState<string | null>(null)
+  const [otherCompanyConnections, setOtherCompanyConnections] = useState<
+    { bank_name: string; company_id: string }[]
+  >([])
+  // Set when the OAuth callback pointed at a connection that belongs to a
+  // different company than the active one: without this the picker simply
+  // never opens and the connection looks like it vanished.
+  const [pickerCompanyMismatch, setPickerCompanyMismatch] = useState<string | null>(null)
 
   // Must match STALE_THRESHOLD_MS in extensions/general/enable-banking/index.ts
   const PENDING_LOCK_MS = 30 * 1000
@@ -103,13 +137,30 @@ export default function BankingSettingsPanel() {
     const match = bankConnections.find(c => c.id === targetId)
     if (match) {
       setPickerConnectionId(targetId)
+      setPickerCompanyMismatch(null)
+    } else {
+      // The callback finished, but the connection belongs to a company that
+      // isn't the active one (the user switched company during the bank
+      // round-trip, or authorized while another company was active). Name the
+      // owner instead of dropping the user on a panel that looks unchanged.
+      void (async () => {
+        const { data } = await supabase
+          .from('bank_connections')
+          .select('company_id')
+          .eq('id', targetId)
+          .maybeSingle()
+        const ownerId = (data as { company_id?: string } | null)?.company_id
+        if (!ownerId) return
+        const owner = companies.find((c) => c.company.id === ownerId)
+        setPickerCompanyMismatch(owner?.company.name ?? 'ett annat bolag')
+      })()
     }
 
     params.delete('select_accounts')
     const newQuery = params.toString()
     const newUrl = `${window.location.pathname}${newQuery ? `?${newQuery}` : ''}`
     window.history.replaceState({}, '', newUrl)
-  }, [isLoading, bankConnections])
+  }, [isLoading, bankConnections, companies, supabase])
 
   function releaseConnectingLock() {
     connectingRef.current = false
@@ -147,6 +198,33 @@ export default function BankingSettingsPanel() {
 
       setBankConnections(connections || [])
 
+      // Same-bank connections in the user's other companies. Only sessions
+      // that actually hold a consent count: a revoked or errored row is not
+      // competing for the bank's one-session-per-login slot.
+      const { data: allConnections } = await supabase
+        .from('bank_connections')
+        .select('bank_name, company_id, status')
+        .in('status', ['active', 'pending_selection'])
+      setOtherCompanyConnections(
+        ((allConnections || []) as { bank_name: string; company_id: string }[]).filter(
+          (c) => c.company_id !== company.id
+        )
+      )
+
+      // Reuse offers. Best-effort: a failure here costs the shortcut, never the
+      // panel, so the normal connect flow stays available either way.
+      try {
+        const reuseResponse = await fetch('/api/extensions/ext/enable-banking/reusable-sessions')
+        if (reuseResponse.ok) {
+          const { sessions } = await reuseResponse.json()
+          setReusableSessions((sessions || []) as ReusableSessionOffer[])
+        } else {
+          setReusableSessions([])
+        }
+      } catch {
+        setReusableSessions([])
+      }
+
       // If a pending connection exists from a recent attempt (e.g. user bounced back from
       // the bank's auth page), keep the connect button disabled until the server-side lock expires.
       const freshPending = (connections || []).find((c) => c.status === 'pending')
@@ -169,9 +247,88 @@ export default function BankingSettingsPanel() {
     }
   }
 
+  /**
+   * Warn before authorizing a bank where the same user already holds live
+   * connections in other companies. Several ASPSPs bind one active AIS session
+   * per PSU, so the new authorization silently invalidates the existing ones,
+   * and nothing in the product tells the user until a sync fails days later.
+   * Advisory only: legitimate multi-company setups must still be able to
+   * proceed, so the dialog always offers a working "Fortsätt".
+   */
+  async function confirmSameBankConnections(bankName: string): Promise<boolean> {
+    const clashes = otherCompanyConnections.filter((c) => c.bank_name === bankName)
+    if (clashes.length === 0) return true
+
+    const names = clashes
+      .map((c) => companies.find((entry) => entry.company.id === c.company_id)?.company.name)
+      .filter((name): name is string => !!name)
+    const companyList = names.length > 0 ? ` (${names.join(', ')})` : ''
+    const count = clashes.length
+
+    return confirm({
+      title: `Du har redan ${count} ${count === 1 ? 'anslutning' : 'anslutningar'} till ${bankName}`,
+      description:
+        `${bankName} är sedan tidigare ansluten i ${count === 1 ? 'ett annat bolag' : 'andra bolag'}${companyList}. ` +
+        'Vissa banker tillåter bara en aktiv anslutning per inloggning: när du slutför den här kan de andra sluta synka ' +
+        'och behöva förnyas. Fortsätt om du vet att din bank tillåter flera.',
+      confirmLabel: 'Fortsätt',
+      variant: 'warning',
+    })
+  }
+
+  /**
+   * Reuse a session authorized for another of the user's companies. No bank
+   * round-trip: the server creates this company's connection against the same
+   * consent and parks it in 'pending_selection', so the account picker opens
+   * exactly as it does after a real authorization.
+   */
+  async function handleReuseConnection(offer: ReusableSessionOffer) {
+    if (attachingConnectionId) return
+    setAttachingConnectionId(offer.connection_id)
+    try {
+      const response = await fetch('/api/extensions/ext/enable-banking/attach', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ connection_id: offer.connection_id }),
+      })
+      const result = await response.json()
+
+      if (!response.ok) {
+        toast({
+          title: 'Kunde inte återanvända anslutningen',
+          description: result?.error || 'Försök igen om en stund.',
+          variant: 'destructive',
+        })
+        return
+      }
+
+      await fetchConnections()
+      notifyBankSyncUpdated()
+      // Straight into account selection: the connection exists but syncs
+      // nothing until the user picks which accounts belong to this company.
+      setPickerConnectionId(result.connection_id)
+    } catch (error) {
+      console.error('[enable-banking] Reuse failed', error)
+      toast({
+        title: 'Kunde inte återanvända anslutningen',
+        description: 'Ett oväntat fel uppstod. Försök igen om en stund.',
+        variant: 'destructive',
+      })
+    } finally {
+      setAttachingConnectionId(null)
+    }
+  }
+
   async function handleConnectBank(bank: Bank, psuTypeOverride?: 'personal' | 'business') {
     if (connectingRef.current) return
+    // Claim the lock BEFORE the confirm await. The dialog can sit open
+    // indefinitely, and a second click in that window would otherwise sail
+    // past the guard above and start a concurrent connect flow.
     connectingRef.current = true
+    if (!(await confirmSameBankConnections(bank.name))) {
+      connectingRef.current = false
+      return
+    }
     setIsConnecting(true)
     setConnectingBankName(bank.name)
 
@@ -233,7 +390,12 @@ export default function BankingSettingsPanel() {
   // back through account selection to active.
   async function handleReconnect(connection: BankConnection, psuTypeOverride?: 'personal' | 'business') {
     if (connectingRef.current) return
+    // Lock before the confirm await, same reason as handleConnectBank.
     connectingRef.current = true
+    if (!(await confirmSameBankConnections(connection.bank_name))) {
+      connectingRef.current = false
+      return
+    }
     setIsConnecting(true)
     setConnectingBankName(connection.bank_name)
 
@@ -477,6 +639,15 @@ export default function BankingSettingsPanel() {
         />
       )}
 
+      {/* The callback landed on a connection owned by another of the user's
+          companies: one ochre line naming where it went (convention 6). */}
+      {pickerCompanyMismatch && (
+        <p className="px-1 pt-6 text-[12.5px] leading-relaxed text-attn">
+          Bankanslutningen slutfördes för {pickerCompanyMismatch}, inte för det bolag som är aktivt
+          nu. Byt till {pickerCompanyMismatch} för att välja vilka konton som ska synka.
+        </p>
+      )}
+
       {/* Persistent CSV fallback after connection/sync failure: a live hint,
           kept visible as a compact line instead of a boxed strip. */}
       {showCsvFallback && (
@@ -561,6 +732,69 @@ export default function BankingSettingsPanel() {
         </SettingsGroup>
       )}
 
+      {/* Reuse a session authorized for another of the user's companies. Sits
+          ABOVE the bank list deliberately: at a one-session-per-login bank,
+          choosing the bank below is the very action that kills the other
+          company's feed, so the cheaper and safer path has to be seen first.
+          Renders only when a live session actually has unclaimed accounts. */}
+      {hasBankSync && reusableSessions.length > 0 && (
+        <SettingsGroup
+          label="Återanvänd befintlig anslutning"
+          help={
+            <div className="space-y-2">
+              <p>
+                Du har redan en giltig bankanslutning i ett annat bolag, och den ser konton
+                som inget bolag använder ännu.
+              </p>
+              <p>
+                Vissa banker tillåter bara en aktiv anslutning per inloggning. Att återanvända
+                anslutningen i stället för att logga in på nytt låter bolagen dela samma
+                samtycke, så bolaget som redan är anslutet fortsätter att synka.
+              </p>
+              <p>
+                Bolagen delar bara samtycket. Konton, transaktioner och bokföring hålls isär,
+                och du väljer i nästa steg vilka konton som hör till det här bolaget.
+              </p>
+            </div>
+          }
+        >
+          {reusableSessions.map((offer) => (
+            <SettingsRow key={offer.connection_id} label={offer.bank_name ?? 'Bank'}>
+              <SettingsRowNote>
+                Ansluten för{' '}
+                <span className="font-medium text-foreground">
+                  {offer.company_name ?? 'ett annat bolag'}
+                </span>
+                . {offer.available_account_count}{' '}
+                {offer.available_account_count === 1 ? 'ledigt konto' : 'lediga konton'} kan
+                kopplas till{' '}
+                <span className="font-medium text-foreground">
+                  {company?.name ?? 'det här bolaget'}
+                </span>{' '}
+                utan nytt BankID.
+              </SettingsRowNote>
+              <SettingsRowEnd>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => handleReuseConnection(offer)}
+                  disabled={!!attachingConnectionId}
+                >
+                  {attachingConnectionId === offer.connection_id ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      Kopplar
+                    </>
+                  ) : (
+                    'Återanvänd'
+                  )}
+                </Button>
+              </SettingsRowEnd>
+            </SettingsRow>
+          ))}
+        </SettingsGroup>
+      )}
+
       {/* Connect new bank. Non-payers keep seeing the group (conversion
           surface) but the bank list is replaced by an upgrade note: the
           server gate would 403 the connect anyway. The former "Om
@@ -570,6 +804,10 @@ export default function BankingSettingsPanel() {
         help={
           <div className="space-y-2">
             <p>Välj din bank nedan för att koppla ditt konto via PSD2.</p>
+            <p>
+              Anslutningen görs för det bolag som är aktivt just nu. Byt bolag först om du vill
+              ansluta banken åt ett annat bolag.
+            </p>
             <p className="font-medium">Om bankintegration (PSD2)</p>
             <p>
               Automatisk import av transaktioner via PSD2 open banking.
@@ -607,6 +845,15 @@ export default function BankingSettingsPanel() {
               />
             </SettingsRow>
             <div className="px-1 pt-4">
+              {/* Name the company on the surface itself, not only in the help
+                  popover: the bank login that follows says nothing about which
+                  set of books the accounts will land in. */}
+              {company?.name && (
+                <p className="mb-3 text-[12.5px] leading-relaxed text-muted-foreground">
+                  Anslutningen görs för{' '}
+                  <span className="font-medium text-foreground">{company.name}</span>.
+                </p>
+              )}
               <BankSelector
                 onConnect={(bank) => handleConnectBank(bank, psuType)}
                 onPsuTypeDetected={setPsuType}

@@ -12,14 +12,14 @@ export function generateMetadata(): Metadata {
 export default function PrivacyPolicyPage() {
   const { appName, legalEntity, privacyEmail } = getBranding()
   return (
-    <div className="min-h-screen bg-gradient-to-b from-slate-50 to-white py-12 px-4">
+    <div className="min-h-screen bg-background py-12 px-4">
       <div className="max-w-3xl mx-auto space-y-6">
         <div className="text-center mb-8">
           <h1 className="text-3xl font-bold text-foreground mb-2">
             Integritetspolicy
           </h1>
           <p className="text-muted-foreground">
-            Senast uppdaterad: 2026-07-22
+            Senast uppdaterad: 2026-08-06
           </p>
         </div>
 
@@ -27,7 +27,7 @@ export default function PrivacyPolicyPage() {
           <CardHeader>
             <CardTitle>1. Personuppgiftsansvarig</CardTitle>
           </CardHeader>
-          <CardContent className="prose prose-sm max-w-none">
+          <CardContent className="prose prose-sm dark:prose-invert max-w-none">
             <p>
               {legalEntity} (&quot;vi&quot;, &quot;oss&quot;) är personuppgiftsansvarig för behandlingen av dina
               personuppgifter i samband med användningen av {appName}. Vi behandlar dina uppgifter i
@@ -40,7 +40,7 @@ export default function PrivacyPolicyPage() {
           <CardHeader>
             <CardTitle>2. Vilka uppgifter vi behandlar</CardTitle>
           </CardHeader>
-          <CardContent className="prose prose-sm max-w-none">
+          <CardContent className="prose prose-sm dark:prose-invert max-w-none">
             <p>Vi behandlar följande kategorier av personuppgifter:</p>
             <ul>
               <li><strong>Kontouppgifter:</strong> E-postadress (för inloggning)</li>
@@ -59,7 +59,7 @@ export default function PrivacyPolicyPage() {
           <CardHeader>
             <CardTitle>3. Rättslig grund (GDPR Art. 6)</CardTitle>
           </CardHeader>
-          <CardContent className="prose prose-sm max-w-none">
+          <CardContent className="prose prose-sm dark:prose-invert max-w-none">
             <ul>
               <li>
                 <strong>Avtal (Art. 6.1b):</strong> Behandling som är nödvändig för att fullgöra våra
@@ -85,7 +85,7 @@ export default function PrivacyPolicyPage() {
           <CardHeader>
             <CardTitle>4. Underbiträden</CardTitle>
           </CardHeader>
-          <CardContent className="prose prose-sm max-w-none">
+          <CardContent className="prose prose-sm dark:prose-invert max-w-none">
             <p>
               Vi använder följande underbiträden för att tillhandahålla tjänsten. Uppgifterna nedan anger
               vilka uppgifter som delas med respektive underbiträde, syftet samt var behandlingen sker
@@ -153,16 +153,24 @@ export default function PrivacyPolicyPage() {
                   <tr className="border-b">
                     <td className="py-2 pr-4 font-medium">PostHog</td>
                     <td className="py-2 pr-4">
-                      Produktanalys, sessionsinspelning, felrapportering och
-                      enkäter. Överförda uppgifter: användar-ID,
-                      e-postadress, namn och företagsnamn. All text i
-                      sessionsinspelningar maskeras: vi spelar in var i
-                      gränssnittet du klickar, aldrig vad som står i din
-                      bokföring. Organisationsnummer överförs aldrig.
+                      Produktanalys, sessionsinspelning, felrapportering,
+                      enkäter och supportärenden. Överförda uppgifter:
+                      användar-ID, e-postadress, namn och företagsnamn. Om du
+                      själv skriver till supporten i appen skickas även ditt
+                      meddelande dit som ett ärende, så att vi kan svara. I
+                      sessionsinspelningar maskeras belopp, person- och
+                      organisationsnummer samt lösenord; övrig text i
+                      gränssnittet och det du själv skriver kan ingå i
+                      inspelningen, så att vi kan felsöka problem du stöter
+                      på. Organisationsnummer skickas aldrig som analysdata.
                       Identifiering sker endast för inloggade användare (ej
-                      sandbox/demo). Inga kakor eller annan lagring på din
-                      enhet används för analysen; enkäter sparar enbart en
-                      lokal markering om att du redan sett dem.
+                      sandbox/demo). Inga kakor används, och själva analysdatan
+                      lagras inte på din enhet. Två små tekniska värden sparas
+                      dock lokalt: en markering om vilka enkäter du redan sett,
+                      så att du inte får samma fråga igen, och ett
+                      slumpmässigt ärende-ID som gör att du hittar tillbaka
+                      till ditt supportärende i samma webbläsare. Inget av dem
+                      innehåller personuppgifter.
                     </td>
                     <td className="py-2 pr-4">EU (Frankfurt)</td>
                     <td className="py-2">
@@ -189,7 +197,7 @@ export default function PrivacyPolicyPage() {
           <CardHeader>
             <CardTitle>5. Tredjelandsöverföring</CardTitle>
           </CardHeader>
-          <CardContent className="prose prose-sm max-w-none">
+          <CardContent className="prose prose-sm dark:prose-invert max-w-none">
             <p>
               Vissa underbiträden är baserade i USA. För dessa överföringar används EU-kommissionens
               standardavtalsklausuler (SCCs) som skyddsmekanism i enlighet med GDPR kapitel V.
@@ -204,7 +212,7 @@ export default function PrivacyPolicyPage() {
           <CardHeader>
             <CardTitle>6. Lagringstid</CardTitle>
           </CardHeader>
-          <CardContent className="prose prose-sm max-w-none">
+          <CardContent className="prose prose-sm dark:prose-invert max-w-none">
             <ul>
               <li>
                 <strong>Bokföringsmaterial:</strong> 7 år från räkenskapsårets slut, i enlighet
@@ -235,7 +243,7 @@ export default function PrivacyPolicyPage() {
           <CardHeader>
             <CardTitle>7. Dina rättigheter</CardTitle>
           </CardHeader>
-          <CardContent className="prose prose-sm max-w-none">
+          <CardContent className="prose prose-sm dark:prose-invert max-w-none">
             <p>Du har följande rättigheter enligt GDPR:</p>
             <ul>
               <li><strong>Tillgång (Art. 15):</strong> Du kan begära en kopia av alla dina personuppgifter.</li>
@@ -259,7 +267,7 @@ export default function PrivacyPolicyPage() {
           <CardHeader>
             <CardTitle>8. Kontaktuppgifter</CardTitle>
           </CardHeader>
-          <CardContent className="prose prose-sm max-w-none">
+          <CardContent className="prose prose-sm dark:prose-invert max-w-none">
             <p>
               För frågor om behandlingen av dina personuppgifter, kontakta oss:
             </p>

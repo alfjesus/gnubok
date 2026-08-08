@@ -41,6 +41,8 @@ import { getErrorMessage } from '@/lib/errors/get-error-message'
 import { logMatchEvent } from '@/lib/invoices/match-log'
 import { planInvoicePayment } from '@/lib/invoices/apply-invoice-payment'
 import { detectDuplicatePaymentVoucher } from '@/lib/invoices/duplicate-payment-detection'
+import { clearSettledInvoiceSuggestions } from '@/lib/invoices/clear-settled-invoice-suggestions'
+import { paidAtFromDate } from '@/lib/invoices/paid-at'
 import { eventBus } from '@/lib/events/bus'
 import type { Currency, EntityType, Invoice, Transaction } from '@/types'
 
@@ -408,6 +410,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       })
     }
     const { newPaidAmount, newRemaining, isFullyPaid, newStatus } = payment.plan
+    const paidAt = isFullyPaid ? paidAtFromDate(transaction.date) : null
 
     if (transaction.journal_entry_id) {
       try {
@@ -430,8 +433,6 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
         return v1ErrorResponse(err, txLog, { requestId: ctx.requestId })
       }
     }
-
-    const now = new Date().toISOString()
 
     const { data: settings } = await ctx.supabase
       .from('company_settings')
@@ -464,7 +465,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
 
     // Reject cash-method partial payments ONLY for pure kontantmetoden
     // invoices (no prior JE). Under kontantmetoden utgående moms must be
-    // reported in the period of actual receipt (ML 13 kap 8 §); the
+    // reported in the period of actual receipt (bokslutsmetoden); the
     // partial-payment branch uses the accrual-style clearing entry which
     // doesn't model the per-installment moms event. When the invoice was
     // already booked under accrual, the clearing entry IS the correct
@@ -674,7 +675,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       .from('invoices')
       .update({
         status: newStatus,
-        paid_at: isFullyPaid ? now : null,
+        paid_at: paidAt,
         paid_amount: newPaidAmount,
         remaining_amount: newRemaining,
       })
@@ -741,6 +742,15 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       })
     }
 
+    // The invoice is now settled, so every OTHER transaction still carrying a
+    // suggestion pointer at it is dead: retire them (issue #1259). This
+    // request's own row is cleared by the update just below.
+    if (isFullyPaid) {
+      await clearSettledInvoiceSuggestions(ctx.supabase, ctx.companyId!, 'invoice', invoice_id, {
+        exceptTransactionId: txId,
+      })
+    }
+
     // When the tx already has a category (set by a prior :categorize call,
     // could be income_products / rental / etc.), preserve it. When there is
     // none, leave the column UNTOUCHED: the existing default ('uncategorized')
@@ -788,8 +798,21 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       eventBus.emit({
         type: 'invoice.match_confirmed',
         payload: {
-          invoice: invoice as Invoice,
-          transaction: transaction as Transaction,
+          invoice: {
+            ...invoice,
+            status: newStatus,
+            paid_at: paidAt,
+            paid_amount: newPaidAmount,
+            remaining_amount: newRemaining,
+          } as Invoice,
+          transaction: {
+            ...transaction,
+            invoice_id,
+            potential_invoice_id: null,
+            journal_entry_id: journalEntryId,
+            is_business: true,
+            ...(existingTxCategory ? { category: existingTxCategory } : {}),
+          } as Transaction,
           userId: ctx.userId,
           companyId: ctx.companyId!,
         },
@@ -802,7 +825,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       {
         success: true,
         invoice_status: newStatus,
-        paid_at: isFullyPaid ? now : null,
+        paid_at: paidAt,
         paid_amount: newPaidAmount,
         remaining_amount: newRemaining,
         journal_entry_id: journalEntryId,

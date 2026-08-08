@@ -1,6 +1,8 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { generateTrialBalance } from './trial-balance'
+import { getLatestPostedVouchers } from './latest-vouchers'
 import type {
+  LatestVoucherPerSeries,
   ResultatrapportReport,
   ResultatrapportRow,
   ResultatrapportGroup,
@@ -53,7 +55,18 @@ export async function generateResultatrapport(
   const effectiveFromDate = options?.fromDate ?? period.period_start
   const effectiveToDate = options?.toDate ?? period.period_end
 
+  // Exclude year-end closing entries. Without this a closed year reads ZERO on
+  // every line: the resultatavslut posts the mirror image of each P&L account
+  // into 2099 inside the same period, so the period movements this report sums
+  // net out exactly.
+  //
+  // 'exclude-all-year-end', NOT 'exclude-final', so this report keeps showing
+  // the same profit as the formal Resultaträkning. Moving
+  // generateIncomeStatement to 'exclude-final' is Stage 2 of #1051 and
+  // deliberately deferred: see DECISIONS.md:632. When that lands, this call
+  // site moves with it.
   const currentTb = await generateTrialBalance(supabase, companyId, fiscalPeriodId, {
+    closingEntry: 'exclude-all-year-end',
     fromDate: options?.fromDate,
     toDate: options?.toDate,
     dimensions: options?.dimensions,
@@ -97,7 +110,11 @@ export async function generateResultatrapport(
         .single()
 
       if (prior) {
-        const priorTb = await generateTrialBalance(supabase, companyId, priorPeriodId)
+        // Same exclusion as the current period: a prior year is almost always
+        // closed, so without it the comparison column reads zero throughout.
+        const priorTb = await generateTrialBalance(supabase, companyId, priorPeriodId, {
+          closingEntry: 'exclude-all-year-end',
+        })
         priorRows = filterPnl(priorTb.rows)
         priorPeriodInfo = { start: prior.period_start, end: prior.period_end }
       }
@@ -128,6 +145,7 @@ export async function generateResultatrapport(
         const to = shiftedTo < p.period_end ? shiftedTo : p.period_end
         if (from > to) continue
         const tbPart = await generateTrialBalance(supabase, companyId, p.id, {
+          closingEntry: 'exclude-all-year-end',
           fromDate: from,
           toDate: to,
         })
@@ -157,12 +175,31 @@ export async function generateResultatrapport(
   const netResultCurrent = sumNet(currentRows)
   const netResultPrior = sumNet(priorRows)
 
+  // Reconciliation aid for the header: which vouchers are actually in here.
+  // Scoped to the reported window, so a Q1 report says something true about Q1.
+  // Dimension filter: skipped entirely. The report already discloses that it is
+  // partial, and an unfiltered voucher range next to a filtered result invites
+  // exactly the wrong conclusion during avstämning.
+  // Best-effort: a header nicety never breaks the report.
+  let latestVouchers: LatestVoucherPerSeries[] = []
+  if (!options?.dimensions) {
+    try {
+      latestVouchers = await getLatestPostedVouchers(supabase, companyId, fiscalPeriodId, {
+        fromDate: effectiveFromDate,
+        toDate: effectiveToDate,
+      })
+    } catch {
+      // Best-effort header line only.
+    }
+  }
+
   return {
     groups,
     net_result_current: round2(netResultCurrent),
     net_result_prior: round2(netResultPrior),
     period: { start: effectiveFromDate, end: effectiveToDate },
     prior_period: priorPeriodInfo,
+    ...(latestVouchers.length > 0 ? { latest_vouchers: latestVouchers } : {}),
   }
 }
 

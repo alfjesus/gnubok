@@ -12,11 +12,15 @@ import { formatCurrency, formatDate } from '@/lib/utils'
 import { linkDocuments, formatFailedDocumentNames } from '@/lib/documents/link-documents'
 import { ArrowUpRight, ArrowDownRight, Check, Paperclip, ChevronDown, ChevronUp, AlertTriangle } from 'lucide-react'
 import { getDefaultAccountForCategory } from '@/lib/bookkeeping/category-mapping'
-import type { BookingTemplate } from '@/lib/bookkeeping/booking-templates'
+import { isCounterpartyTemplateId } from '@/lib/bookkeeping/counterparty-templates'
+import { getVatRate } from '@/lib/bookkeeping/vat-entries'
+import type { ReviewTemplate } from '@/lib/transactions/quick-review-defaults'
+import { resolveExplicitVat } from '@/lib/transactions/quick-review-defaults'
 import { resolveSekAmount } from '@/lib/bookkeeping/currency-utils'
 import { formatAccountWithName } from '@/lib/bookkeeping/client-account-names'
 import JournalEntryPreview from './JournalEntryPreview'
 import AccountCombobox from '@/components/bookkeeping/AccountCombobox'
+import LineDimensionFields from '@/components/dimensions/LineDimensionFields'
 import DocumentUploadZone from '@/components/bookkeeping/DocumentUploadZone'
 import DocumentViewerPane from '@/components/bookkeeping/DocumentViewerPane'
 import type { UploadedFile } from '@/components/bookkeeping/DocumentUploadZone'
@@ -32,18 +36,26 @@ interface QuickReviewDialogProps {
   transaction: TransactionWithInvoice | null
   category: TransactionCategory | null
   categoryLabel: string
+  /** Empty string when there is no sensible default: never undefined. */
   defaultAccount: string
   defaultVat: VatTreatment | 'none'
   entityType?: EntityType
-  template?: BookingTemplate | null
+  template?: ReviewTemplate | null
   templateId?: string
   counterpartyLinePattern?: LinePatternEntry[] | null
+  /**
+   * Learned bag from the counterparty template (default_dimensions): prefills
+   * the picker so the user sees, and can change, what the booking will be
+   * tagged with.
+   */
+  counterpartyDefaultDimensions?: Record<string, string> | null
   onConfirm: (
     id: string,
     category: TransactionCategory,
     vatTreatment: VatTreatment | undefined,
     accountOverride: string | undefined,
-    templateId?: string
+    templateId?: string,
+    dimensions?: Record<string, string>
   ) => Promise<string | null>
   onChangeTemplate?: () => void
 }
@@ -60,6 +72,7 @@ export default function QuickReviewDialog({
   template,
   templateId,
   counterpartyLinePattern,
+  counterpartyDefaultDimensions,
   onConfirm,
   onChangeTemplate,
 }: QuickReviewDialogProps) {
@@ -67,7 +80,12 @@ export default function QuickReviewDialog({
   const tCat = useTranslations('tx_categories')
   const { toast } = useToast()
   const router = useRouter()
-  const [accountOverride, setAccountOverride] = useState(defaultAccount)
+  // `?? ''` is deliberate belt-and-braces: the prop is a required string, but
+  // a caller that hands over a template-shaped object missing debit_account
+  // used to make this undefined and take the whole page down on the
+  // .startsWith() below. An empty account disables the confirm button; it
+  // never throws.
+  const [accountOverride, setAccountOverride] = useState(defaultAccount ?? '')
   const [vatTreatment, setVatTreatment] = useState<VatTreatment | 'none'>(defaultVat)
   const [accounts, setAccounts] = useState<BASAccount[]>([])
   const [isProcessing, setIsProcessing] = useState(false)
@@ -81,13 +99,21 @@ export default function QuickReviewDialog({
   const [enrichedTx, setEnrichedTx] = useState<TransactionWithInvoice | null>(transaction)
   const [rateLoading, setRateLoading] = useState(false)
   const [rateError, setRateError] = useState<string | null>(null)
+  // Dimension tagging (kostnadsställe/projekt): the picker renders only when
+  // company_settings.dimensions_enabled, same gate as BulkBookDialog. Seeded
+  // from the counterparty template's learned bag so the user sees what the
+  // booking will carry and can change it.
+  const [dimensionsEnabled, setDimensionsEnabled] = useState(false)
+  const [dims, setDims] = useState<Record<string, string>>(
+    () => ({ ...(counterpartyDefaultDimensions ?? {}) }),
+  )
 
   const preAttachedDocumentId = transaction?.document_id ?? null
 
   // Handle account changes: clear VAT for liability/equity accounts (class 2)
   const handleAccountChange = useCallback((account: string) => {
-    setAccountOverride(account)
-    if (account.startsWith('2')) {
+    setAccountOverride(account ?? '')
+    if (account?.startsWith('2')) {
       setVatTreatment('none')
     }
   }, [])
@@ -113,7 +139,27 @@ export default function QuickReviewDialog({
   useEffect(() => {
     setEnrichedTx(transaction)
     setRateError(null)
+    setDims({ ...(counterpartyDefaultDimensions ?? {}) })
+    // Re-seeding on counterpartyDefaultDimensions alone would clobber in-
+    // flight edits; the bag only changes together with the transaction.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [transaction])
+
+  // Company settings gate the dimension affordance (dimensions_enabled).
+  // Fetched once per open; on failure the picker simply stays hidden.
+  useEffect(() => {
+    if (!open) return
+    let cancelled = false
+    fetch('/api/settings')
+      .then((r) => r.json())
+      .then(({ data }) => {
+        if (!cancelled) setDimensionsEnabled(data?.dimensions_enabled === true)
+      })
+      .catch(() => {
+        if (!cancelled) setDimensionsEnabled(false)
+      })
+    return () => { cancelled = true }
+  }, [open])
 
   // Backfill the SEK conversion on demand. resolveSekAmount silently falls
   // back to the raw foreign amount when amount_sek/exchange_rate are null,
@@ -163,9 +209,17 @@ export default function QuickReviewDialog({
 
   const tx = enrichedTx ?? transaction
   const isIncome = tx.amount > 0
-  const isCounterpartyTemplate = !!(counterpartyLinePattern && counterpartyLinePattern.length > 0)
+  // Keyed off the template ID, not off the presence of a line pattern: a
+  // *learned* counterparty (one business line, no pattern) is still booked
+  // server-side from counterparty_template_id, so its accounts and VAT come
+  // from the stored template. Deciding this from counterparties that happen
+  // to have a multi-line pattern made single-line ones fall through to the
+  // category branch, which previewed the wrong accounts and offered an
+  // account/VAT editor whose values the categorize route discards.
+  const isCounterpartyTemplate = !!template?.id && isCounterpartyTemplateId(template.id)
+  const hasCounterpartyPattern = !!(counterpartyLinePattern && counterpartyLinePattern.length > 0)
   const isTemplateBooking = !!templateId || isCounterpartyTemplate
-  const isLiabilityAccount = accountOverride.startsWith('2')
+  const isLiabilityAccount = accountOverride?.startsWith('2') ?? false
   // For non-SEK transactions, the verifikation and the headline must show
   // the SEK-converted total: the mall/category booking always posts in SEK.
   const sekAmount = resolveSekAmount(
@@ -197,13 +251,31 @@ export default function QuickReviewDialog({
     setIsProcessing(true)
     setError(null)
     try {
-      const resolvedVat = vatTreatment === 'none' ? undefined : vatTreatment
+      // 'none' as the seeded default stays off the wire (server derives, no
+      // VAT line); 'none' as a user deviation goes as explicit 'exempt'. The
+      // old unconditional collapse re-derived the default server-side and
+      // booked 25% moms against an explicit "Ingen moms" while the preview
+      // showed none. See resolveExplicitVat.
+      const resolvedVat = resolveExplicitVat(vatTreatment, defaultVat)
       const catDefault = getDefaultAccountForCategory(category)
       const override = accountOverride && accountOverride !== catDefault
         ? accountOverride
         : undefined
 
-      const journalEntryId = await onConfirm(transaction.id, category, resolvedVat, override, templateId)
+      // Cleared combobox values leave empty strings behind; strip them so an
+      // untouched picker sends no bag at all (learned template bags then apply
+      // server-side unchanged).
+      const cleanedDims = Object.fromEntries(
+        Object.entries(dims).filter(([, code]) => code && code.trim().length > 0),
+      )
+      const journalEntryId = await onConfirm(
+        transaction.id,
+        category,
+        resolvedVat,
+        override,
+        templateId,
+        Object.keys(cleanedDims).length > 0 ? cleanedDims : undefined,
+      )
 
       // Attach the uploaded underlag to the verifikat the booking just created.
       // BFL 5 kap 7 § requires the verifikation to reference its underlag and
@@ -349,7 +421,7 @@ export default function QuickReviewDialog({
                 {patternDimsLabel}
               </Badge>
             )}
-            {onChangeTemplate && !isCounterpartyTemplate && (
+            {onChangeTemplate && !hasCounterpartyPattern && (
               <button
                 type="button"
                 className="text-xs text-primary hover:underline"
@@ -359,7 +431,10 @@ export default function QuickReviewDialog({
               </button>
             )}
           </div>
-          {template && !isCounterpartyTemplate && (
+          {/* Only when there IS a single debit/credit pair to show: a
+              multi-line counterparty pattern has none, and a template that
+              never carried accounts would render "D:  → K: ". */}
+          {!hasCounterpartyPattern && template?.debit_account && template?.credit_account && (
             <p className="mt-1.5 text-xs font-mono text-muted-foreground">
               D: {formatAccountWithName(template.debit_account)} → K: {formatAccountWithName(template.credit_account)}
             </p>
@@ -402,15 +477,26 @@ export default function QuickReviewDialog({
           <JournalEntryPreview
             amount={tx.amount}
             amountSek={sekAmount}
-            {...(isCounterpartyTemplate
+            {...(hasCounterpartyPattern
               ? { linePattern: counterpartyLinePattern ?? undefined }
-              : templateId && template
+              : isTemplateBooking && template?.debit_account && template?.credit_account
                 ? {
                     templateDebitAccount: template.debit_account,
                     templateCreditAccount: template.credit_account,
-                    templateVatRate: template.vat_rate,
-                    templateVatTreatment: template.vat_treatment,
-                    templateSupplierType: template.reverse_charge_supplier_type,
+                    // A counterparty template carries a treatment but no rate,
+                    // and its legacy booking path emits an input-VAT leg from
+                    // that treatment only (no basbelopp pair), so it gets the
+                    // rate alone: passing the treatment too would preview
+                    // reverse-charge lines the engine never books.
+                    templateVatRate: isCounterpartyTemplate
+                      ? (template.vat_treatment ? getVatRate(template.vat_treatment) : 0)
+                      : template.vat_rate,
+                    ...(isCounterpartyTemplate
+                      ? {}
+                      : {
+                          templateVatTreatment: template.vat_treatment,
+                          templateSupplierType: template.reverse_charge_supplier_type,
+                        }),
                   }
                 : { category, vatTreatment: isLiabilityAccount ? 'none' : vatTreatment, accountOverride, entityType }
             )}
@@ -462,6 +548,30 @@ export default function QuickReviewDialog({
               </div>
             </div>
           </>
+        )}
+
+        {/* Dimension tags (kostnadsställe/projekt): rendered for category,
+            library-template and legacy counterparty bookings. Multi-line
+            counterparty patterns are excluded: their per-line bags are
+            authoritative server-side and an edit here would be ignored. */}
+        {dimensionsEnabled && !hasCounterpartyPattern && (
+          <div>
+            <label className="text-sm font-medium text-muted-foreground">{t('label_dimensions')}</label>
+            <div className="mt-1">
+              <LineDimensionFields
+                dimensions={dims}
+                onChange={(sieDimNo, code) => {
+                  setDims((prev) => {
+                    const next = { ...prev }
+                    if (code) next[sieDimNo] = code
+                    else delete next[sieDimNo]
+                    return next
+                  })
+                }}
+                inputClassName="h-8"
+              />
+            </div>
+          </div>
         )}
 
         {/* No pre-attached document: let the user upload one. (When a document

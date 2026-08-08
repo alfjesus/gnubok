@@ -7,6 +7,18 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 let resultIdx: number
 let results: Array<{ data?: unknown; error?: unknown }>
 
+/**
+ * The company's own class 3 accounts, as fetchDynamicRuta05Accounts reads
+ * them. Answered off a table-routed builder rather than the sequential queue:
+ * every calculateVatDeclaration test would otherwise have to seed one, and a
+ * missing seed would silently hand the chart query the ledger result.
+ */
+let chartAccounts: Array<{
+  account_number: string
+  account_name?: string
+  default_vat_rate: number | null
+}>
+
 function makeBuilder() {
   const b: Record<string, unknown> = {}
   for (const m of ['select', 'eq', 'neq', 'in', 'gte', 'lte', 'lt', 'or', 'not', 'order', 'range', 'limit']) {
@@ -18,9 +30,29 @@ function makeBuilder() {
   return b
 }
 
+/**
+ * chart_of_accounts builder. The real query returns all active class 3 rows:
+ * fetchDynamicRuta05Accounts applies configured-rate and narrow missing-rate
+ * fallback rules in memory.
+ */
+function makeChartBuilder() {
+  const b: Record<string, unknown> = {}
+  for (const m of ['select', 'eq', 'in', 'not', 'order', 'range']) {
+    b[m] = vi.fn().mockReturnValue(b)
+  }
+  b.then = (resolve: (v: unknown) => void) =>
+    resolve({
+      data: chartAccounts.map((account) => ({ account_name: '', ...account })),
+      error: null,
+    })
+  return b
+}
+
 function makeClient() {
   return {
-    from: vi.fn().mockImplementation(() => makeBuilder()),
+    from: vi.fn().mockImplementation((table: string) =>
+      table === 'chart_of_accounts' ? makeChartBuilder() : makeBuilder()
+    ),
     rpc: vi.fn().mockImplementation(async () => results[resultIdx++] ?? { data: null, error: null }),
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   } as any
@@ -66,6 +98,7 @@ import {
   getVatDeclarationSummary,
   calculateVatDeclaration,
   rcInputTotalsFromDeclaration,
+  rutorFromTotals,
 } from '../vat-declaration'
 import { runVatDeclarationChecks } from '../vat-declaration-checks'
 import type { VatDeclaration } from '@/types'
@@ -76,12 +109,37 @@ beforeEach(() => {
   vi.clearAllMocks()
   resultIdx = 0
   results = []
+  chartAccounts = []
   supabase = makeClient()
 })
 
 // ============================================================
 // Pure function tests: no mocks needed
 // ============================================================
+
+describe('rutorFromTotals: ruta 41 (omvänd skattskyldighet, sales side)', () => {
+  it('projects 3231/3232/3233 credit balances into ruta 41', () => {
+    const totals = new Map([
+      ['3231', { debit: 0, credit: 100_000 }],
+      ['3232', { debit: 500, credit: 10_500 }],
+      ['3233', { debit: 0, credit: 0 }],
+    ])
+    const rutor = rutorFromTotals(totals)
+    expect(rutor.ruta41).toBe(110_000)
+    // Buyer accounts for the VAT: an RC sale must not leak into the
+    // taxable-sales pairing (rutor 05-08) nor into the net (ruta 49).
+    expect(rutor.ruta05).toBe(0)
+    expect(rutor.ruta49).toBe(0)
+  })
+
+  it('a pure ruta 41 declaration passes the sales/output pairing checks', () => {
+    const totals = new Map([['3231', { debit: 0, credit: 50_000 }]])
+    const rutor = rutorFromTotals(totals)
+    const findings = runVatDeclarationChecks(rutor)
+    expect(findings.map((f) => f.code)).not.toContain('TAXABLE_SALES_WITHOUT_OUTPUT')
+    expect(findings.map((f) => f.code)).not.toContain('OUTPUT_VAT_WITHOUT_SALES_BASE')
+  })
+})
 
 describe('calculatePeriodDates', () => {
   it('returns correct dates for monthly period', () => {
@@ -896,6 +954,362 @@ describe('calculateVatDeclaration: parent/summary accounts', () => {
   })
 })
 
+// ============================================================
+// #1261: the company's OWN revenue accounts reach ruta 05.
+//
+// ACCOUNT_RUTA maps 3000-3003 only, and Accounted's BAS chart ships no
+// varugrupp accounts at all, so a company selling on 3013 had that revenue
+// dropped from the declaration entirely: the map's keys ARE the account filter
+// sent to the aggregation RPC. Membership now comes from the konto's own
+// "Standard moms" (chart_of_accounts.default_vat_rate).
+// ============================================================
+
+describe('calculateVatDeclaration: company-specific ruta 05 accounts', () => {
+  it('infers a missing rate only from a matching domestic-sales number and label (#1289)', async () => {
+    chartAccounts = [{
+      account_number: '3011',
+      account_name: 'Försäljning tjänster inom Sverige, 25 % moms',
+      default_vat_rate: null,
+    }]
+    seedLedger([
+      { account_number: '3011', debit_amount: 0, credit_amount: 9725 },
+      { account_number: '2611', debit_amount: 0, credit_amount: 2431.25 },
+    ])
+
+    const result = await calculateVatDeclaration(supabase, 'company-1', 'monthly', 2024, 1)
+    const findings = runVatDeclarationChecks(result.rutor)
+
+    expect(result.rutor.ruta05).toBe(9725)
+    expect(result.rutor.ruta10).toBe(2431.25)
+    expect(result.breakdown.invoices.base25).toBe(9725)
+    expect(findings.map((f) => f.code)).not.toContain('OUTPUT_VAT_WITHOUT_SALES_BASE')
+  })
+
+  it('includes a user-added revenue account carrying a moms-sats', async () => {
+    chartAccounts = [{ account_number: '3013', default_vat_rate: 0.06 }]
+    seedLedger([
+      { account_number: '3013', debit_amount: 0, credit_amount: 8000 },
+      { account_number: '2631', debit_amount: 0, credit_amount: 480 },
+    ])
+
+    const result = await calculateVatDeclaration(supabase, 'company-1', 'monthly', 2024, 1)
+
+    expect(result.rutor.ruta05).toBe(8000)
+    expect(result.rutor.ruta12).toBe(480)
+  })
+
+  it('books the account into the base bucket of its own sats', async () => {
+    // Without this the ruta 05 total would have no matching base25/12/6, and
+    // the proportional SALES_OUTPUT_VAT_SHORTFALL check reads an unaccounted
+    // base as missing utgående moms.
+    chartAccounts = [
+      { account_number: '3011', default_vat_rate: 0.25 },
+      { account_number: '3013', default_vat_rate: 0.06 },
+    ]
+    seedLedger([
+      { account_number: '3011', debit_amount: 0, credit_amount: 4000 },
+      { account_number: '3013', debit_amount: 0, credit_amount: 1000 },
+      { account_number: '3001', debit_amount: 0, credit_amount: 2000 },
+    ])
+
+    const result = await calculateVatDeclaration(supabase, 'company-1', 'monthly', 2024, 1)
+
+    expect(result.rutor.ruta05).toBe(7000)
+    expect(result.breakdown.invoices.base25).toBe(6000)  // 3001 + 3011
+    expect(result.breakdown.invoices.base6).toBe(1000)   // 3013
+    expect(result.breakdown.invoices.base12).toBe(0)
+  })
+
+  it('counts a 3000 gruppkonto balance in ruta 05 exactly once', async () => {
+    // 3000 is already summed into ruta 05 by the static map. Surfacing its
+    // "Standard moms" must not also add it to the dynamic account list, which
+    // would double the filed figure.
+    chartAccounts = [{ account_number: '3000', default_vat_rate: 0.25 }]
+    seedLedger([
+      { account_number: '3000', debit_amount: 0, credit_amount: 5000 },
+      { account_number: '2611', debit_amount: 0, credit_amount: 1250 },
+    ])
+
+    const result = await calculateVatDeclaration(supabase, 'company-1', 'monthly', 2024, 1)
+
+    expect(result.rutor.ruta05).toBe(5000)
+    expect(result.rutor.ruta10).toBe(1250)
+  })
+
+  it('books a rated 3000 into its base bucket so the split adds up to ruta 05', async () => {
+    chartAccounts = [{ account_number: '3000', default_vat_rate: 0.25 }]
+    seedLedger([
+      { account_number: '3000', debit_amount: 0, credit_amount: 5000 },
+      { account_number: '3001', debit_amount: 0, credit_amount: 2000 },
+    ])
+
+    const result = await calculateVatDeclaration(supabase, 'company-1', 'monthly', 2024, 1)
+
+    expect(result.rutor.ruta05).toBe(7000)
+    expect(result.breakdown.invoices.base25).toBe(7000)  // 3001 + 3000
+    expect(result.breakdown.invoices.base12).toBe(0)
+    expect(result.breakdown.invoices.base6).toBe(0)
+  })
+
+  it('leaves 3000 in ruta 05 with no base bucket when no sats is set', async () => {
+    // The filed figure is unaffected: only the breakdown is incomplete, and
+    // the checks derive their expected base from the output-VAT rutor.
+    chartAccounts = []
+    seedLedger([{ account_number: '3000', debit_amount: 0, credit_amount: 5000 }])
+
+    const result = await calculateVatDeclaration(supabase, 'company-1', 'monthly', 2024, 1)
+
+    expect(result.rutor.ruta05).toBe(5000)
+    expect(result.breakdown.invoices.base25).toBe(0)
+  })
+
+  it('nets a credit note booked as a debit on the account', async () => {
+    chartAccounts = [{ account_number: '3013', default_vat_rate: 0.06 }]
+    seedLedger([
+      { account_number: '3013', debit_amount: 0, credit_amount: 8000 },
+      { account_number: '3013', debit_amount: 1000, credit_amount: 0 },
+    ])
+
+    const result = await calculateVatDeclaration(supabase, 'company-1', 'monthly', 2024, 1)
+
+    expect(result.rutor.ruta05).toBe(7000)
+    expect(result.breakdown.invoices.base6).toBe(7000)
+  })
+
+  it('does not double-count an account the static map already owns', async () => {
+    // The BAS backfill sets 3001 = 25 %, so it comes back from the chart query
+    // too. Counting it in both projections would double ruta 05.
+    chartAccounts = [{ account_number: '3001', default_vat_rate: 0.25 }]
+    seedLedger([
+      { account_number: '3001', debit_amount: 0, credit_amount: 10000 },
+    ])
+
+    const result = await calculateVatDeclaration(supabase, 'company-1', 'monthly', 2024, 1)
+
+    expect(result.rutor.ruta05).toBe(10000)
+    expect(result.breakdown.invoices.base25).toBe(10000)
+  })
+
+  it('leaves accounts that belong to another ruta out of ruta 05', async () => {
+    // VMB (3211) is ruta 07 and 3231 is ruta 41. Neither is mappable yet, so
+    // they stay out of the declaration: filing an amount in the wrong box is
+    // worse than omitting it.
+    chartAccounts = [
+      { account_number: '3211', default_vat_rate: 0.25 },
+      { account_number: '3231', default_vat_rate: 0.25 },
+    ]
+    seedLedger([
+      { account_number: '3211', debit_amount: 0, credit_amount: 5000 },
+      { account_number: '3231', debit_amount: 0, credit_amount: 3000 },
+    ])
+
+    const result = await calculateVatDeclaration(supabase, 'company-1', 'monthly', 2024, 1)
+
+    expect(result.rutor.ruta05).toBe(0)
+  })
+
+  it('keeps an account the ACCOUNT_TO_BOX mirror already maps in its own ruta', async () => {
+    // 3108 is momsfri EU-leverans (ruta 35). A user who sets a sats on it must
+    // not move it to ruta 05.
+    chartAccounts = [{ account_number: '3108', default_vat_rate: 0.25 }]
+    seedLedger([{ account_number: '3108', debit_amount: 0, credit_amount: 4000 }])
+
+    const result = await calculateVatDeclaration(supabase, 'company-1', 'monthly', 2024, 1)
+
+    expect(result.rutor.ruta35).toBe(4000)
+    expect(result.rutor.ruta05).toBe(0)
+  })
+
+  it('routes momspliktig EU-försäljning (3106) to ruta 05', async () => {
+    // 3106 carries Swedish moms (buyer not VAT-registered), so it is ordinary
+    // momspliktig försäljning. Neither ACCOUNT_RUTA nor the mirror maps it; the
+    // MCP report has widened ruta 05 with it by hand for the same reason.
+    chartAccounts = [{ account_number: '3106', default_vat_rate: 0.25 }]
+    seedLedger([
+      { account_number: '3106', debit_amount: 0, credit_amount: 2000 },
+      { account_number: '2611', debit_amount: 0, credit_amount: 500 },
+    ])
+
+    const result = await calculateVatDeclaration(supabase, 'company-1', 'monthly', 2024, 1)
+
+    expect(result.rutor.ruta05).toBe(2000)
+    expect(result.breakdown.invoices.base25).toBe(2000)
+  })
+
+  it('ignores missing rates without matching evidence and keeps explicit 0 % authoritative', async () => {
+    // A number or a free-text label alone is not enough, and an explicit
+    // "Ingen moms" always wins over the fallback convention.
+    chartAccounts = [
+      { account_number: '3013', account_name: 'Varugrupp C', default_vat_rate: null },
+      { account_number: '3011', account_name: 'Varugrupp A, 25 % moms', default_vat_rate: 0 },
+      { account_number: '3098', account_name: 'Försäljning 25 % moms', default_vat_rate: null },
+      { account_number: '3023', account_name: 'Försäljning 25 % moms', default_vat_rate: null },
+    ]
+    seedLedger([
+      { account_number: '3013', debit_amount: 0, credit_amount: 8000 },
+      { account_number: '3011', debit_amount: 0, credit_amount: 2000 },
+      { account_number: '3098', debit_amount: 0, credit_amount: 1000 },
+      { account_number: '3023', debit_amount: 0, credit_amount: 500 },
+    ])
+
+    const result = await calculateVatDeclaration(supabase, 'company-1', 'monthly', 2024, 1)
+
+    expect(result.rutor.ruta05).toBe(0)
+  })
+
+  it('requires the word "moms" after the percent and refuses an ambiguous label', async () => {
+    // Two deliberate rules, pinned here so neither is loosened by accident:
+    //   - a bare percent is not a moms-sats. "provision 25 %" and "konsult 25 %"
+    //     are a margin and a rate of pay; reading either as a sats would file
+    //     revenue into ruta 05 off a word the user never wrote.
+    //   - a label naming two different sats resolves to nothing rather than to
+    //     whichever it spells out first: neither figure is trustworthy, and
+    //     picking one silently splits breakdown.invoices.base25/12/6 wrong.
+    chartAccounts = [
+      { account_number: '3011', account_name: 'Försäljning konsult 25 %', default_vat_rate: null },
+      {
+        account_number: '3021',
+        account_name: 'Försäljning varugrupp 1, provision 25 %',
+        default_vat_rate: null,
+      },
+      {
+        account_number: '3031',
+        account_name: 'Försäljning 25 % moms och 6 % moms',
+        default_vat_rate: null,
+      },
+    ]
+    seedLedger([
+      { account_number: '3011', debit_amount: 0, credit_amount: 4000 },
+      { account_number: '3021', debit_amount: 0, credit_amount: 3000 },
+      { account_number: '3031', debit_amount: 0, credit_amount: 2000 },
+    ])
+
+    const result = await calculateVatDeclaration(supabase, 'company-1', 'monthly', 2024, 1)
+
+    expect(result.rutor.ruta05).toBe(0)
+  })
+
+  it('lets a contradicting label veto the fallback even when number and sats agree', async () => {
+    // The 30x1 suffix and the "25 % moms" label both point at domestic taxable
+    // sales, but the rest of the name says the konto is something else: omvänd
+    // betalningsskyldighet belongs in ruta 41, VMB in ruta 07, export in
+    // ruta 36 and momsfritt in ruta 42. Ruta 05 is the wrong box for all four,
+    // so the fallback stands down and the konto keeps its unresolved
+    // behaviour (omission) rather than being filed somewhere it does not go.
+    chartAccounts = [
+      {
+        account_number: '3011',
+        account_name: 'Försäljning byggtjänster 25 % moms, omvänd betalningsskyldighet',
+        default_vat_rate: null,
+      },
+      {
+        account_number: '3021',
+        account_name: 'Försäljning begagnat 25 % moms (VMB)',
+        default_vat_rate: null,
+      },
+      {
+        account_number: '3031',
+        account_name: 'Export utanför EU, tidigare 25 % moms',
+        default_vat_rate: null,
+      },
+      {
+        account_number: '3041',
+        account_name: 'Momsfri försäljning, tidigare 25 % moms',
+        default_vat_rate: null,
+      },
+    ]
+    seedLedger([
+      { account_number: '3011', debit_amount: 0, credit_amount: 5000 },
+      { account_number: '3021', debit_amount: 0, credit_amount: 4000 },
+      { account_number: '3031', debit_amount: 0, credit_amount: 3000 },
+      { account_number: '3041', debit_amount: 0, credit_amount: 2000 },
+    ])
+
+    const result = await calculateVatDeclaration(supabase, 'company-1', 'monthly', 2024, 1)
+
+    expect(result.rutor.ruta05).toBe(0)
+  })
+
+  it('does not let a percentage ending in zero trip the 0 % veto', async () => {
+    // The veto's "0 %" alternative needs a leading word boundary: without one it
+    // also matches the trailing zero of "10/20/30/100 %", so an ordinary
+    // domestic sales konto whose name happens to mention a discount or a share
+    // would be dropped from ruta 05 and then raise a blocking
+    // OUTPUT_VAT_WITHOUT_SALES_BASE. Both names below are momspliktig
+    // försäljning inom Sverige: agreeing 30x1 suffix, agreeing "25 % moms".
+    chartAccounts = [
+      {
+        account_number: '3011',
+        account_name: 'Försäljning varor 25 % moms, rabatt 30 %',
+        default_vat_rate: null,
+      },
+      {
+        account_number: '3021',
+        account_name: 'Försäljning varor 25 % moms, 100 % ägt dotterbolag',
+        default_vat_rate: null,
+      },
+    ]
+    seedLedger([
+      { account_number: '3011', debit_amount: 0, credit_amount: 5000 },
+      { account_number: '3021', debit_amount: 0, credit_amount: 3000 },
+    ])
+
+    const result = await calculateVatDeclaration(supabase, 'company-1', 'monthly', 2024, 1)
+
+    expect(result.rutor.ruta05).toBe(8000)
+  })
+
+  it('still vetoes a konto whose label states a genuine 0 % sats', async () => {
+    // The other side of the boundary fix: a real "0 %" label must keep vetoing.
+    chartAccounts = [
+      {
+        account_number: '3011',
+        account_name: 'Försäljning 0 % moms',
+        default_vat_rate: null,
+      },
+    ]
+    seedLedger([{ account_number: '3011', debit_amount: 0, credit_amount: 5000 }])
+
+    const result = await calculateVatDeclaration(supabase, 'company-1', 'monthly', 2024, 1)
+
+    expect(result.rutor.ruta05).toBe(0)
+  })
+
+  it('adds the accounts to p_accounts but never to p_ruta_accounts', async () => {
+    // p_ruta_accounts is the settlement SHAPE detector inside the RPC: an entry
+    // touching it plus 2650/1650 is classified a momsredovisning and dropped
+    // from the totals. A plain sale booked 1930 / 3013 / 2650 would then vanish
+    // from its own declaration. This is invisible to an outcome assertion, so
+    // assert the RPC arguments directly.
+    chartAccounts = [{ account_number: '3013', default_vat_rate: 0.06 }]
+    seedLedger([{ account_number: '3013', debit_amount: 0, credit_amount: 8000 }])
+
+    await calculateVatDeclaration(supabase, 'company-1', 'monthly', 2024, 1)
+
+    const [, args] = supabase.rpc.mock.calls[0]
+    expect(args.p_accounts).toContain('3013')
+    expect(args.p_ruta_accounts).not.toContain('3013')
+    expect(args.p_ruta_accounts).toContain('3001') // static list still intact
+  })
+
+  it('clears the blocking OUTPUT_VAT_WITHOUT_SALES finding (#1261)', async () => {
+    // The reported symptom was not just an understated ruta 05: with ruta05 = 0
+    // and output VAT on 2611, runVatDeclarationChecks failed the declaration
+    // with a blocking ERROR and the user could not file at all.
+    chartAccounts = [{ account_number: '3013', default_vat_rate: 0.06 }]
+    seedLedger([
+      { account_number: '3013', debit_amount: 0, credit_amount: 8000 },
+      { account_number: '2631', debit_amount: 0, credit_amount: 480 },
+    ])
+
+    const result = await calculateVatDeclaration(supabase, 'company-1', 'monthly', 2024, 1)
+    const findings = runVatDeclarationChecks(result.rutor)
+
+    expect(findings.map((f) => f.code)).not.toContain('OUTPUT_VAT_WITHOUT_SALES')
+    expect(findings.map((f) => f.code)).not.toContain('SALES_OUTPUT_VAT_SHORTFALL')
+  })
+})
+
 describe('calculateVatDeclaration: annual VAT spans the räkenskapsår', () => {
   it('uses the fiscal period bounds for yearly when a fiscalPeriodId is given', async () => {
     // Förlängt räkenskapsår (extended first year, 18 months): annual VAT
@@ -977,9 +1391,10 @@ describe('calculateVatDeclaration: annual VAT spans the räkenskapsår', () => {
 
     expect(result.period.start).toBe('2026-03-01')
     expect(result.period.end).toBe('2026-03-31')
-    // The räkenskapsår path is yearly-only: monthly makes no table query at
-    // all, just the single totals RPC.
-    expect(supabase.from).not.toHaveBeenCalled()
+    // The räkenskapsår path is yearly-only: monthly never touches
+    // fiscal_periods. (chart_of_accounts is read on every period type, for the
+    // company's own ruta 05 accounts.)
+    expect(supabase.from).not.toHaveBeenCalledWith('fiscal_periods')
     expect(supabase.rpc).toHaveBeenCalledTimes(1)
   })
 })

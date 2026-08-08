@@ -76,9 +76,9 @@ export const EXTENSION_DEFINITIONS: Record<string, ExtensionDefinition[]> = {
           "icon": "Cloud",
           "dataPattern": "manual",
           "description": "Synka säkerhetsbackup till din egen molnlagring",
-          "longDescription": "Koppla ditt Google Drive-konto och ladda upp en fullständig säkerhetsbackup med ett klick. Accounted skapar en ZIP med SIE-filer, kvitton och behandlingshistorik och laddar upp till en egen mapp i din Drive. Perfekt för att uppfylla egna krav på redundans.",
+          "longDescription": "Koppla ditt Google Drive- eller Dropbox-konto och ladda upp en fullständig säkerhetsbackup med ett klick. Accounted skapar en ZIP med SIE-filer, kvitton och behandlingshistorik och laddar upp till en egen mapp i din molnlagring. Du kan koppla båda samtidigt, med separata scheman. Perfekt för att uppfylla egna krav på redundans.",
           "hasOwnData": true,
-          "subscriptionNotice": "Kräver ett Google-konto. Uppladdningar sker direkt till din Drive: ingen data lagras hos tredje part utöver Google."
+          "subscriptionNotice": "Kräver ett Google- eller Dropbox-konto. Uppladdningar sker direkt till din egen molnlagring: ingen data lagras hos tredje part utöver den tjänst du väljer."
     },
     {
           "slug": "skatteverket",
@@ -130,6 +130,33 @@ export const EXTENSION_DEFINITIONS: Record<string, ExtensionDefinition[]> = {
           "longDescription": "Koppla företagets Stripe-konto så skapas en betalningslänk automatiskt när du skickar en faktura. Betalningar prickas av mot rätt faktura och Stripe-utbetalningar bokförs med avgifter och moms.",
           "hasOwnData": true,
           "subscriptionNotice": "Denna integration kräver ett eget Stripe-konto. Stripes transaktionsavgifter tillkommer enligt ditt avtal med Stripe."
+    },
+    {
+          "slug": "whatsapp-inbox",
+          "name": "WhatsApp-inkorg",
+          "sector": "general",
+          "category": "import",
+          "icon": "MessageCircle",
+          "dataPattern": "both",
+          "description": "Skicka kvitton som foto eller PDF till Accounteds WhatsApp-nummer: de landar i Underlag med avlästa fält",
+          "longDescription": "Koppla ditt mobilnummer med en engångskod och skicka sedan kvitton direkt i WhatsApp. Varje kvitto laddas upp till dokumentarkivet, fält som belopp och datum läses av med AI, och du får en bekräftelse i chatten. Bokföringen sker som vanligt i appen.",
+          "readsCoreTables": [
+                "company_members",
+                "document_attachments",
+                "invoice_inbox_items"
+          ],
+          "hasOwnData": true
+    },
+    {
+          "slug": "woocommerce",
+          "name": "WooCommerce",
+          "sector": "general",
+          "category": "import",
+          "icon": "ShoppingCart",
+          "dataPattern": "manual",
+          "description": "Hämta betalda ordrar och återbetalningar från din WooCommerce-butik till transaktionsinkorgen",
+          "longDescription": "Anslut din WooCommerce-butik så hämtas betalda ordrar och återbetalningar automatiskt varje natt till transaktionsinkorgen, som ett bankflöde för butiken. Inget bokförs automatiskt: du bokför raderna själv precis som vanliga banktransaktioner.",
+          "hasOwnData": true
     },
   ],
 }

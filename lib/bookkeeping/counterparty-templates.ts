@@ -339,7 +339,13 @@ export async function findCounterpartyTemplatesBatch(
   }
 
   for (const tx of transactions) {
-    const rawName = tx.merchant_name || tx.description
+    // Identity anchors on the immutable bank original, not the working title:
+    // the ingest boundary strips the trailing channel phrase off description
+    // ("SPOTIFY AB Kortköp" → "SPOTIFY AB") and users can rename it, but
+    // templates were learned from the full bank string, so matching the
+    // original keeps every era's keys and aliases aligned (same rationale as
+    // buildMerchantHistory in lib/transactions/category-suggestions.ts).
+    const rawName = tx.merchant_name || tx.original_description || tx.description
     if (!rawName) continue
 
     const normalized = normalizeCounterpartyName(rawName)
@@ -544,6 +550,11 @@ export function buildMappingResultFromCounterpartyTemplate(
     ),
     default_private: isPrivate,
     vat_lines: vatLines,
+    // Learned bag tags the business line (buildTransactionEntryLines); an
+    // explicitly supplied bag on the categorize call overwrites it afterwards.
+    ...(tmpl.default_dimensions && Object.keys(tmpl.default_dimensions).length > 0
+      ? { dimensions: tmpl.default_dimensions }
+      : {}),
     description: `Motpart: ${tmpl.counterparty_name} (${tmpl.occurrence_count} ggr)`,
   }
 }
@@ -600,6 +611,11 @@ function buildLegacyMismatchResult(
     direction_mismatch: true,
     default_private: false,
     vat_lines: vatLines,
+    // A refund of a tagged expense reduces the same kostnadsställe/projekt,
+    // mirroring how the multi-line path keeps entry bags when mirrored.
+    ...(tmpl.default_dimensions && Object.keys(tmpl.default_dimensions).length > 0
+      ? { dimensions: tmpl.default_dimensions }
+      : {}),
     description: `Motpart: ${tmpl.counterparty_name} (retur/återbetalning)`,
   }
 }
@@ -718,6 +734,13 @@ export interface TemplateUpsertParams {
   lastSeenDate: string | null
   source: CategorizationTemplateSource
   linePattern?: LinePatternEntry[] | null
+  /**
+   * Bag {sie_dim_no: code} from the booking being learned. Latest-explicit-
+   * wins: a non-empty bag replaces the stored default_dimensions, an empty/
+   * omitted bag leaves it untouched (an untagged booking is not evidence the
+   * user stopped tagging this counterparty).
+   */
+  defaultDimensions?: Record<string, string> | null
 }
 
 /**
@@ -812,6 +835,9 @@ export async function insertOrUpdateTemplate(
           source: newSource,
           counterparty_aliases: mergedAliases,
           line_pattern: params.linePattern !== undefined ? params.linePattern : existing.line_pattern,
+          ...(params.defaultDimensions && Object.keys(params.defaultDimensions).length > 0
+            ? { default_dimensions: params.defaultDimensions }
+            : {}),
         })
         .eq('id', existing.id)
       if (error) {
@@ -833,6 +859,9 @@ export async function insertOrUpdateTemplate(
           counterparty_aliases: mergedAliases,
           category: params.category || existing.category,
           ...(params.linePattern !== undefined ? { line_pattern: params.linePattern } : {}),
+          ...(params.defaultDimensions && Object.keys(params.defaultDimensions).length > 0
+            ? { default_dimensions: params.defaultDimensions }
+            : {}),
         })
         .eq('id', existing.id)
       if (error) {
@@ -853,6 +882,7 @@ export async function insertOrUpdateTemplate(
         vat_account: params.vatAccount,
         category: params.category,
         line_pattern: params.linePattern ?? null,
+        default_dimensions: params.defaultDimensions ?? {},
         occurrence_count: params.occurrenceCount,
         confidence: params.confidence,
         last_seen_date: params.lastSeenDate,
@@ -882,7 +912,11 @@ export async function upsertCounterpartyTemplate(
   // flip the template's accounts and poison future matches.
   if (mappingResult.direction_mismatch) return
 
-  const rawName = transaction.merchant_name || transaction.description
+  // Learn from the immutable bank original (see findCounterpartyTemplatesBatch):
+  // learning and lookup MUST derive the key from the same string, or the
+  // ingest-time phrase strip would fork template identities by era.
+  const rawName =
+    transaction.merchant_name || transaction.original_description || transaction.description
   if (!rawName) return
 
   const normalized = normalizeCounterpartyName(rawName)
@@ -904,6 +938,10 @@ export async function upsertCounterpartyTemplate(
     confidence: calculateConfidence(1),
     lastSeenDate: transaction.date,
     source,
+    // The bag the booking actually carried (user-picked or template-applied).
+    // Latest-explicit-wins inside insertOrUpdateTemplate: empty bags never
+    // erase a learned one.
+    defaultDimensions: mappingResult.dimensions ?? null,
   })
 }
 
