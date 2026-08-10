@@ -38,7 +38,7 @@ interface Preview {
   excluded: Array<{ id: string; reason: string }>
   total: number
   debtor_ok: boolean
-  debtor_missing?: 'iban' | 'bic'
+  debtor_missing?: 'iban' | 'bic' | 'org_number'
 }
 
 interface PaymentFileDialogProps {
@@ -220,10 +220,18 @@ export default function PaymentFileDialog({
         ) : (
           <div className="space-y-4">
             {!preview.debtor_ok && (
-              <AttnLine action={{ label: t('debtor_missing_link'), href: '/settings/invoicing' }}>
+              <AttnLine
+                action={
+                  preview.debtor_missing === 'org_number'
+                    ? { label: t('debtor_missing_org_link'), href: '/settings/company' }
+                    : { label: t('debtor_missing_link'), href: '/settings/invoicing' }
+                }
+              >
                 {preview.debtor_missing === 'bic'
                   ? t('debtor_missing_bic')
-                  : t('debtor_missing_iban')}
+                  : preview.debtor_missing === 'org_number'
+                    ? t('debtor_missing_org')
+                    : t('debtor_missing_iban')}
               </AttnLine>
             )}
 
