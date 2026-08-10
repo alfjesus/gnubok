@@ -1336,6 +1336,7 @@
     "toast_status_update_failed": "Kunde inte uppdatera status"
   },
   "initial_setup": {
+    "completed_verdict": "Bokföringen är igång.",
     "title": "{count} steg så är bokföringen igång",
     "step_books_title": "Få in din bokföring",
     "step_books_description": "Importera från ett annat system eller ladda upp en SIE-fil. Ny verksamhet?",
