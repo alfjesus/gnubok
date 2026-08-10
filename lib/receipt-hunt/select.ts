@@ -13,7 +13,10 @@
  * without a database; the caller owns the reads and the staging write.
  */
 import { scoreUnderlagCandidates, type CandidateTransaction } from '@/lib/agent-context/underlag-candidates'
-import { calculateMerchantSimilarity } from '@/lib/documents/core-receipt-matcher'
+import {
+  calculateMerchantSimilarity,
+  normalizeForMatch,
+} from '@/lib/documents/core-receipt-matcher'
 
 /**
  * Confidence a candidate must reach to be proposed unattended.
@@ -290,4 +293,39 @@ export function worthFetching(
     if (daysBetween(doc.date, tx.date) <= FETCH_DATE_WINDOW_DAYS) return true
   }
   return false
+}
+
+/**
+ * What identifies one purchase's paperwork, for deciding whether to fetch it.
+ *
+ * A mail carries the invoice and the receipt for the same purchase under
+ * different names, and the same receipt reaches a second mailbox on another
+ * message, so neither the filename nor the message id identifies anything.
+ * The vendor, the total and the date do.
+ *
+ * The date is what keeps a subscription working. Anthropic bills the same
+ * amount every month, and without a date every month after the first would be
+ * treated as a duplicate of it and suppressed forever: a worse failure than
+ * the duplicates this key exists to prevent, because it is permanent and
+ * silent. Two documents for one purchase share a date; June and July do not.
+ *
+ * Without a vendor there is nothing to anchor an amount to, so those fall back
+ * to the message and the file. The filename alone is not enough: half the
+ * world's billing systems attach "invoice.pdf".
+ */
+export function receiptIdentity(doc: {
+  vendor: string | null
+  amount: number | null
+  currency: string | null
+  date?: string | null
+  attachmentName?: string | null
+  messageId?: string | null
+}): string {
+  const vendor = normalizeForMatch(doc.vendor ?? '').trim()
+  if (vendor && doc.amount != null) {
+    // Öre, not floating point: 0.1 + 0.2 must not read as a different total.
+    const amount = Math.round(doc.amount * 100) / 100
+    return `v1::${vendor}::${amount}::${(doc.currency ?? 'SEK').toLowerCase()}::${doc.date ?? ''}`
+  }
+  return `v1::file::${(doc.messageId ?? '').toLowerCase()}::${(doc.attachmentName ?? '').toLowerCase()}`
 }

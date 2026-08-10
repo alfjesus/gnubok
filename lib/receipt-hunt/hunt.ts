@@ -22,6 +22,7 @@ import { extractMailDocuments } from './mail-intelligence'
 import {
   MAX_PROPOSALS_PER_RUN,
   canHaveEmailReceipt,
+  receiptIdentity,
   worthFetching,
   pairKey,
   selectProposals,
@@ -147,6 +148,21 @@ export interface HuntOptions {
   searchMail?: boolean
   /** How many unexplained purchases to search mail for in one run. */
   mailSearchLimit?: number
+  /**
+   * Mails read in one run, overriding the environment default.
+   *
+   * The cap is what bounds cost, and it interacts with the largest-first
+   * ordering: a low cap spends the whole budget on the biggest purchases,
+   * which on a real ledger are the least likely to have a findable receipt.
+   */
+  maxMails?: number
+  /**
+   * Receipts fetched in one run, overriding the environment default.
+   *
+   * A person pressing a button wants a pass that ends, reports, and can be
+   * repeated. The nightly default is a different budget from a manual one.
+   */
+  maxReceipts?: number
   /**
    * Score and decide, but write nothing.
    *
@@ -352,6 +368,8 @@ export async function huntCompany(
     dryRun = false,
     searchMail = false,
     mailSearchLimit = MAX_MAIL_SEARCHES_PER_RUN,
+    maxReceipts = MAX_RECEIPTS_PER_RUN,
+    maxMails = MAX_MAILS_READ_PER_RUN,
   } = options
 
   const [transactions, suppression] = await Promise.all([
@@ -373,16 +391,26 @@ export async function huntCompany(
   // in a Gmail preview. So the receipt is filed, the extraction that already
   // runs on upload reads its amount, and the pairing below is the same
   // deterministic amount-and-merchant match used for every other underlag.
-  const mail = searchMail
-    ? await harvestReceiptsFromMail(
+  let mail: MailHuntSummary | undefined
+  if (searchMail) {
+    try {
+      mail = await harvestReceiptsFromMail(
         supabase,
         companyId,
         userId,
         transactions.filter((t) => !suppression.claimedTransactionIds.has(t.id)),
         mailSearchLimit,
         dryRun,
+        maxReceipts,
+        maxMails,
       )
-    : undefined
+    } finally {
+      // Cached messages carry their bodies. A body is read to extract fields
+      // and must not outlive the run that read it, including when the run
+      // fails partway.
+      getMailSearchService().releaseCache?.()
+    }
+  }
 
   const { pool, fileNames } = await fetchPool(supabase, companyId)
 
@@ -452,6 +480,59 @@ export async function huntCompany(
  * no mailbox is connected. Finding a candidate is NOT the same as having the
  * receipt: ingesting it is the next step and stays behind human approval.
  */
+/**
+ * Vendor and total of every receipt the hunt has already filed.
+ *
+ * The per-run key only stops duplicates inside one pass. Across passes the
+ * check was the message and attachment, which does not recognise the same
+ * purchase arriving as an invoice in one mail and a receipt in another: those
+ * have different file keys and were fetched twice, filling the pool with
+ * identical candidates the matcher then refuses to choose between.
+ */
+async function fetchAlreadyHeld(
+  supabase: SupabaseClient,
+  companyId: string,
+): Promise<Set<string>> {
+  const rows = await fetchAllRows<{ extracted_data: unknown; channel_context: unknown }>((range) =>
+    supabase
+      .from('invoice_inbox_items')
+      .select('extracted_data, channel_context')
+      .eq('company_id', companyId)
+      .eq('source', 'mail_hunt')
+      .order('id', { ascending: true })
+      .range(range.from, range.to),
+  )
+
+  const held = new Set<string>()
+  for (const row of rows) {
+    const data = row.extracted_data as
+      | {
+          supplier?: { name?: string }
+          invoice?: { currency?: string; invoiceDate?: string | null }
+          totals?: { total?: number }
+        }
+      | null
+    // Prefer the identity written when the receipt was filed: it came from the
+    // same reading that the incoming candidate's does, so the two compare
+    // exactly. Rows filed before that was stored fall back to the extraction,
+    // which is weaker but better than nothing.
+    const stored = row.channel_context as { receipt_identity?: string } | null
+    if (stored?.receipt_identity) {
+      held.add(stored.receipt_identity)
+      continue
+    }
+    const key = receiptIdentity({
+      vendor: data?.supplier?.name ?? null,
+      amount: data?.totals?.total ?? null,
+      currency: data?.invoice?.currency ?? null,
+      date: data?.invoice?.invoiceDate ?? null,
+    })
+    if (key.includes('::file::')) continue
+    held.add(key)
+  }
+  return held
+}
+
 async function harvestReceiptsFromMail(
   supabase: SupabaseClient,
   companyId: string,
@@ -459,6 +540,8 @@ async function harvestReceiptsFromMail(
   purchases: readonly HuntTransaction[],
   limit: number,
   dryRun: boolean,
+  maxReceipts: number,
+  maxMails: number,
 ): Promise<MailHuntSummary> {
   const service = getMailSearchService()
   const summary: MailHuntSummary = { searched: 0, withCandidates: 0, ingested: 0, candidates: [] }
@@ -504,7 +587,9 @@ async function harvestReceiptsFromMail(
   }
   if (byMessage.size === 0) return summary
 
-  const mails = [...byMessage.values()].slice(0, MAX_MAILS_READ_PER_RUN)
+  const mails = [...byMessage.values()].slice(0, maxMails)
+  // Everything read from here on is released in the finally below: mail bodies
+  // are read to extract fields and must not outlive this run.
   const toReview = mails.map((c) => ({
     messageId: c.messageId,
     mailbox: c.mailbox,
@@ -531,20 +616,16 @@ async function harvestReceiptsFromMail(
     worthFetching(doc, searchable, retrievedBy.get(doc.messageId) ?? []),
   )
 
-  const claimedFiles = new Set<string>()
+  // Seeded with what is already filed, so a press spends its budget on
+  // documents the company does not have rather than refetching its own.
+  const claimedFiles = await fetchAlreadyHeld(supabase, companyId)
   for (const doc of wanted) {
     const candidate = byMessage.get(doc.messageId)
     if (!candidate) continue
 
-    // The same invoice arrives as an original, a reminder and two forwards,
-    // every one carrying the identical attachment, so the filename alone
-    // collapses those four into one fetch.
-    //
-    // Scoped by vendor as well, because a bare filename is not an identity:
-    // "invoice.pdf" and "Faktura.pdf" are what half the world's billing systems
-    // call their attachment, and keying on the filename alone would silently
-    // drop a second supplier's invoice as a duplicate of the first.
-    const fileKey = `${(doc.vendor ?? '').toLowerCase()}::${(doc.attachmentName ?? doc.messageId).toLowerCase()}`
+    // One underlag per purchase: see receiptIdentity for why neither the
+    // filename nor the message identifies anything here.
+    const fileKey = receiptIdentity(doc)
     if (claimedFiles.has(fileKey)) continue
     claimedFiles.add(fileKey)
     summary.withCandidates++
@@ -563,16 +644,22 @@ async function harvestReceiptsFromMail(
     // provkörning is that no mailbox content is copied anywhere.
     if (dryRun || !userId) continue
     if (candidate.attachmentIds.length === 0) continue
-    if (summary.ingested >= MAX_RECEIPTS_PER_RUN) break
+    if (summary.ingested >= maxReceipts) break
 
     const names = candidate.attachmentNames ?? []
     const at = doc.attachmentName ? names.indexOf(doc.attachmentName) : 0
     const index = at >= 0 ? at : 0
-    const ingested = await ingestMailCandidate(supabase, companyId, userId, {
-      ...candidate,
-      attachmentIds: [candidate.attachmentIds[index] ?? candidate.attachmentIds[0]],
-      attachmentNames: [names[index] ?? names[0] ?? ''],
-    })
+    const ingested = await ingestMailCandidate(
+      supabase,
+      companyId,
+      userId,
+      {
+        ...candidate,
+        attachmentIds: [candidate.attachmentIds[index] ?? candidate.attachmentIds[0]],
+        attachmentNames: [names[index] ?? names[0] ?? ''],
+      },
+      fileKey,
+    )
     if (ingested) summary.ingested++
   }
   return summary

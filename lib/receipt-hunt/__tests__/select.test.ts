@@ -9,6 +9,7 @@ import {
   HUNT_MIN_CONFIDENCE,
   canHaveEmailReceipt,
   pairKey,
+  receiptIdentity,
   worthFetching,
   selectProposals,
   type HuntPoolItem,
@@ -339,25 +340,54 @@ describe('a receipt already offered elsewhere', () => {
 })
 
 /**
- * The per-run fetch key. A filename is not an identity: half the world's
- * billing systems attach "invoice.pdf", so two suppliers would collide.
+ * What identifies one purchase's paperwork. A mail carries the invoice and the
+ * receipt for the same purchase under different names, and the same receipt
+ * reaches a second mailbox on another message, so fetching per file filled the
+ * pool with identical candidates the matcher then refused to choose between.
  */
-describe('per-run duplicate key', () => {
-  const key = (vendor: string | null, file: string | null, messageId: string) =>
-    `${(vendor ?? '').toLowerCase()}::${(file ?? messageId).toLowerCase()}`
-
-  it('collapses the same invoice arriving four times', () => {
-    // Original, reminder and two forwards, all carrying the identical file.
-    const keys = new Set([
-      key('Visma', 'Invoice_13041840.pdf', 'm1'),
-      key('Visma', 'Invoice_13041840.pdf', 'm2'),
-      key('Visma', 'invoice_13041840.pdf', 'm3'),
-      key('Visma', 'Invoice_13041840.pdf', 'm4'),
-    ])
-    expect(keys.size).toBe(1)
+describe('receiptIdentity', () => {
+  it('collapses the invoice and the receipt for one purchase', () => {
+    const d = { vendor: 'Anthropic', amount: 180, currency: 'EUR', date: '2026-06-15', messageId: 'm1' }
+    expect(receiptIdentity({ ...d, attachmentName: 'Invoice-E19DBF63-0021.pdf' })).toBe(
+      receiptIdentity({ ...d, attachmentName: 'Receipt-2066-0204-8388.pdf' }),
+    )
   })
 
-  it('keeps two suppliers who both call it invoice.pdf', () => {
-    expect(key('Loopia', 'invoice.pdf', 'm1')).not.toBe(key('Hetzner', 'invoice.pdf', 'm2'))
+  it('keeps a subscription billing the same amount every month apart', () => {
+    // Without the date, July would look like a duplicate of June and be
+    // suppressed forever: a permanent, silent loss.
+    expect(
+      receiptIdentity({ vendor: 'Anthropic', amount: 225, currency: 'EUR', date: '2026-06-15' }),
+    ).not.toBe(
+      receiptIdentity({ vendor: 'Anthropic', amount: 225, currency: 'EUR', date: '2026-07-15' }),
+    )
+  })
+
+  it('reads equivalent totals as one amount', () => {
+    expect(
+      receiptIdentity({ vendor: 'Uber', amount: 0.1 + 0.2, currency: 'SEK', date: '2026-06-01' }),
+    ).toBe(receiptIdentity({ vendor: 'Uber', amount: 0.3, currency: 'SEK', date: '2026-06-01' }))
+  })
+
+  it('ignores wrapping the matcher already folds away', () => {
+    expect(receiptIdentity({ vendor: 'Loopia AB', amount: 388, currency: 'SEK', date: '2026-06-11' })).toBe(
+      receiptIdentity({ vendor: 'LOOPIA', amount: 388, currency: 'SEK', date: '2026-06-11' }),
+    )
+  })
+
+  it('keeps two suppliers apart', () => {
+    expect(receiptIdentity({ vendor: 'Loopia', amount: 388, currency: 'SEK', date: '2026-06-11' })).not.toBe(
+      receiptIdentity({ vendor: 'Hetzner', amount: 388, currency: 'SEK', date: '2026-06-11' }),
+    )
+  })
+
+  it('never lets a missing vendor make two documents the same', () => {
+    // "invoice.pdf" is what half the world's billing systems attach, so the
+    // message has to be part of the identity when there is no vendor.
+    expect(
+      receiptIdentity({ vendor: null, amount: 500, currency: 'SEK', messageId: 'm1', attachmentName: 'invoice.pdf' }),
+    ).not.toBe(
+      receiptIdentity({ vendor: '', amount: 500, currency: 'SEK', messageId: 'm2', attachmentName: 'invoice.pdf' }),
+    )
   })
 })
