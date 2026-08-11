@@ -41,6 +41,7 @@ import {
 } from 'lucide-react'
 import Link from 'next/link'
 import { cn, formatCurrency, formatDate } from '@/lib/utils'
+import { useReceiptHunt } from '@/components/extensions/general/use-receipt-hunt'
 import { createClient } from '@/lib/supabase/client'
 import { fetchWithTimeout } from '@/lib/http/fetch-with-timeout'
 import { copyInboxAddress, type AddressCopyState } from '@/components/extensions/general/inbox-address-copy'
@@ -448,6 +449,27 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
   const [purchases, setPurchases] = useState<PurchaseWithoutUnderlag[]>([])
   const [selectedPurchaseId, setSelectedPurchaseId] = useState<string | null>(null)
 
+  // Whether any mailbox can actually be searched. Counting rows would not
+  // answer that: a revoked or expired connection is still a row, and the hunt
+  // skips it, so the button would promise a search that returns nothing every
+  // pass. A dead mailbox looking healthy is the exact failure this feature
+  // exists to surface, so it must not start by doing it in its own header.
+  const [mailConnected, setMailConnected] = useState(false)
+  useEffect(() => {
+    void (async () => {
+      try {
+        const res = await fetch('/api/extensions/ext/mail/connections')
+        if (!res.ok) return
+        const json = (await res.json()) as {
+          data?: { connections?: { status?: string }[] }
+        }
+        setMailConnected((json.data?.connections ?? []).some((c) => c.status === 'active'))
+      } catch {
+        // The extension may not be enabled at all; stay quiet.
+      }
+    })()
+  }, [])
+
   const fetchPurchases = useCallback(async () => {
     try {
       const res = await fetch('/api/extensions/ext/invoice-inbox/purchases')
@@ -462,6 +484,18 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
   useEffect(() => {
     void fetchPurchases()
   }, [fetchPurchases])
+
+  // A pass can attach a document to a purchase, which moves a row from one
+  // list to the other, so both refresh as the run goes rather than at the end.
+  const {
+    hunt,
+    stop: stopHunt,
+    hunting,
+    progress: huntProgress,
+  } = useReceiptHunt(() => {
+    void fetchItems()
+    void fetchPurchases()
+  })
 
   const selectedPurchase = useMemo(
     () => purchases.find((p) => p.id === selectedPurchaseId) ?? null,
@@ -924,6 +958,26 @@ export default function InvoiceInboxWorkspace(_props: WorkspaceComponentProps) {
             className="hidden"
             onChange={handleFileInputChange}
           />
+          {/* The hunt lived only in Settings, so the button that fills this
+              page sat on a different page. It runs in passes and reports as it
+              goes, because a backlog does not clear in one request. */}
+          {mailConnected && (
+            <Button variant="ghost" size="sm" onClick={hunting ? stopHunt : hunt} disabled={false}>
+              {hunting ? (
+                <>
+                  <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
+                  {huntProgress
+                    ? `Letar… ${huntProgress.fetched} hittade`
+                    : 'Letar…'}
+                </>
+              ) : (
+                <>
+                  <Search className="h-3.5 w-3.5 mr-1.5" />
+                  Leta i mejlen
+                </>
+              )}
+            </Button>
+          )}
           <Button
             variant="outline"
             size="sm"
