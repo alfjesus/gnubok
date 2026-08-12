@@ -33,6 +33,7 @@ import {
   type InvoiceListSort,
   type InvoiceListSortColumn,
 } from '@/lib/invoices/invoice-list-sort'
+import { listContextKey, writeListContext } from '@/lib/navigation/list-context'
 import {
   ArrowDown,
   ArrowUp,
@@ -368,6 +369,14 @@ export default function InvoicesPage() {
     [filteredInvoices, oreRounding, sort],
   )
   const visibleInvoices = sortedInvoices.slice(0, visibleCount)
+
+  // Detail-pager context: the FULL sorted list (not the visible slice), so
+  // prev/next on the detail page can walk past the paging boundary.
+  const rememberListContext = () => {
+    writeListContext(listContextKey('invoices', company?.id), {
+      ids: sortedInvoices.map((invoice) => invoice.id),
+    })
+  }
 
   const tabCounts = useMemo(() => {
     const counts = Object.fromEntries(ALL_TABS.map((tab) => [tab, 0])) as Record<ListTab, number>
@@ -772,7 +781,10 @@ export default function InvoicesPage() {
                       'group cursor-pointer transition-colors duration-150 hover:bg-secondary/35',
                       selectedIds.has(invoice.id) && 'bg-secondary/40',
                     )}
-                    onClick={() => router.push(`/invoices/${invoice.id}`)}
+                    onClick={() => {
+                      rememberListContext()
+                      router.push(`/invoices/${invoice.id}`)
+                    }}
                   >
                     {/* Hover-revealed selection checkbox (supplier-invoices shape). */}
                     {showSelection && (
@@ -799,7 +811,10 @@ export default function InvoicesPage() {
                       <Link
                         href={`/invoices/${invoice.id}`}
                         className="hover:underline"
-                        onClick={(e) => e.stopPropagation()}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          rememberListContext()
+                        }}
                       >
                         {number ?? '·'}
                       </Link>
