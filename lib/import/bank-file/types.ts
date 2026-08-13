@@ -49,7 +49,7 @@ export interface BankFileDuplicateInfo {
 export interface BankFileParseIssue {
   row: number
   message: string
-  severity: 'warning' | 'error'
+  severity: 'info' | 'warning' | 'error'
 }
 
 /** Supported bank file format identifiers */
