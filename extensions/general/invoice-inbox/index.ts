@@ -1094,18 +1094,45 @@ export const invoiceInboxExtension: Extension = {
             fileName: doc.file_name,
           })
 
-          const { error: updateError } = await ctx.supabase
-            .from('invoice_inbox_items')
-            .update({
-              status: 'received',
-              error_message: null,
-              extracted_data: extracted as unknown as Record<string, unknown>,
-              // Retry is user-initiated and bypasses the page-count gate by
-              // design: the user explicitly opted into the slow path.
-              extraction_skipped: false,
-            })
-            .eq('id', id)
-            .eq('company_id', ctx.companyId)
+          // Re-running the extraction has to re-run the match too, or the one
+          // affordance the user reaches for when an item failed to auto-link
+          // ("Tolka om") can never produce a link: this path rewrote
+          // extracted_data and left matched_supplier_id untouched. Only a
+          // positive match is written, so a supplier the user picked by hand
+          // survives a retry that finds nothing.
+          const matchedSupplierId = await matchSupplierId(
+            ctx.supabase,
+            ctx.companyId,
+            extracted.supplier,
+          )
+
+          // Two literal payloads instead of one with a conditional spread:
+          // the phantom-column guard can only check columns written as inline
+          // object literals, and matched_supplier_id should be checkable.
+          const { error: updateError } = matchedSupplierId
+            ? await ctx.supabase
+                .from('invoice_inbox_items')
+                .update({
+                  status: 'received',
+                  error_message: null,
+                  extracted_data: extracted as unknown as Record<string, unknown>,
+                  // Retry is user-initiated and bypasses the page-count gate by
+                  // design: the user explicitly opted into the slow path.
+                  extraction_skipped: false,
+                  matched_supplier_id: matchedSupplierId,
+                })
+                .eq('id', id)
+                .eq('company_id', ctx.companyId)
+            : await ctx.supabase
+                .from('invoice_inbox_items')
+                .update({
+                  status: 'received',
+                  error_message: null,
+                  extracted_data: extracted as unknown as Record<string, unknown>,
+                  extraction_skipped: false,
+                })
+                .eq('id', id)
+                .eq('company_id', ctx.companyId)
 
           if (updateError) {
             return NextResponse.json({ error: updateError.message }, { status: 500 })
