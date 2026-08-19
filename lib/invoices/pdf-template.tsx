@@ -1,3 +1,4 @@
+import { roundOre } from '@/lib/money'
 import {
   Document,
   Page,
@@ -704,7 +705,7 @@ export function resolvePdfPaidState(
   const remainingAmount =
     invoice.status === 'paid'
       ? 0
-      : invoice.remaining_amount ?? Math.max(0, Math.round((amountToPay - paidAmount) * 100) / 100)
+      : invoice.remaining_amount ?? Math.max(0, roundOre(amountToPay - paidAmount))
   return {
     kind: invoice.status,
     paidAmount,
