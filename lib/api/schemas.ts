@@ -3669,3 +3669,17 @@ export const CompanyMigrationResetSchema = z.object({
     error: 'Bekräfta att den tidigare företagskopian sparas som arkiv',
   }),
 })
+
+/**
+ * POST /api/notices/dismiss
+ *
+ * notice_id is an opaque lib/notices id (category + state discriminator).
+ * Ids are bounded by construction: a multi-connection discriminator collapses
+ * to a count plus an 8-char sha256 digest of the sorted parts (see
+ * boundedDiscriminator in lib/notices/categories.ts), so the widest real id
+ * is a single connection uuid plus a status/expiry, well under this cap;
+ * anything longer is garbage.
+ */
+export const NoticeDismissSchema = z.object({
+  notice_id: z.string().min(1).max(200),
+})
