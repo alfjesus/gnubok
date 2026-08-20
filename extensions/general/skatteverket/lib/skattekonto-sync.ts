@@ -4,6 +4,7 @@ import { eventBus } from '@/lib/events/bus'
 import { createLogger } from '@/lib/logger'
 import { formatRedovisare } from '@/lib/skatteverket/format'
 import { computeDedupKey, contentSignature } from '@/lib/skatteverket/skattekonto-dedup'
+import { getEarliestFiscalPeriodStart } from '@/lib/core/bookkeeping/period-service'
 import { fetchAllRows } from '@/lib/supabase/fetch-all'
 import { settleAgiTaxPayments } from './agi-tax-settlement'
 import { getSaldo, getTransaktioner } from './skattekonto-client'
@@ -20,6 +21,30 @@ const log = createLogger('skattekonto-sync')
 
 const BALANCE_SNAPSHOT_KEY = 'skattekonto_balance_snapshot'
 const LAST_SYNCED_AT_KEY = 'skattekonto_last_synced_at'
+
+/** SKV's default lookback for tidigare transaktioner when no datumFrom is sent. */
+const SKV_DEFAULT_WINDOW_DAYS = 555
+
+function isoDateDaysAgo(days: number): string {
+  const d = new Date()
+  d.setUTCDate(d.getUTCDate() - days)
+  return d.toISOString().slice(0, 10)
+}
+
+/**
+ * Clamp the bookkeeping-start lower bound to SKV's own window.
+ *
+ * Sending a datumFrom OLDER than the 555-day default would silently widen
+ * the fetch past what an unbounded call returns, and anything older than
+ * ~915 days is rejected outright (felkod 2). In both cases omitting the
+ * parameter is identical to what we actually want (the default window), so
+ * a bound is only sent when it is strictly inside the default window.
+ */
+function clampDatumFrom(earliestPeriodStart: string | null): string | undefined {
+  if (!earliestPeriodStart) return undefined
+  const defaultFrom = isoDateDaysAgo(SKV_DEFAULT_WINDOW_DAYS)
+  return earliestPeriodStart > defaultFrom ? earliestPeriodStart : undefined
+}
 
 export interface SkattekontoSyncResult {
   /** Number of new or status-promoted booked rows */
@@ -66,10 +91,12 @@ async function resolveOmfragad(
  */
 // file_import_id is excluded from the upsert payload on purpose: when the
 // sync takes over a file-imported row (see below) the provenance link back
-// to the uploaded file should survive the conflict-update.
+// to the uploaded file should survive the conflict-update. is_ignored is
+// likewise excluded: it is a user decision, and a nightly sync must never
+// silently un-ignore a row via the conflict-update.
 type SyncRow = Omit<
   StoredSkattekontoTransaction,
-  'id' | 'imported_at' | 'updated_at' | 'journal_entry_id' | 'file_import_id'
+  'id' | 'imported_at' | 'updated_at' | 'journal_entry_id' | 'file_import_id' | 'is_ignored'
 >
 
 function bookedToRow(companyId: string, tx: SkatteverketBookedTransaction): SyncRow {
@@ -128,12 +155,27 @@ export async function syncSkattekonto(
 ): Promise<SkattekontoSyncResult> {
   const omfragad = await resolveOmfragad(ctx.supabase, ctx.companyId)
 
+  // Lower-bound the transaction fetch at the company's bookkeeping start.
+  // Without datumFrom, SKV defaults to ~555 days back, which for an enskild
+  // firma (whose skattekonto is the owner's PERSONAL account) imports private
+  // pre-company rows that can never be booked (no fiscal period covers them).
+  // Applied uniformly to EF and AB, but clamped to SKV's window (see
+  // clampDatumFrom): a company whose bookkeeping started more than 555 days
+  // ago gets no datumFrom at all, because sending one would either widen the
+  // window past the default or (past ~915 days) fail the whole sync with
+  // felkod 2. No fiscal period yet (brand-new company) -> no bound either.
+  const earliestPeriodStart = await getEarliestFiscalPeriodStart(
+    ctx.supabase,
+    ctx.companyId,
+  )
+  const datumFrom = clampDatumFrom(earliestPeriodStart)
+
   let saldo: SkatteverketSaldoResponse
   let transaktioner: Awaited<ReturnType<typeof getTransaktioner>>
   try {
     ;[saldo, transaktioner] = await Promise.all([
       getSaldo(auth, omfragad),
-      getTransaktioner(auth, omfragad),
+      getTransaktioner(auth, omfragad, datumFrom),
     ])
   } catch (err) {
     if (err instanceof SkatteverketAuthError) {
