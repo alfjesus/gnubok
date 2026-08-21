@@ -1363,10 +1363,23 @@ export const arcimMigrationExtension: Extension = {
 
         let consentId: string | undefined
         let dryRun = false
+        let cursor: string | null = null
         try {
-          const body = (await request.json()) as { consentId?: string; dryRun?: boolean }
+          const body = (await request.json()) as {
+            consentId?: string
+            dryRun?: boolean
+            cursor?: string
+          }
           consentId = body?.consentId
           dryRun = body?.dryRun === true
+          // Resume point from a previous partial call (the last handled
+          // provider attachment id, see import-documents.ts); anything else
+          // restarts from the top, which is always safe: already-archived
+          // receipts are skipped by hash.
+          cursor =
+            typeof body?.cursor === 'string' && body.cursor.length > 0 && body.cursor.length <= 256
+              ? body.cursor
+              : null
         } catch {
           // empty/invalid body: consentId check below rejects it
         }
@@ -1382,15 +1395,20 @@ export const arcimMigrationExtension: Extension = {
             userId: user.id,
             consentId,
             dryRun,
+            cursor,
           })
           log.info('arcim import-documents completed', {
             companyId,
             dryRun,
+            cursor,
+            total: result.total,
             scanned: result.scanned,
             linked: result.linked,
             skipped: result.skipped,
             unmatched: result.unmatched,
             failed: result.failed,
+            partial: result.partial,
+            nextCursor: result.nextCursor,
           })
           return NextResponse.json({ success: true, dryRun, result })
         } catch (error) {

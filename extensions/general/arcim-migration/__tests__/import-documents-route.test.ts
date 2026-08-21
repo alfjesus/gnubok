@@ -152,6 +152,45 @@ describe('POST /import-documents', () => {
     )
   })
 
+  it('passes a non-empty string cursor through and restarts from the top for anything else', async () => {
+    ;(importProviderDocuments as Mock).mockResolvedValue({
+      provider: 'fortnox',
+      scanned: 1,
+      linked: 1,
+      skipped: 0,
+      unmatched: 0,
+      failed: 0,
+      dryRun: false,
+      unmatchedSamples: [],
+      total: 113,
+      partial: true,
+      nextCursor: 'file-18',
+    })
+
+    const withCursor = createMockRequest(
+      'http://localhost/api/extensions/ext/arcim-migration/import-documents',
+      { method: 'POST', body: { consentId: 'consent-1', dryRun: false, cursor: 'file-17' } },
+    )
+    const { status, body } = await parseJsonResponse<{
+      result: { partial: boolean; nextCursor: string | null }
+    }>(await handler(withCursor, buildContext()))
+
+    expect(status).toBe(200)
+    expect(body.result).toMatchObject({ partial: true, nextCursor: 'file-18' })
+    expect(importProviderDocuments).toHaveBeenLastCalledWith(
+      expect.objectContaining({ consentId: 'consent-1', dryRun: false, cursor: 'file-17' }),
+    )
+
+    const garbage = createMockRequest(
+      'http://localhost/api/extensions/ext/arcim-migration/import-documents',
+      { method: 'POST', body: { consentId: 'consent-1', cursor: 17 } },
+    )
+    await handler(garbage, buildContext())
+    expect(importProviderDocuments).toHaveBeenLastCalledWith(
+      expect.objectContaining({ cursor: null }),
+    )
+  })
+
   it('asks the user to reconnect only once the connect request carries the scopes', async () => {
     fortnoxOAuth.documentScopesApproved = true
     ;(importProviderDocuments as Mock).mockRejectedValue(
