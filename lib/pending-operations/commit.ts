@@ -6001,8 +6001,17 @@ async function commitLinkTransactionJournalEntry(
   if (!outcome.ok) {
     const entry = getErrorEntry(outcome.code)
     const httpStatus = entry?.httpStatus ?? 500
+    // Carry the DB reason into the message itself: the dispatcher persists and
+    // returns `error`/`errorCode`, and the MCP approve result has no separate
+    // details slot, so a bare "database error" left the agent with nothing to
+    // act on.
+    const reason = outcome.details && typeof outcome.details.reason === 'string'
+      ? outcome.details.reason
+      : null
+    const baseMessage = entry?.message_en ?? outcome.code
     return {
-      error: entry?.message_en ?? outcome.code,
+      error: reason ? `${baseMessage} (${reason})` : baseMessage,
+      errorCode: outcome.code,
       status: httpStatus,
       data: outcome.details as Record<string, unknown> | undefined,
     }
@@ -6428,26 +6437,52 @@ async function commitPendingOperationInner(
       }
     }
     const isAutoReject = result.status === 404 || result.status === 409
-    await supabase
+    // Executor-provided failure details (e.g. the Postgres message behind
+    // LINK_TX_DB_ERROR) are persisted and returned alongside the message so
+    // the approver sees WHY, not just that it failed.
+    const failureDetails =
+      result.data && Object.keys(result.data).length > 0 ? result.data : null
+    const { error: rejectWriteError } = await supabase
       .from('pending_operations')
       .update({
         status: 'rejected',
         resolved_at: new Date().toISOString(),
         result_data: isAutoReject
-          ? { auto_rejected: true, reason: result.error }
+          ? {
+              auto_rejected: true,
+              reason: result.error,
+              ...(result.errorCode ? { error_code: result.errorCode } : {}),
+              ...(failureDetails ? { details: failureDetails } : {}),
+            }
           : {
               error: result.error,
               http_status: result.status,
               ...(result.errorCode ? { error_code: result.errorCode } : {}),
+              ...(failureDetails ? { details: failureDetails } : {}),
             },
       })
       .eq('id', pendingOp.id)
+    if (rejectWriteError) {
+      // Same contract as the finalize branch below: the row stays in
+      // 'committing' and the daily recovery sweep
+      // (recover-stuck-committing.ts) resolves it; log loudly with the ids
+      // and the failure we could not persist so nothing is lost silently.
+      log.error('failed to mark pending_operation rejected (left in committing)', rejectWriteError, {
+        pendingOperationId: pendingOp.id,
+        operationType: pendingOp.operation_type,
+        companyId,
+        executorError: result.error,
+        executorErrorCode: result.errorCode ?? null,
+      })
+    }
     if (isAutoReject) {
       return {
         status: 'rejected',
         auto_rejected: true,
         error: result.error,
         http_status: result.status,
+        ...(result.errorCode ? { code: result.errorCode } : {}),
+        ...(failureDetails ? { data: failureDetails } : {}),
       }
     }
     return {
@@ -6455,6 +6490,7 @@ async function commitPendingOperationInner(
       error: result.error,
       http_status: result.status ?? 500,
       ...(result.errorCode ? { code: result.errorCode } : {}),
+      ...(failureDetails ? { data: failureDetails } : {}),
     }
   }
 
