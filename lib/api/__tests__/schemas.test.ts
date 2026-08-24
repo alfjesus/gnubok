@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest'
+import { HouseworkTypeSchema } from '../schemas'
 import {
   // Enums
   EntityTypeSchema,
@@ -276,6 +277,33 @@ describe('Enum schemas', () => {
 // ============================================================
 // Invoice schemas
 // ============================================================
+
+describe('CreateInvoiceSchema: ROT/RUT line completeness', () => {
+  const paths = (r: { success: boolean; error?: { issues: Array<{ path: PropertyKey[] }> } }) =>
+    r.success ? [] : r.error!.issues.map((i) => i.path.join('.'))
+  const rutLine = (extra: Record<string, unknown>) => validInvoiceItem({ deduction_type: 'rut', ...extra })
+
+  it('requires a same-kind arbetstyp and hours > 0 on invoice documents', () => {
+    expect(paths(CreateInvoiceSchema.safeParse(validInvoice({ items: [rutLine({})] })))).toEqual(
+      expect.arrayContaining(['items.0.work_type', 'items.0.labor_hours']),
+    )
+    expect(paths(CreateInvoiceSchema.safeParse(validInvoice({ items: [rutLine({ work_type: 'BYGG', labor_hours: 2 })] })))).toEqual(['items.0.work_type'])
+    expect(CreateInvoiceSchema.safeParse(validInvoice({ items: [rutLine({ work_type: 'STAD', labor_hours: 2 })] })).success).toBe(true)
+    // Schablontjänst: no hours needed
+    expect(CreateInvoiceSchema.safeParse(validInvoice({ items: [rutLine({ work_type: 'TVATT' })] })).success).toBe(true)
+  })
+
+  it('does not apply to proformas / delivery notes (server nulls the fields) nor to text rows', () => {
+    expect(CreateInvoiceSchema.safeParse(validInvoice({ document_type: 'proforma', items: [rutLine({})] })).success).toBe(true)
+    expect(CreateInvoiceSchema.safeParse(validInvoice({ items: [validInvoiceItem({ line_type: 'text', description: '', deduction_type: 'rut' })] })).success).toBe(true)
+  })
+
+  it('applies to UpdateInvoiceSchema too', () => {
+    const { save_as_draft: _s, ...body } = validInvoice({ items: [rutLine({})] }) as Record<string, unknown>
+    expect(UpdateInvoiceSchema.safeParse(body).success).toBe(false)
+    expect(UpdateInvoiceSchema.safeParse({ ...body, items: [rutLine({ work_type: 'STAD', labor_hours: 1 })] }).success).toBe(true)
+  })
+})
 
 describe('CreateInvoiceSchema', () => {
   it('accepts a valid invoice', () => {
@@ -701,6 +729,79 @@ describe('CreateCustomerSchema', () => {
   })
 })
 
+// Where an individual's personnummer lands (#1707 follow-up). Synthetic
+// personnummer throughout, never a real one.
+describe('CreateCustomerSchema: personnummer placement', () => {
+  it('moves a personnummer-shaped org_number on an individual into personal_number', () => {
+    const result = CreateCustomerSchema.safeParse({
+      name: 'Anna Andersson',
+      customer_type: 'individual',
+      org_number: '19900101-1234',
+    })
+    expect(result.success).toBe(true)
+    if (result.success) {
+      expect(result.data.personal_number).toBe('19900101-1234')
+      expect(result.data.org_number).toBeUndefined()
+    }
+  })
+
+  it('strips whitespace from the moved value so it matches the personnummer input forms', () => {
+    const result = CreateCustomerSchema.safeParse({
+      name: 'Anna Andersson',
+      customer_type: 'individual',
+      org_number: '19900101 1234',
+    })
+    expect(result.success).toBe(true)
+    if (result.success) expect(result.data.personal_number).toBe('199001011234')
+  })
+
+  it('drops org_number when it duplicates personal_number', () => {
+    const result = CreateCustomerSchema.safeParse({
+      name: 'Anna Andersson',
+      customer_type: 'individual',
+      org_number: '199001011234',
+      personal_number: '19900101-1234',
+    })
+    expect(result.success).toBe(true)
+    if (result.success) {
+      expect(result.data.personal_number).toBe('19900101-1234')
+      expect(result.data.org_number).toBeUndefined()
+    }
+  })
+
+  it('rejects an org_number that is a different personnummer than personal_number', () => {
+    const result = CreateCustomerSchema.safeParse({
+      name: 'Anna Andersson',
+      customer_type: 'individual',
+      org_number: '19850505-5555',
+      personal_number: '19900101-1234',
+    })
+    expect(result.success).toBe(false)
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join('.') === 'org_number')).toBe(true)
+    }
+  })
+
+  it('still rejects a personnummer-shaped org_number on a business customer', () => {
+    const result = CreateCustomerSchema.safeParse(validCustomer({ org_number: '19900101-1234' }))
+    expect(result.success).toBe(false)
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join('.') === 'org_number')).toBe(true)
+    }
+  })
+
+  it('leaves a legal-entity organisationsnummer alone on every customer_type', () => {
+    for (const customer_type of ['individual', 'swedish_business'] as const) {
+      const result = CreateCustomerSchema.safeParse({ name: 'X', customer_type, org_number: '556677-8899' })
+      expect(result.success).toBe(true)
+      if (result.success) {
+        expect(result.data.org_number).toBe('556677-8899')
+        expect(result.data.personal_number).toBeUndefined()
+      }
+    }
+  })
+})
+
 // ============================================================
 // Supplier schemas
 // ============================================================
@@ -742,6 +843,24 @@ describe('CreateSupplierSchema', () => {
   it('accepts valid 4-digit expense account', () => {
     const result = CreateSupplierSchema.safeParse(validSupplier({ default_expense_account: '6200' }))
     expect(result.success).toBe(true)
+  })
+
+  // The web form submits untouched optional inputs as '' (Björn 2026-08-17:
+  // saving with the field left blank failed "Kontonummer måste vara 4 siffror").
+  it('treats empty-string expense account as absent', () => {
+    const result = CreateSupplierSchema.safeParse(validSupplier({ default_expense_account: '' }))
+    expect(result.success).toBe(true)
+    if (result.success) {
+      expect(result.data.default_expense_account).toBeUndefined()
+    }
+  })
+
+  it('treats empty-string email as absent', () => {
+    const result = CreateSupplierSchema.safeParse(validSupplier({ email: '' }))
+    expect(result.success).toBe(true)
+    if (result.success) {
+      expect(result.data.email).toBeUndefined()
+    }
   })
 })
 
@@ -925,6 +1044,23 @@ describe('CreateSupplierInvoiceItemSchema', () => {
       validSupplierInvoiceItem({ amount: 100.04, vat_rate: 0.25, vat_amount: 25.02 })
     )
     expect(result.success).toBe(true)
+  })
+
+  it('accepts apply_slp as an optional boolean (särskild löneskatt opt-in)', () => {
+    const flagged = CreateSupplierInvoiceItemSchema.safeParse(
+      validSupplierInvoiceItem({ account_number: '7412', vat_rate: 0, apply_slp: true })
+    )
+    expect(flagged.success).toBe(true)
+
+    const omitted = CreateSupplierInvoiceItemSchema.safeParse(validSupplierInvoiceItem())
+    expect(omitted.success).toBe(true)
+  })
+
+  it('rejects non-boolean apply_slp', () => {
+    const result = CreateSupplierInvoiceItemSchema.safeParse(
+      validSupplierInvoiceItem({ apply_slp: 'yes' })
+    )
+    expect(result.success).toBe(false)
   })
 
   it('works with quantity * unit_price line total', () => {
@@ -1335,6 +1471,54 @@ describe('UpdateSettingsSchema', () => {
     })
 
     expect(result.success).toBe(true)
+  })
+
+  it('accepts a USD payment account with routing number + account number + BIC and no IBAN', () => {
+    const result = UpdateSettingsSchema.safeParse({
+      invoice_payment_accounts: {
+        USD: {
+          bank_name: 'Wise US Inc',
+          bic: 'trwius35xxx',
+          bank_code: '084 009 519',
+          foreign_account_number: '9600 0012 3456 7890',
+        },
+      },
+    })
+
+    expect(result.success).toBe(true)
+    if (result.success) {
+      const usd = result.data.invoice_payment_accounts?.USD
+      expect(usd?.bic).toBe('TRWIUS35XXX')
+      expect(usd?.bank_code).toBe('084009519')
+      expect(usd?.foreign_account_number).toBe('9600001234567890')
+    }
+  })
+
+  it('accepts a GBP payment account with a dashed sort code', () => {
+    const result = UpdateSettingsSchema.safeParse({
+      invoice_payment_accounts: {
+        GBP: { bic: 'NWBKGB2L', bank_code: '60-16-13', foreign_account_number: '31926819' },
+      },
+    })
+    expect(result.success).toBe(true)
+  })
+
+  it('rejects a USD payment account with neither IBAN nor the full routing triple', () => {
+    const result = UpdateSettingsSchema.safeParse({
+      invoice_payment_accounts: {
+        USD: { bank_code: '084009519', foreign_account_number: '9600001234567890' },
+      },
+    })
+    expect(result.success).toBe(false)
+  })
+
+  it('still requires an IBAN for an EUR payment account even with a routing triple', () => {
+    const result = UpdateSettingsSchema.safeParse({
+      invoice_payment_accounts: {
+        EUR: { bic: 'DEUTDEFF', bank_code: '37040044', foreign_account_number: '0532013000' },
+      },
+    })
+    expect(result.success).toBe(false)
   })
 
   it('accepts null when clearing the legacy SEK bank account mirror', () => {
@@ -2189,6 +2373,39 @@ describe('UpdateSupplierSchema', () => {
     expect(result.success).toBe(true)
   })
 
+  // Update routes pass fields straight into .update(), where undefined keys
+  // are dropped (unchanged) and null writes NULL. An empty string from a
+  // cleared form field must therefore become null, or clearing does nothing.
+  it('maps empty-string expense account to null so clearing persists', () => {
+    const result = UpdateSupplierSchema.safeParse({ default_expense_account: '' })
+    expect(result.success).toBe(true)
+    if (result.success) {
+      expect(result.data.default_expense_account).toBeNull()
+    }
+  })
+
+  it('maps empty-string email to null so clearing persists', () => {
+    const result = UpdateSupplierSchema.safeParse({ email: '' })
+    expect(result.success).toBe(true)
+    if (result.success) {
+      expect(result.data.email).toBeNull()
+    }
+  })
+
+  it('leaves omitted fields absent', () => {
+    const result = UpdateSupplierSchema.safeParse({ name: 'New Supplier' })
+    expect(result.success).toBe(true)
+    if (result.success) {
+      expect('default_expense_account' in result.data).toBe(false)
+      expect('email' in result.data).toBe(false)
+    }
+  })
+
+  it('still rejects a malformed expense account on update', () => {
+    const result = UpdateSupplierSchema.safeParse({ default_expense_account: '54' })
+    expect(result.success).toBe(false)
+  })
+
   it('rejects invalid expense account format', () => {
     const result = UpdateSupplierSchema.safeParse({ default_expense_account: '40' })
     expect(result.success).toBe(false)
@@ -2287,6 +2504,17 @@ describe('UpdateAccountSchema', () => {
       normal_balance: 'debit',
       default_vat_rate: 0.5,
     }).success).toBe(false)
+  })
+
+  it('accepts supported account VAT treatments and rejects unknown values', () => {
+    expect(UpdateAccountSchema.safeParse({
+      default_vat_treatment: 'reverse_charge_eu_goods',
+    }).success).toBe(true)
+    expect(UpdateAccountSchema.safeParse({
+      default_vat_treatment: 'reverse_charge_non_eu_services',
+    }).success).toBe(true)
+    expect(UpdateAccountSchema.safeParse({ default_vat_treatment: null }).success).toBe(true)
+    expect(UpdateAccountSchema.safeParse({ default_vat_treatment: 'eu_purchase' }).success).toBe(false)
   })
 })
 
@@ -2771,5 +2999,49 @@ describe('CreateRecurringScheduleSchema interval_months', () => {
     expect(CreateRecurringScheduleSchema.safeParse({ ...base, interval_months: 0 }).success).toBe(false)
     expect(CreateRecurringScheduleSchema.safeParse({ ...base, interval_months: 13 }).success).toBe(false)
     expect(CreateRecurringScheduleSchema.safeParse({ ...base, interval_months: 1.5 }).success).toBe(false)
+  })
+})
+
+describe('CreateSalaryLineItemSchema: derived-only item types', () => {
+  it("rejects manual 'oresavrundning' lines (only the calculator may write them)", async () => {
+    const { CreateSalaryLineItemSchema, UpdateSalaryLineItemSchema } = await import('../schemas')
+    const base = {
+      salary_run_employee_id: '3f0a2f60-0000-4000-8000-000000000001',
+      description: 'Öresavrundning',
+      amount: 0.4,
+    }
+    expect(
+      CreateSalaryLineItemSchema.safeParse({ ...base, item_type: 'oresavrundning' }).success,
+    ).toBe(false)
+    expect(
+      CreateSalaryLineItemSchema.safeParse({ ...base, item_type: 'bonus' }).success,
+    ).toBe(true)
+    expect(UpdateSalaryLineItemSchema.safeParse({ item_type: 'oresavrundning' }).success).toBe(false)
+    expect(UpdateSalaryLineItemSchema.safeParse({ item_type: 'bonus' }).success).toBe(true)
+  })
+})
+
+describe('HouseworkTypeSchema (articles.housework_type)', () => {
+  it('stores a Skatteverket work-type code upper-cased', () => {
+    expect(HouseworkTypeSchema.parse('stad')).toBe('STAD')
+    expect(HouseworkTypeSchema.parse('BYGG')).toBe('BYGG')
+  })
+
+  it('accepts the bare kind ROT / RUT (deduction only, no arbetstyp pre-fill)', () => {
+    expect(HouseworkTypeSchema.parse('rut')).toBe('RUT')
+    expect(HouseworkTypeSchema.parse('ROT')).toBe('ROT')
+  })
+
+  it('treats empty string as clear and passes null/undefined through', () => {
+    expect(HouseworkTypeSchema.parse('')).toBeNull()
+    expect(HouseworkTypeSchema.parse('   ')).toBeNull()
+    expect(HouseworkTypeSchema.parse(null)).toBeNull()
+    expect(HouseworkTypeSchema.parse(undefined)).toBeUndefined()
+  })
+
+  it('rejects values the invoice editor could never interpret', () => {
+    for (const bad of ['1', '0', 'Ja', 'SNICKERI', 'RUT-städning']) {
+      expect(HouseworkTypeSchema.safeParse(bad).success).toBe(false)
+    }
   })
 })

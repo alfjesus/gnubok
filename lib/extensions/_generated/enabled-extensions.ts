@@ -1,6 +1,7 @@
 // AUTO-GENERATED: do not edit. Run `npm run setup:extensions` to regenerate.
 
 export const ENABLED_EXTENSION_IDS: ReadonlySet<string> = new Set([
+  'calendar',
   'enable-banking',
   'email',
   'arcim-migration',
@@ -13,4 +14,6 @@ export const ENABLED_EXTENSION_IDS: ReadonlySet<string> = new Set([
   'stripe',
   'whatsapp-inbox',
   'woocommerce',
+  'shopify',
+  'mail',
 ])

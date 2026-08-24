@@ -1,5 +1,5 @@
 import crypto from 'crypto'
-import { createClient } from '@supabase/supabase-js'
+import { createServiceRoleClient } from '@/lib/supabase/service-client'
 
 const KEY_PREFIX = 'gnubok_sk_'
 const REFRESH_TOKEN_PREFIX = 'gnubok_rt_'
@@ -35,6 +35,12 @@ export const API_KEY_SCOPES = {
   'agent:write':        { label: 'Agent: skriv',        description: 'Spara och ta bort agentens minnen om företaget (remember_fact, forget_fact)' },
   'pending_operations:read':    { label: 'Stagade operationer: läs',     description: 'Lista pending_operations (staged writes awaiting approval)' },
   'pending_operations:approve': { label: 'Stagade operationer: godkänn', description: 'Godkänn eller avvisa stagade operationer via API/MCP: agenten ersätter web-UI:s granskning' },
+  // Reconciliation (account-keyed: bank accounts + skattekonto). Reads cover
+  // the account list, the bridge and the item buckets; writes cover links
+  // (match/unmatch) and ignore flags. Links never touch the ledger.
+  'reconciliation:read':  { label: 'Avstämning: läs',   description: 'Konton att stämma av, bryggan per konto och raderna bakom den (bank + skattekonto)' },
+  'reconciliation:write': { label: 'Avstämning: skriv', description: 'Koppla och koppla bort händelser mot verifikat, ignorera rader (MCP stagar; REST skriver direkt)' },
+  'reconciliation:signoff': { label: 'Avstämning: signera', description: 'Markera ett konto som avstämt t.o.m. ett datum och öppna en signering igen (MCP stagar; REST skriver direkt)' },
 } as const
 
 export type ApiKeyScope = keyof typeof API_KEY_SCOPES
@@ -125,6 +131,11 @@ export const STAGING_SCOPES: ApiKeyScope[] = [
   // key holding both this and pending_operations:approve is a SoD conflict:
   // findStageApproveConflict picks it up automatically from this list.
   'skatteverket:write',
+  // gnubok_reconcile_match / gnubok_reconcile_unmatch stage reconciliation_*
+  // operations; same SoD reasoning.
+  'reconciliation:write',
+  // gnubok_reconcile_signoff stages reconciliation_signoff.
+  'reconciliation:signoff',
 ]
 
 /**
@@ -167,6 +178,7 @@ export const TOOL_SCOPE_MAP: Record<string, ApiKeyScope> = {
   gnubok_update_company_settings:         'companies:write',
   // Transactions
   gnubok_list_uncategorized_transactions:     'transactions:read',
+  gnubok_list_cash_accounts:                  'transactions:read',
   gnubok_list_transactions_without_documents: 'transactions:read',
   gnubok_create_transactions:                 'transactions:write',
   gnubok_categorize_transaction:              'transactions:write',
@@ -176,6 +188,12 @@ export const TOOL_SCOPE_MAP: Record<string, ApiKeyScope> = {
   gnubok_match_transaction_to_invoice:        'transactions:write',
   gnubok_link_transaction_to_journal_entry:   'transactions:write',
   gnubok_match_batch_allocate:                'transactions:write',
+  // Reconciliation (account-keyed). gnubok_get_reconciliation_status keeps its
+  // historical reports:read so existing keys are not cut off.
+  gnubok_list_reconciliation_items:           'reconciliation:read',
+  gnubok_reconcile_match:                     'reconciliation:write',
+  gnubok_reconcile_unmatch:                   'reconciliation:write',
+  gnubok_reconcile_signoff:                   'reconciliation:signoff',
   gnubok_bulk_book_transactions:              'transactions:write',
   gnubok_bulk_book_inbox_items:               'transactions:write',
   gnubok_auto_match_period:                   'transactions:write',
@@ -241,6 +259,7 @@ export const TOOL_SCOPE_MAP: Record<string, ApiKeyScope> = {
   gnubok_get_document_content:            'transactions:read',
   gnubok_attach_document_to_transaction:  'transactions:write',
   gnubok_link_document_to_voucher:        'bookkeeping:write',
+  gnubok_link_documents_to_vouchers:      'bookkeeping:write',
   // Körjournal (mileage): trip log reads/writes are payroll surface
   // (milersättning, 7331); booking the verifikat is a journal write.
   gnubok_list_mileage_trips:              'payroll:read',
@@ -271,6 +290,7 @@ export const TOOL_SCOPE_MAP: Record<string, ApiKeyScope> = {
   gnubok_lock_period:                     'bookkeeping:write',
   gnubok_unlock_period:                   'bookkeeping:write',
   gnubok_run_year_end:                    'bookkeeping:write',
+  gnubok_post_kontantmetod_cutoff:        'bookkeeping:write',
   gnubok_year_end_readiness:              'reports:read',
   gnubok_set_opening_balances:            'bookkeeping:write',
   gnubok_run_currency_revaluation:        'bookkeeping:write',
@@ -362,7 +382,7 @@ export function validateScopes(scopes: unknown): ApiKeyScope[] | null {
  * Used for API key validation (MCP, webhooks) where there's no browser session.
  */
 export function createServiceClientNoCookies() {
-  return createClient(
+  return createServiceRoleClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.SUPABASE_SERVICE_ROLE_KEY!
   )

@@ -32,10 +32,10 @@ import {
   Tag,
   Tags,
   ChevronRight,
-  Clock,
   Sparkles,
   Percent,
   Landmark,
+  Scale,
   CalendarClock,
   CalendarRange,
   FileCheck,
@@ -45,6 +45,8 @@ import {
   PanelLeftClose,
   Library,
   BookCheck,
+  ShoppingCart,
+  Car,
 } from 'lucide-react'
 import { getBranding } from '@/lib/branding/service'
 import { ENABLED_EXTENSION_IDS as _ENABLED_EXTENSION_IDS } from '@/lib/extensions/_generated/enabled-extensions'
@@ -53,6 +55,7 @@ import { resetAnalyticsIdentity } from '@/lib/analytics/reset'
 import { SupportLink } from '@/components/ui/support-link'
 import CompanySwitcher from '@/components/dashboard/CompanySwitcher'
 import UserMenu from '@/components/dashboard/UserMenu'
+import SubscriptionTouchpoint from '@/components/billing/SubscriptionTouchpoint'
 import AgentAvatar from '@/components/agent/AgentAvatar'
 import { useAgentSheet } from '@/components/agent/AgentSheetProvider'
 import { useCompany } from '@/contexts/CompanyContext'
@@ -81,6 +84,14 @@ interface DashboardNavProps {
   // switched on. Drives visibility of the Kostnadsställen & projekt row:
   // same mechanism as paysSalaries: fetched by the dashboard layout.
   dimensionsEnabled?: boolean
+  // Whether the company has a webshop hooked up (active WooCommerce/Shopify
+  // connection, or existing webshop_orders rows). Drives visibility of the
+  // Order row: same mechanism as paysSalaries, fetched by the layout.
+  hasWebshop?: boolean
+  // Whether the Körjournal row shows: the company_settings.mileage_enabled
+  // toggle OR existing mileage_trips rows (trips created via API/MCP must
+  // stay reachable). Computed by the dashboard layout.
+  hasMileage?: boolean
   isSandbox?: boolean
   extensionNavItems?: ExtensionNavItem[]
   // Signed-in user's full name + email: drives the bottom-left account
@@ -101,12 +112,14 @@ type NavLabelKey =
   | 'kpi'
   | 'invoice_inbox'
   | 'invoices'
+  | 'sales_orders'
   | 'customers'
   | 'articles'
   | 'supplier_invoices'
   | 'suppliers'
   | 'review'
   | 'transactions'
+  | 'reconciliation'
   | 'bookkeeping'
   | 'chart_of_accounts'
   | 'dimensions'
@@ -162,6 +175,14 @@ interface NavItem {
   // company_settings.dimensions_enabled (UI-visibility gate only; the pages
   // and APIs work regardless, dimensions plan §2).
   requiresDimensions?: boolean
+  // Webshop surfaces: visible only when the company has an active
+  // WooCommerce/Shopify connection or already-imported order rows.
+  // UI-visibility gate only; the page and APIs work regardless.
+  requiresWebshop?: boolean
+  // Körjournal surfaces: visible only when the company has opted in via the
+  // bookkeeping settings toggle (company_settings.mileage_enabled) or already
+  // has trips. UI-visibility gate only; the page and APIs work regardless.
+  requiresMileage?: boolean
   // Paywall surfaces: hidden unless the active company holds this paid
   // capability. Cosmetic only, the page and API gates are the real
   // enforcement; this just keeps the sidebar honest for non-payers.
@@ -189,12 +210,20 @@ const navItems: NavItem[] = [
   { href: '/bookkeeping', labelKey: 'bookkeeping', icon: BookOpen, group: 'arbeta' },
   { href: '/e/general/invoice-inbox', labelKey: 'invoice_inbox', icon: Inbox, group: 'arbeta', requiredCapability: EXTENSION_REQUIRED_CAPABILITY['general/invoice-inbox'] },
   { href: '/transactions', labelKey: 'transactions', icon: ArrowLeftRight, group: 'arbeta' },
+  { href: '/reconciliation', labelKey: 'reconciliation', icon: Scale, group: 'arbeta' },
   { href: '/pending', labelKey: 'review', icon: ClipboardCheck, group: 'arbeta' },
   { href: '/invoices', labelKey: 'invoices', icon: ReceiptText, group: 'arbeta' },
+  // Webshop orders: visible only for companies that actually have a webshop
+  // hooked up (active WooCommerce/Shopify connection or existing order rows).
+  // Deliberately NOT capability-gated: a company whose entitlement lapsed
+  // must still reach its already-imported orders (accounting underlag).
+  { href: '/orders', labelKey: 'sales_orders', icon: ShoppingCart, group: 'arbeta', requiresWebshop: true, betaBadge: true },
   { href: '/supplier-invoices', labelKey: 'supplier_invoices', icon: Wallet, group: 'arbeta' },
   { href: '/salary', labelKey: 'salary', icon: HandCoins, group: 'arbeta', employerOnly: true },
-  // Körjournal is deliberately hidden from the nav; the /mileage route stays live.
-  // { href: '/mileage', labelKey: 'mileage', icon: Car, group: 'arbeta' },
+  // Körjournal: hidden by default (most companies have no car); shows when
+  // the settings toggle is on or trips already exist (hybrid gate, same
+  // "data stays reachable" reasoning as the Order row above).
+  { href: '/mileage', labelKey: 'mileage', icon: Car, group: 'arbeta', requiresMileage: true },
   // Analys: read the numbers.
   { href: '/kpi', labelKey: 'kpi', icon: TrendingUp, group: 'analys' },
   { href: '/reports', labelKey: 'reports', icon: BarChart3, group: 'analys' },
@@ -268,11 +297,11 @@ const groupLabelKey: Record<Exclude<GroupKey, 'top'>, string> = {
   skatt: 'group_tax',
 }
 
-export default function DashboardNav({ companyName: _companyName, entityType, paysSalaries = false, dimensionsEnabled = false, isSandbox = false, extensionNavItems = [], userName = null, userEmail = null, initialUiState }: DashboardNavProps) {
+export default function DashboardNav({ companyName: _companyName, entityType, paysSalaries = false, dimensionsEnabled = false, hasWebshop = false, hasMileage = false, isSandbox = false, extensionNavItems = [], userName = null, userEmail = null, initialUiState }: DashboardNavProps) {
   const pathname = usePathname()
   const router = useRouter()
   const supabase = useRealtimeSupabase()
-  const { company, capabilities, trialEndsAt } = useCompany()
+  const { company, capabilities } = useCompany()
   // Agent identity drives the "Assistent" nav icon: when the user has
   // built their assistant we show its chosen avatar instead of the
   // generic Sparkles glyph.
@@ -291,28 +320,6 @@ export default function DashboardNav({ companyName: _companyName, entityType, pa
     pendingOperations: pendingOpsCount,
     refresh: refreshBadges,
   } = useWorklistBadges(company?.id)
-  // Trial countdown for the sidebar touchpoint. Computed in an effect (not
-  // during render) so server and client markup agree at hydration; an hourly
-  // tick keeps a long-lived tab from showing yesterday's count. The sync
-  // setState is that hydration strategy, not derived-state-in-effect (the
-  // lint only started analyzing this component once the badge-refresh loop
-  // that made the compiler bail was removed).
-  const [trialDaysLeft, setTrialDaysLeft] = useState<number | null>(null)
-  useEffect(() => {
-    if (!trialEndsAt) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setTrialDaysLeft(null)
-      return
-    }
-    const update = () => {
-      const msLeft = new Date(trialEndsAt).getTime() - Date.now()
-      setTrialDaysLeft(msLeft > 0 ? Math.ceil(msLeft / 86_400_000) : null)
-    }
-    update()
-    const id = setInterval(update, 3_600_000)
-    return () => clearInterval(id)
-  }, [trialEndsAt])
-
   const hasCompany = !!company
   const ALWAYS_ENABLED = new Set(['/settings'])
   const isItemEnabled = (href: string) => hasCompany || ALWAYS_ENABLED.has(href)
@@ -485,6 +492,12 @@ export default function DashboardNav({ companyName: _companyName, entityType, pa
     // Dimension surfaces are hidden until the company opts in via the
     // bookkeeping settings toggle (company_settings.dimensions_enabled).
     if (item.requiresDimensions && !dimensionsEnabled) return false
+    // Webshop surfaces are hidden until a store is connected (or order rows
+    // already exist from a since-disconnected store).
+    if (item.requiresWebshop && !hasWebshop) return false
+    // Körjournal is hidden until the company opts in via the bookkeeping
+    // settings toggle (or trips already exist, e.g. created via MCP).
+    if (item.requiresMileage && !hasMileage) return false
     // Paywalled surfaces (e.g. the AI-only Dokumentinkorg) are hidden unless
     // the active company holds the capability. The page + API gates enforce
     // the paywall; this keeps the sidebar from advertising a dead workspace.
@@ -706,7 +719,7 @@ export default function DashboardNav({ companyName: _companyName, entityType, pa
                 alt=""
                 width={26}
                 height={26}
-                className="h-[26px] w-[26px] rounded-md"
+                className="h-[26px] w-[26px] rounded-lg"
               />
             </Link>
             <button
@@ -861,25 +874,10 @@ export default function DashboardNav({ companyName: _companyName, entityType, pa
             </nav>
           </div>
 
-          {/* Trial countdown touchpoint: the paywall is a lifecycle flow, not
-              a settings page, so trial state stays quietly visible in the
-              chrome instead of only inside Inställningar → Abonnemang.
-              Hidden for sandbox/demo (no checkout) and once any non-trial
-              grant is active (trialEndsAt is null then). */}
-          {!collapsed && !isSandbox && trialDaysLeft !== null && (
-            <div className="flex-shrink-0 px-3 pb-2">
-              <Link
-                href="/settings/billing"
-                className="flex items-center gap-2 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground hover:bg-secondary/60 hover:text-foreground transition-colors duration-150"
-              >
-                <Clock className="h-3.5 w-3.5 shrink-0" />
-                <span className="flex-1 truncate">
-                  {tNav('trial_days_left', { days: trialDaysLeft })}
-                </span>
-                <ChevronRight className="h-3.5 w-3.5 shrink-0 opacity-50" />
-              </Link>
-            </div>
-          )}
+          {/* Subscription touchpoint: trial countdown while the trial runs,
+              a persistent muted upgrade link once it (or a subscription) has
+              lapsed. Hides itself for sandbox/demo and paying companies. */}
+          <SubscriptionTouchpoint variant="sidebar" collapsed={collapsed} />
 
           {/* Sticky user block (bottom-left): avatar, name, active company.
               Opens the upward user menu with the company-switcher flyout,
@@ -978,7 +976,7 @@ export default function DashboardNav({ companyName: _companyName, entityType, pa
           {/* Bottom sheet */}
           <div
             className={cn(
-              "md:hidden fixed inset-x-0 bottom-0 z-50 bg-card rounded-t-2xl border-t border-border/40 overflow-y-auto overscroll-contain",
+              "md:hidden fixed inset-x-0 bottom-0 z-50 bg-card rounded-t-xl border-t border-border/40 overflow-y-auto overscroll-contain",
               isClosing
                 ? "animate-out slide-out-to-bottom duration-200"
                 : "animate-in slide-in-from-bottom duration-300"
@@ -988,7 +986,7 @@ export default function DashboardNav({ companyName: _companyName, entityType, pa
             aria-label={tNav('navigation_menu')}
           >
             {/* Drag handle */}
-            <div className="flex justify-center pt-3 pb-1 sticky top-0 bg-card rounded-t-2xl">
+            <div className="flex justify-center pt-3 pb-1 sticky top-0 bg-card rounded-t-xl">
               <div className="w-8 h-1 rounded-full bg-muted-foreground/25" />
             </div>
 
@@ -1174,6 +1172,10 @@ export default function DashboardNav({ companyName: _companyName, entityType, pa
               </div>
 
               <div className="space-y-0.5">
+                {/* Subscription touchpoint: mobile had no trial surface at
+                    all before this row (trial countdown or lapsed upgrade
+                    link; hides itself for sandbox and paying companies). */}
+                <SubscriptionTouchpoint variant="mobile" onNavigate={closeMobileMenu} />
                 {([
                   { href: '/settings', labelKey: 'settings' as NavLabelKey, icon: Settings },
                   { href: '/help', labelKey: 'help' as NavLabelKey, icon: HelpCircle },

@@ -12,6 +12,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { HelpPopover } from '@/components/ui/help-popover'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
 import { useToast } from '@/components/ui/use-toast'
@@ -455,9 +456,13 @@ export default function SendInvoiceDialog({
                     ? 'title_email'
                     : 'title_manual',
             )}
-            {invoice.invoice_number ? t('title_suffix', { number: invoice.invoice_number }) : ''}
+            {/* data-ph-mask: the invoice number is user data */}
+            {invoice.invoice_number ? (
+              <span data-ph-mask="">{t('title_suffix', { number: invoice.invoice_number })}</span>
+            ) : ''}
           </DialogTitle>
-          <DialogDescription>
+          {/* data-ph-mask: amount and customer email are user data */}
+          <DialogDescription data-ph-mask="">
             {formatCurrency(invoice.total, invoice.currency)}
             {invoice.currency !== 'SEK' && invoice.total_sek && (
               <>{t('description_sek_suffix', { amount: formatCurrency(invoice.total_sek) })}</>
@@ -493,10 +498,21 @@ export default function SendInvoiceDialog({
             {mode === 'email' && (
               <div className="space-y-3 rounded-lg border border-border p-3">
                 <div className="space-y-1 text-sm">
-                  <p>
-                    <span className="font-medium">{t('recipient_to_label')}:</span>{' '}
-                    {invoice.customer.email}
-                  </p>
+                  <div className="flex items-start justify-between gap-2">
+                    <p>
+                      <span className="font-medium">{t('recipient_to_label')}:</span>{' '}
+                      {invoice.customer.email}
+                    </p>
+                    {/* Convention 7: the why of fixed CC/BCC and the extra
+                        address rules live behind the "?": only the actual
+                        addresses stay inline. */}
+                    <HelpPopover>
+                      <p>{t('recipient_help_fixed')}</p>
+                      {canCustomizeRecipients && (
+                        <p className="mt-2">{t('recipient_help_additional')}</p>
+                      )}
+                    </HelpPopover>
+                  </div>
                   <p className="text-muted-foreground">
                     <span className="font-medium text-foreground">{t('recipient_fixed_cc_label')}:</span>{' '}
                     {fixedRecipients.cc.length > 0 ? fixedRecipients.cc.join(', ') : t('recipient_none')}
@@ -532,7 +548,6 @@ export default function SendInvoiceDialog({
                         />
                       </div>
                     </div>
-                    <p className="text-xs text-muted-foreground">{t('recipient_additional_hint')}</p>
                     {recipientError && (
                       <p className="text-sm text-destructive" role="alert">{recipientError}</p>
                     )}

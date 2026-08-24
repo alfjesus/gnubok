@@ -298,7 +298,13 @@ export const REPORT_CATALOG: ReportDescriptor[] = [
     // which left the view to host its OWN fiscal-year selector inside a
     // loading-gated action bar: a render deadlock that hung the page on a
     // permanent skeleton (#771).
-    params: 'fiscal',
+    //
+    // 'fiscal-range' since 2026-08-20: the view used to host its own "Datum
+    // från / Datum till" inputs plus a Filtrera button, a second period control
+    // competing with the header's räkenskapsår picker (convention 8). It now
+    // uses the shared ReportDateRange like every other report, mounted with a
+    // full-year default and its own preset memory (see FocusedReport).
+    params: 'fiscal-range',
   },
 
   // --- Export & arkiv: library-only ---
@@ -310,6 +316,21 @@ export const REPORT_CATALOG: ReportDescriptor[] = [
     params: 'fiscal',
     route: '/import?view=export#sie-export',
     libraryOnly: true,
+  },
+  {
+    // Behandlingshistorik (BFL 5 kap. 11 §, BFNAR 2013:2 p. 9.16): the
+    // per-räkenskapsår processing history revisorer ask for at bokslut. Lives
+    // with export & arkiv like Visma's Bokföring > Rapporter placement; the
+    // date sub-range narrows to "what happened between these dates".
+    slug: 'behandlingshistorik',
+    labelKey: 'name_behandlingshistorik',
+    descKey: 'desc_behandlingshistorik',
+    category: 'export',
+    params: 'fiscal-range',
+    exports: ['pdf', 'xlsx'],
+    libraryOnly: true,
+    searchTerms:
+      'behandlingshistorik audit trail audit log händelselogg ändringslogg logg historik vem gjorde vad processing history revision systemdokumentation',
   },
 ]
 

@@ -19,6 +19,7 @@ import {
   type TrialBalanceLike,
 } from './archive-csv'
 import { buildArchiveReadme, buildDriveFolderReadme } from './archive-readme'
+import { currentAppVersion } from './app-version'
 import type { GeneralLedgerReport } from './general-ledger'
 import type {
   AuditLogEntry,
@@ -262,10 +263,7 @@ export async function estimateArchiveSize(
   periodId?: string
 ): Promise<{ total_bytes: number; document_bytes: number; document_count: number }> {
   // Scope=all counts every document (linked or not), mirroring writeDocuments.
-  let query = supabase
-    .from('document_attachments')
-    .select('file_size_bytes, journal_entry_id', { count: 'exact' })
-    .eq('company_id', companyId)
+  let rows: { file_size_bytes: number | null }[]
 
   if (scope === 'period') {
     if (!periodId) {
@@ -286,15 +284,35 @@ export async function estimateArchiveSize(
     if (ids.length === 0) {
       return { total_bytes: ARCHIVE_OVERHEAD_BYTES, document_bytes: 0, document_count: 0 }
     }
-    query = query.in('journal_entry_id', ids)
+    // A busy year holds thousands of entries and can hold more than a page of
+    // documents: chunk the IN() list (PostgREST URL limit) and paginate every
+    // chunk (PostgREST row cap). One flat IN() + single read undercounts as
+    // soon as either limit is hit.
+    rows = []
+    for (let i = 0; i < ids.length; i += CHILD_FK_CHUNK) {
+      const chunk = ids.slice(i, i + CHILD_FK_CHUNK)
+      const chunkRows = await fetchAllRows<{ file_size_bytes: number | null }>(({ from, to }) =>
+        supabase
+          .from('document_attachments')
+          .select('id, file_size_bytes')
+          .eq('company_id', companyId)
+          .in('journal_entry_id', chunk)
+          .order('id', { ascending: true })
+          .range(from, to)
+      )
+      rows.push(...chunkRows)
+    }
+  } else {
+    rows = await fetchAllRows<{ file_size_bytes: number | null }>(({ from, to }) =>
+      supabase
+        .from('document_attachments')
+        .select('id, file_size_bytes')
+        .eq('company_id', companyId)
+        .order('id', { ascending: true })
+        .range(from, to)
+    )
   }
 
-  const { data, error } = await query
-  if (error) {
-    throw new Error(`Failed to estimate archive size: ${error.message}`)
-  }
-
-  const rows = (data as { file_size_bytes: number | null }[]) || []
   const documentBytes = rows.reduce((sum, r) => sum + (Number(r.file_size_bytes) || 0), 0)
 
   return {
@@ -840,6 +858,23 @@ export const MASTER_DATA_DUMP_TABLES: MasterDataTableSpec[] = [
   // Delivery metadata proves which recipient received the archived PDF and
   // when, so it is räkenskapsinformation alongside the invoice itself.
   { name: 'invoice_deliveries', file: 'invoice_deliveries.json', orderBy: 'created_at' },
+  // Peppol archive evidence is split so the exact staged UBL, every verified
+  // asynchronous event, and provider evidence stay independently auditable.
+  { name: 'peppol_deliveries', file: 'peppol_deliveries.json', orderBy: 'created_at' },
+  { name: 'peppol_delivery_events', file: 'peppol_delivery_events.json', orderBy: 'created_at' },
+  {
+    name: 'peppol_delivery_evidence',
+    file: 'peppol_delivery_evidence.json',
+    orderBy: 'created_at',
+  },
+  // Receiving side: which identifiers the company published, and every
+  // inbound e-invoice with the exact received XML (the underlag itself).
+  { name: 'peppol_registrations', file: 'peppol_registrations.json', orderBy: 'created_at' },
+  {
+    name: 'peppol_inbound_documents',
+    file: 'peppol_inbound_documents.json',
+    orderBy: 'received_at',
+  },
   { name: 'recurring_invoice_schedules', file: 'recurring_invoice_schedules.json' },
   // Supplier invoicing
   { name: 'supplier_invoices', file: 'supplier_invoices.json', orderBy: 'invoice_date' },
@@ -850,6 +885,19 @@ export const MASTER_DATA_DUMP_TABLES: MasterDataTableSpec[] = [
     denormalize: { prefix: 'supplier_invoice_', columns: ['currency', 'exchange_rate'] },
   },
   { name: 'supplier_invoice_payments', file: 'supplier_invoice_payments.json' },
+  // Payment batches (betalfil): the immutable instruction snapshots a
+  // generated bank payment file derives from; underlag for the payments it
+  // initiated, so they leave with the archive.
+  {
+    name: 'supplier_payment_batches',
+    file: 'supplier_payment_batches.json',
+    orderBy: 'created_at',
+  },
+  {
+    name: 'supplier_payment_batch_items',
+    file: 'supplier_payment_batch_items.json',
+    orderBy: 'created_at',
+  },
   // Underlag intake: the chat answers behind a verifikat.
   //
   // A projection, not the whole table. `channel_context` holds the human
@@ -886,6 +934,10 @@ export const MASTER_DATA_DUMP_TABLES: MasterDataTableSpec[] = [
   // NOTE: the date column on transactions is `date` (a previous spec said
   // booking_date, which does not exist: every backup got an error stub).
   { name: 'transactions', file: 'transactions.json', orderBy: 'date' },
+  // Webshop order rows are booking underlag (and carry customer personal
+  // data), so they belong in the archive like transactions do.
+  { name: 'webshop_orders', file: 'webshop_orders.json', orderBy: 'order_date' },
+  { name: 'webshop_store_settings', file: 'webshop_store_settings.json' },
   { name: 'transaction_voucher_links', file: 'transaction_voucher_links.json' },
   { name: 'bank_file_imports', file: 'bank_file_imports.json', orderBy: 'created_at' },
   { name: 'cash_accounts', file: 'cash_accounts.json' },
@@ -932,6 +984,10 @@ export const MASTER_DATA_DUMP_TABLES: MasterDataTableSpec[] = [
   // lines and the old description/date, i.e. the preserved side of every
   // in-verifikat rättelse — räkenskapsinformation, not an operation log.
   { name: 'journal_entry_rattelse_log', file: 'journal_entry_rattelse_log.json', orderBy: 'created_at' },
+  // Reconciliation sign-offs ("avstämt t.o.m."): who attested which account
+  // through which date with the numbers as they stood, plus reopen stamps.
+  // Part of the avstämningsdokumentation an auditor asks for; kept.
+  { name: 'account_reconciliations', file: 'account_reconciliations.json', orderBy: 'signed_at' },
   { name: 'journal_entry_no_doc_required', file: 'journal_entry_no_doc_required.json', pageKey: 'journal_entry_id' },
   { name: 'rot_rut_payout_requests', file: 'rot_rut_payout_requests.json', orderBy: 'created_at' },
   // No `denormalize`: rot_rut_payout_requests has no currency column either.
@@ -971,6 +1027,8 @@ export const ARCHIVE_COVERED_ELSEWHERE_TABLES: Record<string, string> = {
  * a portable räkenskapsinformation backup.
  */
 export const ARCHIVE_EXCLUDED_TABLES: Record<string, string> = {
+  // Operator-side Peppol access grant and sending cap: platform configuration, not the company's räkenskapsinformation.
+  peppol_access: 'platform access grant (status, sending cap); no bookkeeping content',
   agent_conversations: 'AI assistant state, not räkenskapsinformation',
   agent_memory: 'AI assistant state, not räkenskapsinformation',
   agent_profiles: 'AI assistant state, not räkenskapsinformation',
@@ -981,11 +1039,13 @@ export const ARCHIVE_EXCLUDED_TABLES: Record<string, string> = {
   booking_template_usage: 'usage telemetry',
   calendar_feeds: 'feed tokens (secrets)',
   capability_grants: 'entitlement state',
+  categorize_calibration_samples: 'auto-booking confidence telemetry, not räkenskapsinformation',
   chat_messages: 'AI assistant state, not räkenskapsinformation',
   chat_sessions: 'AI assistant state, not räkenskapsinformation',
   company_capability_config: 'entitlement state',
   company_inbound_domains: 'inbound-mail infrastructure',
   company_inboxes: 'inbound-mail infrastructure',
+  company_sending_domains: 'outbound-mail infrastructure (sender domain verification state)',
   company_invitations: 'membership state, meaningless outside the platform',
   company_members: 'membership state, meaningless outside the platform',
   company_subscriptions: 'billing state',
@@ -997,9 +1057,11 @@ export const ARCHIVE_EXCLUDED_TABLES: Record<string, string> = {
   graph_transaction_counterparties: 'derived AI context graph, regenerable',
   idempotency_keys: 'infrastructure',
   inbox_rate_counters: 'infrastructure',
-  mail_connections: 'mailbox OAuth grants (live refresh tokens), not portable',
+  mail_connections:
+    'mailbox OAuth grants (live refresh tokens), not portable. The receipts they find are archived as documents.',
   mcp_tasks: 'MCP task handles: transient tool-call state with a 1-hour TTL',
   metered_events: 'billing telemetry',
+  notice_dismissals: 'per-user UI notice dismissal state, not räkenskapsinformation',
   notification_log: 'notification dedup log',
   operations: 'staged-operation workflow state',
   payment_match_log: 'derived matching log',
@@ -1007,6 +1069,8 @@ export const ARCHIVE_EXCLUDED_TABLES: Record<string, string> = {
   processing_history: 'internal processing log; behandlingshistorik exports from audit_log',
   provider_consents: 'consent tokens, not portable',
   salary_payslip_deliveries: 'delivery log',
+  skattekonto_file_imports:
+    'import log for the skattekonto mirror below; the statement is re-downloadable from Skatteverket',
   skattekonto_transactions: 'mirror of Skatteverket skattekonto, re-fetchable at source',
   skatteverket_api_audit_log: 'integration audit log',
   skatteverket_company_connections: 'integration connection state',
@@ -1019,6 +1083,7 @@ export const ARCHIVE_EXCLUDED_TABLES: Record<string, string> = {
     'WhatsApp bot conversation state (company_id is only a which-company pin); receipts live in document_attachments',
   webhooks: 'automation config with signing secrets',
   woocommerce_connections: 'WooCommerce connection state (encrypted API secrets)',
+  shopify_connections: 'Shopify connection state (encrypted API secrets)',
 }
 
 /** Max parent ids per `IN (...)` chunk: keeps the PostgREST URL well under limits. */
@@ -1324,6 +1389,9 @@ async function buildSystemDoc(
       name: branding.appName.toLowerCase(),
       description: 'Bokforingssystem for enskild firma och aktiebolag',
       url: branding.appUrl,
+      // BFNAR 2013:2 p. 9.16 second paragraph: program versions are system
+      // changes that affect processing; the archive names the running build.
+      version: currentAppVersion(),
     },
     kontoplan: {
       standard: 'BAS 2026',
@@ -1358,6 +1426,15 @@ async function buildSystemDoc(
       bank: 'Enable Banking (PSD2)',
       email: 'Resend',
       export_format: 'SIE4',
+    },
+    // BFNAR 2013:2 p. 9.15: where and how the behandlingshistorik is produced.
+    behandlingshistorik: {
+      beskrivning:
+        'Skapas automatiskt (BFL 5 kap. 11 §, BFNAR 2013:2 punkt 9.16): registreringstidpunkt och utförare för varje bokföringspost (journal_entries), förändringar via databasens oföränderliga ändringslogg audit_log (kontoplan, inställningar som styr bokföringen, räkenskapsår, API-nycklar, makuleringar, raderingar), rättelser i samma verifikat (journal_entry_rattelse_log) samt SIE-, bankfils- och migreringsloggar.',
+      rapport:
+        'Rapporter > Export & arkiv > Behandlingshistorik: per räkenskapsår eller datumintervall, som PDF, CSV eller Excel',
+      arkivfil: 'revision/behandlingshistorik.json i denna säkerhetsbackup (råa loggrader)',
+      tidszon: 'Europe/Stockholm i rapporten, UTC i JSON-filen',
     },
     generated_at: new Date().toISOString(),
     fiscal_periods: periods.map((p) => ({

@@ -18,6 +18,14 @@ import type {
 // Core Event Types: discriminated union of all system events
 // ============================================================
 
+/**
+ * Who runs AI extraction on an uploaded document.
+ * - 'invoice-inbox': the inbox extracts and mirrors the result itself.
+ * - 'none': nobody should; the caller already holds the booking.
+ * Unset: the document-extraction extension extracts (default).
+ */
+export type DocumentExtractionOwner = 'invoice-inbox' | 'none'
+
 export type CoreEvent =
   // Bookkeeping
   | { type: 'journal_entry.drafted'; payload: { entry: JournalEntry; userId: string; companyId: string } }
@@ -26,7 +34,14 @@ export type CoreEvent =
   | { type: 'journal_entry.reversed'; payload: { originalEntry: JournalEntry; reversalEntry: JournalEntry; userId: string; companyId: string } }
   | { type: 'journal_entry.deleted'; payload: { entryId: string; voucherSeries: string; voucherNumber: number; userId: string; companyId: string } }
   // Documents
-  | { type: 'document.uploaded'; payload: { document: DocumentAttachment; userId: string; companyId: string } }
+  // extractionOwner: set by the invoice inbox on documents it extracts itself,
+  // so the document-extraction extension yields instead of racing it (the
+  // inbox row does not exist yet when this event fires inside uploadDocument).
+  // 'none' is an explicit opt-out: the uploader already knows the booking
+  // (provider underlag import links each file to its posted verifikat), so
+  // running a paid model over it would buy nothing. The extension stamps the
+  // row as skipped instead of extracting.
+  | { type: 'document.uploaded'; payload: { document: DocumentAttachment; userId: string; companyId: string; extractionOwner?: DocumentExtractionOwner } }
   | { type: 'document.accessed'; payload: { document: { id: string; file_name: string }; userId: string; companyId: string } }
   | { type: 'document.deleted'; payload: { document: { id: string; file_name: string }; userId: string; companyId: string } }
   // Invoicing
@@ -54,11 +69,27 @@ export type CoreEvent =
   | { type: 'transaction.synced'; payload: { transactions: Transaction[]; userId: string; companyId: string } }
   | { type: 'transaction.categorized'; payload: { transaction: Transaction; account: string; taxCode: string; userId: string; companyId: string } }
   | { type: 'transaction.reconciled'; payload: { transaction: Transaction; journalEntryId: string; method: ReconciliationMethod; userId: string; companyId: string } }
+  // Account-keyed reconciliation (lib/reconciliation/actions.ts): one event per
+  // link made or removed on any reconcilable account (bank:<cash_account_id>,
+  // skattekonto, later manual:NNNN). `transaction.reconciled` keeps firing for
+  // bank links made through the bank engine; these are the kind-agnostic
+  // signals the flows builder triggers on.
+  | { type: 'reconciliation.matched'; payload: { accountKey: string; externalId: string; journalEntryId: string; method: 'manual' | 'proposal'; userId: string; companyId: string } }
+  | { type: 'reconciliation.unmatched'; payload: { accountKey: string; externalId: string; previousJournalEntryId: string | null; userId: string; companyId: string } }
+  // Sign-off: the human (or agent-staged, user-approved) assertion "reconciled
+  // through this date" on one account (lib/reconciliation/signoff.ts), and its undo.
+  | { type: 'reconciliation.signed_off'; payload: { accountKey: string; signoffId: string; throughDate: string; unexplainedDifference: number | null; userId: string; companyId: string } }
+  | { type: 'reconciliation.reopened'; payload: { accountKey: string; signoffId: string; throughDate: string; reason: string | null; userId: string; companyId: string } }
   // Bank connection lifecycle: consent + account selection are the
   // GDPR/PSD2 audit points; emitted to event_log for compliance trail.
   | { type: 'bank_connection.consent_granted'; payload: { connectionId: string; bankName: string | null; accountCount: number; consentExpiresAt: string | null; userId: string; companyId: string } }
   | { type: 'bank_connection.account_selection_changed'; payload: { connectionId: string; bankName: string | null; previousStatus: string; newStatus: string; enabledCount: number; totalCount: number; userId: string; companyId: string } }
   | { type: 'bank_connection.revoked'; payload: { connectionId: string; bankName: string | null; userId: string; companyId: string } }
+  // Emitted when a new or renewed connection supersedes an older row for the
+  // same bank in the same company: the old row is parked as 'revoked' with
+  // superseded_by pointing at the replacement, and its transactions are
+  // re-pointed. connectionId is the SUPERSEDED (old) row, mirroring .revoked.
+  | { type: 'bank_connection.superseded'; payload: { connectionId: string; supersededById: string; bankName: string | null; userId: string; companyId: string } }
   // Emitted when the PSD2 callback fails to mirror a returned account into
   // cash_accounts. ASVS V16 / ISO 27001 A.8.15: security-relevant failures
   // must land in a structured audit log (event_log, 30-day TTL) rather than
@@ -82,6 +113,9 @@ export type CoreEvent =
   // party's API credentials are granted/dropped).
   | { type: 'woocommerce.connected'; payload: { connectionId: string; storeUrl: string; userId: string; companyId: string } }
   | { type: 'woocommerce.disconnected'; payload: { connectionId: string; storeUrl: string | null; reason: 'user' | 'revoked_upstream'; userId: string; companyId: string } }
+  // Shopify store lifecycle: same audit doctrine as stripe.*/woocommerce.*.
+  | { type: 'shopify.connected'; payload: { connectionId: string; shopDomain: string; userId: string; companyId: string } }
+  | { type: 'shopify.disconnected'; payload: { connectionId: string; shopDomain: string | null; reason: 'user' | 'revoked_upstream'; userId: string; companyId: string } }
   // Periods
   | { type: 'period.locked'; payload: { period: FiscalPeriod; userId: string; companyId: string } }
   | { type: 'period.unlocked'; payload: { period: FiscalPeriod; userId: string; companyId: string } }

@@ -92,8 +92,22 @@ const KNOWN_STALE_ON_CONFLICT: Record<string, string> = {}
  *
  * Baseline 2026-08-06: 370 (158 dynamic-payload, 120 dynamic-select,
  * 47 dynamic-logical, 38 spread-payload, 5 dynamic-column, 2 computed key).
+ *
+ * 2026-08-12 +3: lib/webshop-orders/ingest.ts builds partial UPDATE payloads
+ * at runtime (frozen rows get safe fields only; unfrozen rows get optional
+ * parent/legacy links). Writing the shapes as inline literals would need one
+ * variant per key combination; the row shapes are covered by ingest.test.ts.
+ *
+ * 2026-08-17 +1: lib/import/skattekonto-file/import-service.ts inserts parsed
+ * statement rows via a mapped batch (same shape as every other file importer);
+ * the row shape is covered by the execute route tests and the pg-real suite.
+ *
+ * 2026-08-21 +1: lib/invoices/peppol-inbound.ts updates the processing state
+ * of an inbound Peppol document through one helper (five literal shapes:
+ * routed / unrouted / converted / failed, all partial); the column set is
+ * pinned by peppol-inbound.test.ts and the pg-real immutability test.
  */
-const UNRESOLVED_CEILING = 375
+const UNRESOLVED_CEILING = 380
 
 /**
  * Floor on statically resolved column references. Guards the guard: if a change

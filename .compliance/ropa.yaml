@@ -228,6 +228,47 @@ processing_activities:
       - bankid_signing_required_for_filing
       - immutable_audit_log
 
+  - id: moms.declaration_status_read
+    name: Avläsning av inlämnad momsdeklaration och beslut från Skatteverket
+    purpose: >-
+      Läsa tillbaka en redan inlämnad momsdeklaration (inlamnat) och
+      Skatteverkets beslut (beslutat) för en period, på begäran av en
+      medlem i företaget via v1 REST-API:t eller MCP, så att bokföringen
+      kan stämmas av mot faktiskt inlämnade uppgifter. Läsning sker live
+      mot Skatteverket; deklarationsinnehållet lagras inte hos oss, endast
+      en audit-rad om att anropet gjordes.
+    lawful_basis: art_6_1_b   # service provision: read-back requested by the customer
+    special_category_basis: null
+    controller: gnubok-tenant
+    processor: anthropic-na
+    data_subjects:
+      - business_owner
+    data_categories:
+      - user.government_id          # orgnummer (juridiska personer) eller pnr
+      - user.financial.tax          # rutor 05-62 i det inlämnade underlaget/beslutet
+    recipients:
+      - name: Skatteverket
+        country: SE
+        role: legal_recipient
+    international_transfers:
+      applicable: false
+      mechanism: null
+      note: Sweden-to-Sweden flow; no third-country transfer.
+    retention:
+      # Response bodies are returned to the caller and never persisted.
+      # Only the outbound call metadata lands in the audit log.
+      duration: 7y
+      basis: bfl_7_kap
+      stored_in:
+        - skatteverket_api_audit_log
+    security_measures:
+      - rls_company_scoped
+      - rbac_company_member_role_check
+      - tls_1_3_to_skatteverket
+      - immutable_audit_log
+      - no_payload_body_persisted
+      - upstream_error_bodies_logged_server_side_only
+
   - id: psd2.cash_account_mirror
     name: PSD2-konton speglas till cash_accounts
     purpose: >-
@@ -605,9 +646,9 @@ processing_activities:
     data_categories:
       - user.contact.email    # person property via identify(), aldrig i event-properties
       - user.name             # profiles.full_name
-      # Sessionsinspelningen visar synlig text och tangentbordsinmatning,
-      # förutom maskerade fält (belopp, person-/orgnummer, lösenord samt
-      # data-ph-mask-taggade element), se security_measures nedan.
+      # Sessionsinspelningen är maskerad som standard: all tangentbords-
+      # inmatning och all text maskeras, utom appens eget statiska gränssnitt
+      # (rubriker, navigering, knappar, etiketter), se security_measures.
       - user.behavior         # sidvisningar, klick, händelser, sessionsinspelning
       - user.device           # user agent, skärmstorlek, IP (trunkeras av PostHog)
       # Supportärenden: fritext som användaren SJÄLV skriver till supporten via
@@ -637,12 +678,18 @@ processing_activities:
       stored_in:
         - posthog_eu   # externt hos biträdet; inget lagras i vår databas
     security_measures:
-      # Mönsterbaserad maskering (2026-08-06, ersätter maskera-allt-läget):
-      # belopp (valutaformaterad text), person-/organisationsnummer (text och
-      # inmatning) och lösenord maskeras; övrig text och tangentbordsinmatning
-      # syns i inspelningen för felsökning. data-ph-mask tvingar maskering av
-      # utpekade PII-element; låst av test i lib/analytics/__tests__.
-      - session_replay_masks_amounts_and_identity_numbers  # lib/analytics/replay-masking.ts
+      # Maskerat-som-standard (2026-08-17, ersätter det mönsterbaserade läget
+      # från 2026-08-06): ALL tangentbordsinmatning maskeras (rrweb
+      # maskAllInputs utan undantagsfunktion) och ALL text maskeras utom
+      # element taggade data-ph-unmask (statiskt i18n-gränssnitt: rubriker,
+      # navigering, etiketter, knappar) samt tabellkolumnrubriker. Även
+      # otaggat gränssnitt maskeras, så felmoden för ny UI är övermaskering,
+      # aldrig läckage. Taggat gränssnitt mönsterskrubbas dessutom på belopp
+      # och person-/organisationsnummer. data-ph-mask tvingar maskering och
+      # vinner över data-ph-unmask; låst av test i lib/analytics/__tests__.
+      - session_replay_masked_by_default                   # lib/analytics/replay-masking.ts
+      - session_replay_masks_all_input_values
+      - session_replay_masks_amounts_and_identity_numbers_in_chrome
       - session_replay_masks_password_inputs
       - org_number_never_transmitted_as_group_property     # låst av test i lib/analytics/__tests__
       - no_pii_in_event_properties           # PII endast som person properties via identify()

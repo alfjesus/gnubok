@@ -1,10 +1,11 @@
-import { createClient, type SupabaseClient } from '@supabase/supabase-js'
+import { type SupabaseClient } from '@supabase/supabase-js'
+import { createServiceRoleClient } from '@/lib/supabase/service-client'
 import { NextResponse } from 'next/server'
 import { syncAccountTransactions } from '@/extensions/general/enable-banking/lib/sync'
 import {
-  runReconciliation,
-  DEFAULT_UNATTENDED_CONFIDENCE_THRESHOLD,
-} from '@/lib/reconciliation/bank-reconciliation'
+  runUnattendedReconciliationSweep,
+  toSweepSummary,
+} from '@/lib/reconciliation/unattended-sweep'
 import {
   isConsentExpiringSoon,
   getDaysUntilExpiry,
@@ -52,7 +53,7 @@ export const GET = withCronContext('cron.bank_sync', async (_request, ctx) => {
     })
   }
 
-  const supabase = createClient(supabaseUrl, supabaseServiceKey)
+  const supabase = createServiceRoleClient(supabaseUrl, supabaseServiceKey)
 
   // Clean up stale pending connections (older than 1 hour)
   const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString()
@@ -261,22 +262,36 @@ export const GET = withCronContext('cron.bank_sync', async (_request, ctx) => {
       const totalDuplicates = syncResults.reduce((sum, r) => sum + r.duplicates, 0)
       const totalErrors = syncResults.reduce((sum, r) => sum + r.errors, 0)
 
-      // Batch reconciliation sweep when SIE overlap detected
+      // Batch reconciliation sweep when SIE overlap detected. One scoped run
+      // per enabled cash account (issue #1298): a pooled run matched every
+      // same-currency account's transactions against 1930's GL lines and could
+      // persist a cross-account journal_entry_id.
       if (sieOverlap && totalImported > 0) {
         try {
-          const reconResult = await runReconciliation(supabase, connection.company_id, connection.user_id, {
-            dateFrom: fromDate,
-            dateTo: toDate,
-            // Unattended run: nobody reviews a dry-run first, so never commit
-            // low-confidence (fuzzy / date-range) matches automatically.
-            confidenceThreshold: DEFAULT_UNATTENDED_CONFIDENCE_THRESHOLD,
-          })
+          const reconResult = await runUnattendedReconciliationSweep(
+            supabase,
+            connection.company_id,
+            connection.user_id,
+            { dateFrom: fromDate, dateTo: toDate },
+          )
+          // Stamp the outcome so the UI can render "Vi matchade X av Y" and the
+          // review surface knows there is something to granska.
+          await supabase
+            .from('bank_connections')
+            .update({
+              last_sie_sweep: toSweepSummary(reconResult, { dateFrom: fromDate, dateTo: toDate }),
+            })
+            .eq('id', connection.id)
           if (reconResult.applied > 0 || reconResult.skippedBelowThreshold > 0) {
             ctx.log.info('batch reconciliation after sync', {
               companyId: connection.company_id,
               applied: reconResult.applied,
               skippedBelowThreshold: reconResult.skippedBelowThreshold,
-              total: reconResult.matches.length,
+              accounts: reconResult.accounts.map((a) => ({
+                accountNumber: a.accountNumber,
+                applied: a.applied,
+                skippedBelowThreshold: a.skippedBelowThreshold,
+              })),
             })
           }
         } catch {

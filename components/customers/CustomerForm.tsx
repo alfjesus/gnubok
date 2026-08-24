@@ -25,6 +25,7 @@ import {
   UNDECRYPTABLE_PERSONAL_NUMBER_MASK,
   isMaskedPersonalNumber,
 } from '@/lib/customers/mask-personal-number'
+import { looksLikeSwedishPersonalNumber } from '@/lib/customers/personal-number-shape'
 import type { CreateCustomerInput } from '@/types'
 
 interface CustomerFormProps {
@@ -77,6 +78,19 @@ export default function CustomerForm({
     default_payment_terms: z.number().min(1).optional(),
     notes: z.string().optional(),
   }).superRefine((customer, ctx) => {
+    // A personnummer entered as a business org number would be shown
+    // unmasked in every list (only individual customers are masked).
+    if (
+      customer.org_number &&
+      customer.customer_type !== 'individual' &&
+      looksLikeSwedishPersonalNumber(customer.org_number)
+    ) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['org_number'],
+        message: t('org_number_looks_personal'),
+      })
+    }
     const cc = parseInvoiceRecipientText(customer.invoice_email_cc_addresses ?? '')
     const bcc = parseInvoiceRecipientText(customer.invoice_email_bcc_addresses ?? '')
     for (const [field, addresses] of [
@@ -318,7 +332,7 @@ export default function CustomerForm({
 
       {/* Customer-specific invoice recipients */}
       <div className="space-y-4">
-        <h3 className="text-sm font-medium">{t('invoice_email_section')}</h3>
+        <h3 className="text-sm">{t('invoice_email_section')}</h3>
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div className="space-y-2">
             <Label htmlFor="invoice_email_cc_addresses">{t('invoice_email_cc_label')}</Label>
@@ -350,7 +364,7 @@ export default function CustomerForm({
 
       {/* Address */}
       <div className="space-y-4">
-        <h3 className="font-medium">{t('address_section')}</h3>
+        <h3>{t('address_section')}</h3>
         <div className="space-y-2">
           <Label htmlFor="address_line1">{t('street_label')}</Label>
           <Input
@@ -390,7 +404,7 @@ export default function CustomerForm({
       {/* Identification: depends on customer type */}
       {customerType === 'individual' ? (
         <div className="space-y-4 pt-4 border-t">
-          <h3 className="font-medium">{t('individual_section')}</h3>
+          <h3>{t('individual_section')}</h3>
 
           <div className="space-y-2">
             <Label htmlFor="personal_number">{t('personal_number_label')}</Label>
@@ -408,7 +422,7 @@ export default function CustomerForm({
         </div>
       ) : (
         <div className="space-y-4 pt-4 border-t">
-          <h3 className="font-medium">{t('business_section')}</h3>
+          <h3>{t('business_section')}</h3>
 
           <div className="space-y-2">
             <Label htmlFor="org_number">{t('org_number_label')}</Label>
@@ -417,6 +431,9 @@ export default function CustomerForm({
               placeholder={t('org_number_placeholder')}
               {...register('org_number')}
             />
+            {errors.org_number && (
+              <p className="text-sm text-destructive">{errors.org_number.message}</p>
+            )}
           </div>
 
           {(customerType === 'eu_business' || customerType === 'non_eu_business') && (

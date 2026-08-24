@@ -7,12 +7,18 @@ import {
   CannotEditNonDraftError,
   CannotReverseNonPostedError,
   CannotReverseStornoError,
+  CorrectionChainTooDeepError,
   EntryAlreadyReversedError,
   EntryDateOutsideFiscalPeriodError,
   FiscalPeriodNotFoundError,
+  withUnusedVoucherAllocation,
   JournalEntryNotBalancedError,
   JournalEntryNotFoundError,
 } from '@/lib/bookkeeping/errors'
+import {
+  correctionChainDepth,
+  CORRECTION_CHAIN_GUARD_DEPTH,
+} from '@/lib/core/bookkeeping/correction-chain'
 import { resolveDefaultSeriesForSource } from '@/lib/bookkeeping/voucher-series-resolver'
 import {
   normalizeLineDimensions,
@@ -1039,7 +1045,15 @@ export async function reverseEntry(
   companyId: string,
   userId: string,
   entryId: string,
-  reversalDate?: string
+  reversalDate?: string,
+  options?: {
+    /**
+     * Bypass the correction-chain depth guard: reversing an entry that is
+     * already CORRECTION_CHAIN_GUARD_DEPTH+ links deep throws
+     * CorrectionChainTooDeepError unless set (see storno-service correctEntry).
+     */
+    allowDeepChain?: boolean
+  }
 ): Promise<JournalEntry> {
 
   // Fetch original entry with lines
@@ -1071,6 +1085,16 @@ export async function reverseEntry(
     throw new CannotReverseStornoError(original.source_type)
   }
 
+  // Chain-depth guard: a storno on an entry already deep in a rättelse chain
+  // is almost always an agent reflexively cancelling its own correction
+  // (Christoffer case 2026-08-11). Same guard and bypass as correctEntry.
+  if (!options?.allowDeepChain) {
+    const chain = await correctionChainDepth(supabase, companyId, original)
+    if (chain.depth >= CORRECTION_CHAIN_GUARD_DEPTH) {
+      throw new CorrectionChainTooDeepError(chain.depth, chain.rootVoucher)
+    }
+  }
+
   const lines = (original.lines as JournalEntryLine[]) || []
 
   // Create reversed lines (swap debit and credit, preserve dimensions)
@@ -1099,18 +1123,33 @@ export async function reverseEntry(
     original.fiscal_period_id,
     original.voucher_series || 'A'
   )
+  const unusedVoucherAllocation = {
+    fiscalPeriodId: original.fiscal_period_id,
+    voucherSeries: original.voucher_series || 'A',
+    voucherNumber,
+  }
 
   // Resolve account IDs: include inactive rows. The accounts on the
   // original committed entry were active at commit time; if the user has
   // since toggled one off, the storno must still be allowed to go through
   // (BFL 5 kap 5§). Only a truly missing chart row (rare: would require
   // the row to have been deleted) still throws AccountsNotInChartError.
-  const accountIdMap = await resolveAccountIds(supabase, companyId, reversedLines, { includeInactive: true })
+  let accountIdMap: Map<string, string>
+  try {
+    accountIdMap = await resolveAccountIds(supabase, companyId, reversedLines, { includeInactive: true })
+  } catch (resolveError) {
+    // The sequence RPC committed, but no reversal row exists yet. Carry the
+    // exact unused number so the caller can document this real gap.
+    throw withUnusedVoucherAllocation(resolveError, unusedVoucherAllocation)
+  }
 
   const reversalAccountNumbers = [...new Set(reversedLines.map(l => l.account_number))]
   const missingReversalAccounts = reversalAccountNumbers.filter(num => !accountIdMap.has(num))
   if (missingReversalAccounts.length > 0) {
-    throw new AccountsNotInChartError(missingReversalAccounts)
+    throw withUnusedVoucherAllocation(
+      new AccountsNotInChartError(missingReversalAccounts),
+      unusedVoucherAllocation,
+    )
   }
 
   // Create reversal entry with reverses_id link
@@ -1132,8 +1171,18 @@ export async function reverseEntry(
     .select()
     .single()
 
-  if (reversalError || !reversalEntry) {
-    throw new BookkeepingDatabaseError('create_reversal_entry', reversalError?.message)
+  if (reversalError) {
+    // PostgreSQL rejected the insert, so the allocated number is confirmed
+    // unused and can be explained without guessing from the original entry.
+    throw withUnusedVoucherAllocation(
+      new BookkeepingDatabaseError('create_reversal_entry', reversalError.message),
+      unusedVoucherAllocation,
+    )
+  }
+  if (!reversalEntry) {
+    // No database error means the outcome is ambiguous. Do not label the
+    // number unused unless the engine has a confirmed failure state.
+    throw new BookkeepingDatabaseError('create_reversal_entry', undefined)
   }
 
   // Insert reversal lines with dimensions
@@ -1144,6 +1193,9 @@ export async function reverseEntry(
     .insert(lineInserts)
 
   if (linesError) {
+    // Keep the reversal header as cancelled bookkeeping evidence. The gap
+    // detector counts every non-draft header, including cancelled rows, so
+    // this allocation is still used and must not be labelled as a gap.
     await supabase.from('journal_entries').update({ status: 'cancelled' }).eq('id', reversalEntry.id)
     await supabase.from('journal_entry_lines').delete().eq('journal_entry_id', reversalEntry.id)
     throw new BookkeepingDatabaseError('create_reversal_lines', linesError.message)
@@ -1156,6 +1208,8 @@ export async function reverseEntry(
     .eq('id', reversalEntry.id)
 
   if (postError) {
+    // As above, cleanup preserves the allocated voucher on the cancelled
+    // header. A failed or ambiguous cleanup also cannot prove it unused.
     await supabase.from('journal_entries').update({ status: 'cancelled' }).eq('id', reversalEntry.id)
     await supabase.from('journal_entry_lines').delete().eq('journal_entry_id', reversalEntry.id)
     throw new BookkeepingDatabaseError('post_reversal_entry', postError.message)
@@ -1175,6 +1229,7 @@ export async function reverseEntry(
   if (casError || !updatedOriginal || updatedOriginal.length === 0) {
     // Another concurrent reversal already changed the status: mark the orphaned
     // reversal as cancelled so it's excluded from reports but remains traceable.
+    // Its header still occupies the voucher number, so no gap metadata applies.
     await supabase.from('journal_entries').update({ status: 'cancelled' }).eq('id', reversalEntry.id)
     await supabase.from('journal_entry_lines').delete().eq('journal_entry_id', reversalEntry.id)
     throw new EntryAlreadyReversedError()

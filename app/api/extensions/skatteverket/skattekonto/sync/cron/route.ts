@@ -1,8 +1,9 @@
-import { createClient } from '@supabase/supabase-js'
+import { createServiceRoleClient } from '@/lib/supabase/service-client'
 import { NextResponse } from 'next/server'
 import { ensureInitialized } from '@/lib/init'
 import { verifyCronSecret } from '@/lib/auth/cron'
 import { getCompanyIdsWithCapability } from '@/lib/entitlements/has-capability'
+import { orderByStalestSync } from '@/lib/skatteverket/sync-order'
 import { CAPABILITY } from '@/lib/entitlements/keys'
 import { createExtensionContext } from '@/lib/extensions/context-factory'
 import { syncSkattekonto, SKATTEKONTO_LAST_SYNCED_AT_KEY } from '@/extensions/general/skatteverket/lib/skattekonto-sync'
@@ -66,7 +67,7 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: 'Missing Supabase configuration' }, { status: 500 })
   }
 
-  const supabase = createClient(supabaseUrl, supabaseServiceKey)
+  const supabase = createServiceRoleClient(supabaseUrl, supabaseServiceKey)
 
   // User-token entries. The token row is keyed by user_id but carries
   // company_id (multi-tenant refactor). Rows flagged needs_reconsent are
@@ -82,7 +83,9 @@ export async function GET(request: Request) {
         .order('expires_at', { ascending: true })
         .order('user_id', { ascending: true })
         .range(from, to),
-      { dedupeBy: token => token.user_id },
+      // One row per (user, company) since tokens went per-company: deduping by
+      // user alone would drop every company but one for multi-company operators.
+      { dedupeBy: token => `${token.user_id}:${token.company_id}` },
     )
   } catch (error) {
     console.error('[skattekonto-sync-cron] Failed to fetch tokens', {
@@ -144,9 +147,29 @@ export async function GET(request: Request) {
 
   // Limit the eligible work list, not the raw token list. Expired trials and
   // disabled modules must not occupy all 50 positions ahead of paying firms.
-  const entitledWork = work
-    .filter(item => entitledCompanyIds.has(item.companyId))
-    .slice(0, MAX_COMPANIES_PER_RUN)
+  // Within the eligible list, never-synced and longest-ago-synced companies
+  // go first: a fixed order plus a cap starves the tail forever.
+  const eligibleWork = work.filter(item => entitledCompanyIds.has(item.companyId))
+  let lastSyncedAtByCompany = new Map<string, string | null>()
+  try {
+    const rows = await fetchAllRows(
+      ({ from, to }) => supabase
+        .from('extension_data')
+        .select('company_id, value')
+        .eq('extension_id', 'skatteverket')
+        .eq('key', SKATTEKONTO_LAST_SYNCED_AT_KEY)
+        .order('company_id', { ascending: true })
+        .range(from, to),
+    )
+    lastSyncedAtByCompany = new Map(
+      (rows ?? []).map(r => [r.company_id as string, (r.value as string | null) ?? null]),
+    )
+  } catch (error) {
+    console.warn('[skattekonto-sync-cron] last-synced read failed; keeping token order', {
+      message: error instanceof Error ? error.message : String(error),
+    })
+  }
+  const entitledWork = orderByStalestSync(eligibleWork, lastSyncedAtByCompany).slice(0, MAX_COMPANIES_PER_RUN)
 
   console.info('[skattekonto-sync-cron] Work list built', {
     candidates: work.length,
@@ -213,7 +236,7 @@ export async function GET(request: Request) {
 
       const ctx = createExtensionContext(supabase, userId, companyId, 'skatteverket')
       const auth: SkvAuth =
-        source === 'system' ? { mode: 'system' } : { mode: 'user', supabase, userId }
+        source === 'system' ? { mode: 'system' } : { mode: 'user', supabase, userId, companyId }
       const syncResult = await syncSkattekonto(ctx, auth)
 
       // Drift check: compare the fresh SKV saldo against GL 1630 sum. Emits
@@ -271,7 +294,7 @@ export async function GET(request: Request) {
         err instanceof SkatteverketAuthError &&
         (RECONSENT_ERROR_CODES as readonly string[]).includes(err.code)
       ) {
-        await markNeedsReconsent(supabase, userId, err.code)
+        await markNeedsReconsent(supabase, userId, companyId, err.code)
         results.push({ userId, companyId, source, status: 'expired', error: err.code })
         continue
       }

@@ -11,6 +11,7 @@ import LazyCommandPalette from '@/components/common/LazyCommandPalette'
 import { SettingsHotkey } from '@/components/settings/SettingsHotkey'
 import { SessionTimeoutController } from '@/components/auth/SessionTimeoutController'
 import { SandboxBanner } from '@/components/dashboard/SandboxBanner'
+import TrialExpiredDialog from '@/components/billing/TrialExpiredDialog'
 import { getExtensionNavItems } from '@/lib/extensions/sectors'
 import { CompanyProvider } from '@/contexts/CompanyContext'
 import { getCompanyEntitlements } from '@/lib/entitlements/has-capability'
@@ -39,7 +40,7 @@ const NO_COMPANY_ALLOWED_PATHS = ['/settings/account']
  * document flow with the bottom nav, exactly as before.
  */
 const MAIN_PANEL_CLASS =
-  'safe-area-main-padding md:!pb-0 relative bg-background min-h-screen ' +
+  'safe-area-main-padding md:!pb-0 relative bg-background min-h-dvh ' +
   'md:min-h-0 md:ml-[var(--nav-w)] md:mt-[10px] md:mr-[var(--agent-dock-w)] md:h-[calc(100vh-20px)] ' +
   'md:overflow-y-auto md:rounded-xl md:border md:border-border ' +
   'md:transition-[margin-left,margin-right] md:duration-300 md:ease-[cubic-bezier(0.32,0.72,0,1)]'
@@ -107,12 +108,14 @@ export default async function DashboardLayout({
           isSandbox: false,
           capabilities: [],
           trialEndsAt: null,
+          entitlementState: 'none' as const,
+          trialExpiredAt: null,
         }}
       >
         <SessionTimeoutController />
         <AgentSheetProvider>
           <CompanyTabSync />
-          <div className="min-h-screen bg-frame md:flex md:flex-col">
+          <div className="min-h-dvh bg-frame md:flex md:flex-col">
             <DashboardNav
               companyName={getBranding().appName.toLowerCase()}
               entityType="enskild_firma"
@@ -151,6 +154,8 @@ export default async function DashboardLayout({
     entitlements,
     { data: allSettingsNames },
     { data: userPrefs },
+    hasWebshop,
+    hasMileageTrips,
   ] = await Promise.all([
     supabase.from('companies').select('*').eq('id', companyId).single(),
     supabase.from('company_members').select('role').eq('company_id', companyId).eq('user_id', user.id).single(),
@@ -178,6 +183,32 @@ export default async function DashboardLayout({
     // preference (Inställningar → Assistenten). Batched here so it costs no
     // extra round-trip on the dashboard critical path.
     supabase.from('user_preferences').select('ui_state, hide_assistant_fab').eq('user_id', user.id).maybeSingle(),
+    // Whether the company has a webshop hooked up: an ACTIVE WooCommerce or
+    // Shopify connection, or already-imported webshop_orders rows (a
+    // disconnected store's orders are accounting underlag and must stay
+    // reachable). Three indexed limit-1 selects, parallel with the batch;
+    // accepted cost on the first-paint path (gates a nav destination, unlike
+    // the badge counts that moved client-side above).
+    Promise.all([
+      supabase.from('woocommerce_connections').select('id').eq('company_id', companyId).eq('status', 'active').limit(1),
+      supabase.from('shopify_connections').select('id').eq('company_id', companyId).eq('status', 'active').limit(1),
+      supabase.from('webshop_orders').select('id').eq('company_id', companyId).limit(1),
+    ]).then(
+      ([woo, shopify, orders]) =>
+        (woo.data?.length ?? 0) > 0 ||
+        (shopify.data?.length ?? 0) > 0 ||
+        (orders.data?.length ?? 0) > 0,
+    ),
+    // Whether the company already has mileage trips: OR-ed with the
+    // mileage_enabled settings toggle below so trips created via API/MCP can
+    // never be invisible underlag even if nobody flipped the toggle. Indexed
+    // limit-1 select, same accepted first-paint cost as the webshop gate.
+    supabase
+      .from('mileage_trips')
+      .select('id')
+      .eq('company_id', companyId)
+      .limit(1)
+      .then((trips) => (trips.data?.length ?? 0) > 0),
   ])
 
   // company_id -> current display name for every company the user belongs to.
@@ -203,6 +234,8 @@ export default async function DashboardLayout({
       isSandbox: false,
       capabilities: [],
       trialEndsAt: null,
+      entitlementState: 'none' as const,
+      trialExpiredAt: null,
     }
 
     return (
@@ -210,7 +243,7 @@ export default async function DashboardLayout({
         <SessionTimeoutController />
         <AgentSheetProvider>
           <CompanyTabSync />
-          <div className="min-h-screen bg-frame md:flex md:flex-col">
+          <div className="min-h-dvh bg-frame md:flex md:flex-col">
             <DashboardNav
               companyName={getBranding().appName.toLowerCase()}
               entityType="enskild_firma"
@@ -250,6 +283,9 @@ export default async function DashboardLayout({
   // mechanism as paysSalaries: UI gate only, never load-bearing for
   // correctness (dimensions plan §2).
   const dimensionsEnabled = settings?.dimensions_enabled ?? false
+  // Körjournal visibility: the settings toggle is the normal way in, existing
+  // trips force the row on so already-created data stays reachable.
+  const hasMileage = (settings?.mileage_enabled ?? false) || hasMileageTrips
   const companyWithName = {
     ...companyRow,
     name: displayName,
@@ -283,6 +319,8 @@ export default async function DashboardLayout({
     isSandbox,
     capabilities: entitlements.capabilities,
     trialEndsAt: entitlements.trialEndsAt,
+    entitlementState: entitlements.entitlementState,
+    trialExpiredAt: entitlements.trialExpiredAt,
   }
 
   return (
@@ -294,11 +332,14 @@ export default async function DashboardLayout({
           avatarId: agentProfileIdentity?.avatar_id ?? null,
           isVerified: Boolean(agentProfileIdentity?.verified_at),
         }}
+        // Server-seeded panel geometry (docked width / floating rect / mode)
+        // so the assistant opens at the user's persisted size without a jump.
+        initialPanelPrefs={uiState.agent_panel}
       >
         <CompanyTabSync />
         <div
           id="dash-shell"
-          className="min-h-screen bg-frame md:flex md:flex-col"
+          className="min-h-dvh bg-frame md:flex md:flex-col"
           style={{ '--nav-w': navCollapsed ? '64px' : '248px' } as React.CSSProperties}
         >
           {/* Skip to content link for keyboard/screen reader users */}
@@ -315,6 +356,8 @@ export default async function DashboardLayout({
             entityType={entityType}
             paysSalaries={paysSalaries}
             dimensionsEnabled={dimensionsEnabled}
+            hasWebshop={hasWebshop}
+            hasMileage={hasMileage}
             isSandbox={isSandbox}
             extensionNavItems={getExtensionNavItems()}
             userName={userProfile?.full_name ?? null}
@@ -325,6 +368,19 @@ export default async function DashboardLayout({
             <MainContainer companyId={companyId}>{children}</MainContainer>
           </main>
           <AgentTrigger hidden={userPrefs?.hide_assistant_fab === true} />
+          {/* One-time expired-trial notice. Sandbox/anonymous demo users have
+              no billing (their companies carry trial grants too), so the gate
+              lives here where both flags are known. Acknowledgement persists
+              per user AND company in user_preferences.ui_state, read here
+              server-side so an acked dialog never flashes. */}
+          {!isSandbox && !user.is_anonymous && (
+            <TrialExpiredDialog
+              state={entitlements.entitlementState}
+              trialExpiredAt={entitlements.trialExpiredAt}
+              companyId={companyId}
+              initialAcknowledged={!!uiState.trial_expired_ack?.[companyId]}
+            />
+          )}
           <LazyCommandPalette />
           <SettingsHotkey />
           {settingsModal}

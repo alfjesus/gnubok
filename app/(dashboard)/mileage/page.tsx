@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslations } from 'next-intl'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -27,6 +27,8 @@ import { EmptyState } from '@/components/ui/empty-state'
 import { ContextPicker } from '@/components/common/ContextPicker'
 import { PageHeader } from '@/components/ui/page-header'
 import { useCanWrite } from '@/lib/hooks/use-can-write'
+import { applyRoutePrefill, locationSuggestions } from '@/lib/mileage/route-memory'
+import type { RoutePrefill } from '@/lib/mileage/route-memory'
 import { formatCurrency, formatDate } from '@/lib/utils'
 import { Car, Copy, Download, Plus, Trash2, Pencil, ChevronDown, ChevronUp } from 'lucide-react'
 import type { MileageTrip, MileageVehicleType } from '@/types'
@@ -111,6 +113,13 @@ export default function MileagePage() {
   const [form, setForm] = useState<TripFormState>(emptyForm())
   const [showMore, setShowMore] = useState(false)
   const [saving, setSaving] = useState(false)
+  const [prefill, setPrefill] = useState<RoutePrefill | null>(null)
+  const [suggestStatus, setSuggestStatus] = useState<
+    | { kind: 'idle' }
+    | { kind: 'loading' }
+    | { kind: 'none' }
+    | { kind: 'applied'; fromLabel: string; toLabel: string }
+  >({ kind: 'idle' })
 
   const [bookOpen, setBookOpen] = useState(false)
   const [bookFrom, setBookFrom] = useState('')
@@ -159,10 +168,15 @@ export default function MileagePage() {
     [draftTrips]
   )
 
+  const suggestions = useMemo(() => locationSuggestions(trips), [trips])
+
   const openCreate = () => {
     setEditingId(null)
     setForm(emptyForm())
     setShowMore(false)
+    setPrefill(null)
+    invalidateSuggestLookup()
+    setSuggestStatus({ kind: 'idle' })
     setFormOpen(true)
   }
 
@@ -170,6 +184,9 @@ export default function MileagePage() {
     setEditingId(trip.id)
     setForm(formFromTrip(trip, true))
     setShowMore(Boolean(trip.vehicle_registration || trip.odometer_start || trip.visited || trip.notes))
+    setPrefill(null)
+    invalidateSuggestLookup()
+    setSuggestStatus({ kind: 'idle' })
     setFormOpen(true)
   }
 
@@ -177,7 +194,84 @@ export default function MileagePage() {
     setEditingId(null)
     setForm(formFromTrip(trip, false))
     setShowMore(false)
+    setPrefill(null)
+    invalidateSuggestLookup()
+    setSuggestStatus({ kind: 'idle' })
     setFormOpen(true)
+  }
+
+  // Route memory: when the from/to pair matches an earlier trip, empty km and
+  // purpose fields prefill from the latest match. Prefilled values are cleared
+  // again if the route stops matching before they were touched; user-typed
+  // input is never overwritten, and edit mode is untouched.
+  const updateRouteField = (field: 'from_location' | 'to_location', value: string) => {
+    const next = { ...form, [field]: value }
+    if (!editingId) {
+      const result = applyRoutePrefill(trips, next, prefill)
+      next.distance_km = result.distance_km
+      next.purpose = result.purpose
+      setPrefill(result.prefill)
+    }
+    // A changed endpoint invalidates any suggestion hint for the old route,
+    // including one still in flight.
+    invalidateSuggestLookup()
+    setSuggestStatus({ kind: 'idle' })
+    setForm(next)
+  }
+
+  // A manual edit disowns that field's prefill so the hint disappears and the
+  // value survives later route changes. The record itself is kept (even fully
+  // disowned) as an offered-marker, so the same route never re-fills a field
+  // the user deliberately emptied.
+  const disownPrefill = (field: 'distance_km' | 'purpose') => {
+    if (!prefill || !prefill[field]) return
+    setPrefill({ ...prefill, [field]: '' })
+  }
+
+  // Distance suggestion (OpenStreetMap via our proxy), create mode only.
+  // Deliberately click-triggered, never as-you-type: Nominatim's usage
+  // policy forbids autocomplete-style traffic, and an explicit request is
+  // also what makes overwriting the km field the user's own action. The
+  // value stays fully editable afterwards.
+  const canSuggestDistance =
+    !editingId && form.from_location.trim().length >= 2 && form.to_location.trim().length >= 2
+
+  // Any event that makes an in-flight lookup stale (route edit, manual km
+  // edit, dialog close/reopen) bumps the generation; a response is applied
+  // only if its generation is still current, so a slow lookup can never
+  // write an old route's distance into a changed form.
+  const suggestGeneration = useRef(0)
+
+  const invalidateSuggestLookup = () => {
+    suggestGeneration.current += 1
+  }
+
+  const suggestDistance = async () => {
+    if (!canSuggestDistance || suggestStatus.kind === 'loading') return
+    const from = form.from_location.trim()
+    const to = form.to_location.trim()
+    const generation = ++suggestGeneration.current
+    setSuggestStatus({ kind: 'loading' })
+    try {
+      const res = await fetch(
+        `/api/mileage/distance?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`
+      )
+      const body = res.ok ? await res.json() : null
+      if (generation !== suggestGeneration.current) return
+      if (typeof body?.data?.distance_km === 'number' && body.data.distance_km > 0) {
+        disownPrefill('distance_km')
+        setForm((prev) => ({ ...prev, distance_km: String(body.data.distance_km) }))
+        setSuggestStatus({
+          kind: 'applied',
+          fromLabel: body.data.from_label,
+          toLabel: body.data.to_label,
+        })
+      } else {
+        setSuggestStatus({ kind: 'none' })
+      }
+    } catch {
+      if (generation === suggestGeneration.current) setSuggestStatus({ kind: 'none' })
+    }
   }
 
   const submitForm = async () => {
@@ -423,7 +517,13 @@ export default function MileagePage() {
         </table>
       )}
 
-      <Dialog open={formOpen} onOpenChange={setFormOpen}>
+      <Dialog
+        open={formOpen}
+        onOpenChange={(open) => {
+          if (!open) invalidateSuggestLookup()
+          setFormOpen(open)
+        }}
+      >
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>{editingId ? t('edit_trip') : t('new_trip')}</DialogTitle>
@@ -465,39 +565,97 @@ export default function MileagePage() {
                 <Label htmlFor="from_location">{t('field_from')}</Label>
                 <Input
                   id="from_location"
+                  list="mileage-locations"
                   value={form.from_location}
-                  onChange={(e) => setForm({ ...form, from_location: e.target.value })}
+                  onChange={(e) => updateRouteField('from_location', e.target.value)}
                 />
               </div>
               <div className="space-y-2">
                 <Label htmlFor="to_location">{t('field_to')}</Label>
                 <Input
                   id="to_location"
+                  list="mileage-locations"
                   value={form.to_location}
-                  onChange={(e) => setForm({ ...form, to_location: e.target.value })}
+                  onChange={(e) => updateRouteField('to_location', e.target.value)}
                 />
               </div>
             </div>
+            <datalist id="mileage-locations">
+              {suggestions.map((location) => (
+                <option key={location} value={location} />
+              ))}
+            </datalist>
             <div className="space-y-2">
               <Label htmlFor="purpose">{t('field_purpose')}</Label>
               <Input
                 id="purpose"
                 value={form.purpose}
                 placeholder={t('purpose_placeholder')}
-                onChange={(e) => setForm({ ...form, purpose: e.target.value })}
+                onChange={(e) => {
+                  disownPrefill('purpose')
+                  setForm({ ...form, purpose: e.target.value })
+                }}
               />
+              {Boolean(prefill?.purpose) && (
+                <p className="text-xs text-muted-foreground">{t('route_prefill_hint')}</p>
+              )}
             </div>
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-2">
-                <Label htmlFor="distance_km">
-                  {editingId ? t('field_km_total') : t('field_km')}
-                </Label>
+                <div className="flex items-center justify-between gap-2">
+                  <Label htmlFor="distance_km">
+                    {editingId ? t('field_km_total') : t('field_km')}
+                  </Label>
+                  {!editingId && (
+                    <button
+                      type="button"
+                      className="text-xs text-muted-foreground hover:text-foreground transition-colors duration-150 disabled:opacity-50 disabled:pointer-events-none"
+                      disabled={!canSuggestDistance || suggestStatus.kind === 'loading'}
+                      onClick={suggestDistance}
+                    >
+                      {suggestStatus.kind === 'loading'
+                        ? t('distance_suggest_loading')
+                        : t('distance_suggest_action')}
+                    </button>
+                  )}
+                </div>
                 <Input
                   id="distance_km"
                   inputMode="decimal"
                   value={form.distance_km}
-                  onChange={(e) => setForm({ ...form, distance_km: e.target.value })}
+                  onChange={(e) => {
+                    disownPrefill('distance_km')
+                    invalidateSuggestLookup()
+                    setSuggestStatus((s) => (s.kind === 'applied' ? { kind: 'idle' } : s))
+                    setForm({ ...form, distance_km: e.target.value })
+                  }}
                 />
+                {Boolean(prefill?.distance_km) && (
+                  <p className="text-xs text-muted-foreground">{t('route_prefill_hint')}</p>
+                )}
+                {suggestStatus.kind === 'none' && (
+                  <p className="text-xs text-muted-foreground">{t('distance_suggestion_none')}</p>
+                )}
+                {suggestStatus.kind === 'applied' && (
+                  <p
+                    className="text-xs text-muted-foreground"
+                    title={`${suggestStatus.fromLabel} → ${suggestStatus.toLabel}`}
+                  >
+                    {t('distance_suggestion_route', {
+                      from: suggestStatus.fromLabel.split(',')[0],
+                      to: suggestStatus.toLabel.split(',')[0],
+                    })}
+                    {' · '}
+                    <a
+                      href="https://www.openstreetmap.org/copyright"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="underline hover:text-foreground"
+                    >
+                      © OpenStreetMap contributors
+                    </a>
+                  </p>
+                )}
               </div>
               {!editingId && (
                 <div className="flex items-end pb-2">
