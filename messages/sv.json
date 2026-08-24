@@ -6549,6 +6549,8 @@
     "bank_expiring_action": "Förnya samtycket",
     "other_account_hint": "Det här kontot är tomt, men bokföring för samma organisationsnummer finns i ett annat Accounted-konto. Loggade du in med fel inloggning?",
     "other_account_hint_action": "Byt konto",
+    "skv_unexplained": "Skattekontot stämmer inte med bokföringen: {amount} är oförklarat efter senaste hämtningen.",
+    "skv_unexplained_action": "Stäm av",
     "more_count": "+{count} till",
     "dismiss": "Dölj"
   },
@@ -7813,7 +7815,7 @@
     "empty_connect_skv": "Koppla Skatteverket",
     "load_failed": "Kunde inte hämta avstämningen. Försök igen om en stund.",
     "tile_external_skv": "Saldo hos Skatteverket",
-    "tile_external_bank": "Banktransaktioner i perioden",
+    "tile_external_bank": "Banktransaktioner i perioden (netto)",
     "tile_ledger": "Bokfört på {account}",
     "tile_ledger_bank": "Bokfört på {account} i perioden",
     "tile_difference": "Differens",
